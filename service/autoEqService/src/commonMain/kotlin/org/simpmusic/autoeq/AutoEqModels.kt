@@ -15,6 +15,25 @@ data class AutoEqCurveData(
     val preampDb: Float,
 )
 
+enum class AutoEqFilterType {
+    PEAKING,
+    LOW_SHELF,
+    HIGH_SHELF,
+}
+
+data class AutoEqFilterSpec(
+    val type: AutoEqFilterType,
+    val freqHz: Float,
+    val gainDb: Float,
+    val q: Float,
+)
+
+data class AutoEqParametricData(
+    val preampDb: Float,
+    val filters: List<AutoEqFilterSpec>,
+    val isFixedBand: Boolean,
+)
+
 /** Outcome of asking GitHub for the index. */
 sealed interface AutoEqIndexResult {
     /** The server answered 304: what is cached is still current. */

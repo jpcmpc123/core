@@ -85,6 +85,41 @@ class AutoEq {
             null
         }
 
+    /**
+     * Fetches the higher-precision `<folder> ParametricEQ.txt` when available, falling back to
+     * `<folder> FixedBandEQ.txt`.
+     */
+    suspend fun fetchParametricCurve(encodedPath: String): AutoEqParametricData? {
+        val folder = encodedPath.substringAfterLast('/')
+        val parametric =
+            runCatching {
+                val response = httpClient.get("$RESULTS_BASE/$encodedPath/$folder%20ParametricEQ.txt")
+                if (response.status.isSuccess()) {
+                    parseAutoEqParametricEq(response.bodyAsText())
+                } else {
+                    null
+                }
+            }.onFailure {
+                Logger.d(TAG, "parametric fetch for $encodedPath failed: ${it.message}")
+            }.getOrNull()
+        if (parametric != null) return parametric
+
+        val fixed = fetchFixedBandCurve(encodedPath) ?: return null
+        return AutoEqParametricData(
+            preampDb = fixed.preampDb,
+            filters =
+                AUTOEQ_FIXED_BANDS_HZ.mapIndexed { idx, hz ->
+                    AutoEqFilterSpec(
+                        type = AutoEqFilterType.PEAKING,
+                        freqHz = hz.toFloat(),
+                        gainDb = fixed.bandsDb.getOrElse(idx) { 0f },
+                        q = 1.41f,
+                    )
+                },
+            isFixedBand = true,
+        )
+    }
+
     companion object {
         private const val RESULTS_BASE = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results"
     }

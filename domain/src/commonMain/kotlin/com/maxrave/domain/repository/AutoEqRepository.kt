@@ -2,6 +2,7 @@ package com.maxrave.domain.repository
 
 import com.maxrave.domain.data.entities.AutoEqEntryEntity
 import com.maxrave.domain.data.model.autoeq.AutoEqCurve
+import com.maxrave.domain.data.player.AutoEqLayer
 
 interface AutoEqRepository {
     /** Cached profiles whose name matches [query]; a blank query returns the first [limit] rows. */
@@ -29,4 +30,19 @@ interface AutoEqRepository {
 
     /** Fetch and parse one profile's curve, or null if it cannot be read. */
     suspend fun loadCurve(entry: AutoEqEntryEntity): AutoEqCurve?
+
+    /**
+     * Fetch and parse a full parametric (or fixed-band fallback) [AutoEqLayer] for [entry],
+     * ready to run on the independent AutoEq DSP layer without touching user EQ bands.
+     */
+    suspend fun loadAutoEqLayer(
+        entry: AutoEqEntryEntity,
+        displayLabel: String,
+    ): AutoEqLayer?
+
+    /** Parse pasted or imported `.txt` EQ content (ParametricEQ, FixedBandEQ, or Wavelet GraphicEQ). */
+    fun parseCustomAutoEqText(
+        label: String,
+        rawText: String,
+    ): AutoEqLayer?
 }

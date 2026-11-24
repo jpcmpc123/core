@@ -251,6 +251,34 @@ interface DataStoreManager {
         bandsDb: List<Float>,
     )
 
+    val equalizerEnhancements: Flow<com.maxrave.domain.data.player.EqualizerEnhancements>
+
+    suspend fun setEqualizerEnhancements(enhancements: com.maxrave.domain.data.player.EqualizerEnhancements)
+
+    val equalizerSavedProfiles: Flow<List<com.maxrave.domain.data.player.SavedEqualizerProfile>>
+
+    suspend fun setEqualizerSavedProfiles(profiles: List<com.maxrave.domain.data.player.SavedEqualizerProfile>)
+
+    val equalizerActiveProfileId: Flow<String?>
+
+    suspend fun setEqualizerActiveProfileId(profileId: String?)
+
+    val equalizerAutoEqLayer: Flow<com.maxrave.domain.data.player.AutoEqLayer?>
+
+    suspend fun setEqualizerAutoEqLayer(layer: com.maxrave.domain.data.player.AutoEqLayer?)
+
+    val equalizerCustomAutoEqProfiles: Flow<List<com.maxrave.domain.data.player.AutoEqLayer>>
+
+    suspend fun setEqualizerCustomAutoEqProfiles(profiles: List<com.maxrave.domain.data.player.AutoEqLayer>)
+
+    val equalizerPerOutputEnabled: Flow<Boolean>
+
+    suspend fun setEqualizerPerOutputEnabled(enabled: Boolean)
+
+    val equalizerOutputProfileMap: Flow<Map<String, String>>
+
+    suspend fun setEqualizerOutputProfileMap(map: Map<String, String>)
+
     /**
      * Whether the echo is applied at all.
      *

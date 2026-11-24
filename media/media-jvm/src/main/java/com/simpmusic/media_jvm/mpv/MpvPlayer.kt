@@ -1,12 +1,15 @@
 package com.simpmusic.media_jvm.mpv
 
 import com.maxrave.domain.data.player.AudioEffects
+import com.maxrave.domain.data.player.BiquadFilterKind
 import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.EightDOrbit
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.logger.Logger
 import com.sun.jna.Memory
 import com.sun.jna.Pointer
 import java.util.Locale
+import kotlin.math.abs
 
 private const val TAG = "MpvPlayer"
 
@@ -1027,22 +1030,40 @@ class MpvPlayer private constructor(
     fun setEqualizer(
         bandsDb: List<Float>,
         preampDb: Float,
-    ): Boolean {
+    ): Boolean = setEqualizerConfig(EqualizerConfig.fromLegacy(bandsDb, preampDb))
+
+    fun setEqualizerConfig(config: EqualizerConfig): Boolean {
         if (isReleased) return false
-        val flat = preampDb == 0f && bandsDb.all { it == 0f }
-        eqEntry =
-            if (flat) {
-                null
-            } else {
-                val stages =
-                    EQ_BANDS_HZ.mapIndexed { index, hz ->
-                        val gain = bandsDb.getOrElse(index) { 0f }
-                        "equalizer=f=$hz:width_type=q:width=1.41:g=${mpvNumber(gain)}"
-                    }
-                // Wrapped in [ ] for the same reason the crossfade sweep is: the graph contains
-                // `,` and `=`, which mpv's own filter-list parser would otherwise consume.
-                "@$EQ_LABEL:lavfi=[volume=${mpvNumber(preampDb)}dB,${stages.joinToString(",")}]"
+        if (config.isBypass) {
+            eqEntry = null
+            return applyAudioFilters()
+        }
+        val stages = ArrayList<String>(24)
+        val preampDb = config.effectivePreampDb(48_000.0)
+        stages += "volume=${mpvNumber(preampDb)}dB"
+        config.tonalBiquadStages().forEach { band ->
+            val safe = band.sanitized()
+            when (safe.kind) {
+                BiquadFilterKind.HIGH_PASS ->
+                    stages += "highpass=f=${mpvNumber(safe.freqHz)}:poles=2"
+                BiquadFilterKind.PEAKING ->
+                    stages += "equalizer=f=${mpvNumber(safe.freqHz)}:width_type=q:width=${mpvNumber(safe.q)}:g=${mpvNumber(safe.gainDb)}"
+                BiquadFilterKind.LOW_SHELF ->
+                    stages += "bass=g=${mpvNumber(safe.gainDb)}:f=${mpvNumber(safe.freqHz)}:width_type=q:w=${mpvNumber(safe.q)}"
+                BiquadFilterKind.HIGH_SHELF ->
+                    stages += "treble=g=${mpvNumber(safe.gainDb)}:f=${mpvNumber(safe.freqHz)}:width_type=q:w=${mpvNumber(safe.q)}"
             }
+        }
+        val enh = config.safeEnhancements
+        if (abs(enh.stereoWidth - 1f) > 0.005f) {
+            stages += "extrastereo=m=${mpvNumber(enh.stereoWidth)}:c=false"
+        }
+        val coreChain = stages.joinToString(",")
+        if (enh.limiterEnabled) {
+            eqEntry = "@$EQ_LABEL:lavfi=[$coreChain,alimiter=limit=0.96:attack=3:release=75]"
+            if (applyAudioFilters()) return true
+        }
+        eqEntry = "@$EQ_LABEL:lavfi=[$coreChain]"
         return applyAudioFilters()
     }
 

@@ -33,6 +33,7 @@ import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.DelayEffect
 import com.maxrave.domain.data.player.EightDDirection
 import com.maxrave.domain.data.player.EightDEffect
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericCommandButton
 import com.maxrave.domain.data.player.GenericMediaItem
@@ -438,17 +439,20 @@ class JvmMediaPlayerHandlerImpl(
                 dataStoreManager.equalizerEnabled,
                 dataStoreManager.equalizerBands,
                 dataStoreManager.equalizerPreamp,
-            ) { enabled, bands, preamp -> Triple(enabled == TRUE, bands, preamp) }
+                dataStoreManager.equalizerEnhancements,
+                dataStoreManager.equalizerAutoEqLayer,
+            ) { enabled, bands, preamp, enhancements, autoEq ->
+                EqualizerConfig(
+                    enabled = enabled == TRUE,
+                    bandsDb = bands.split(",").mapNotNull { it.trim().toFloatOrNull() },
+                    manualPreampDb = preamp,
+                    enhancements = enhancements,
+                    autoEqLayer = autoEq,
+                )
+            }
                 .distinctUntilChanged()
-                .collect { (enabled, bands, preamp) ->
-                    // Switched off sends a flat curve rather than skipping the call: the filter
-                    // chain has to actually come out of mpv, and the stored bands are left alone
-                    // so switching back on returns to the user's own shape.
-                    player.setEqualizer(
-                        bandsDb =
-                            if (enabled) bands.split(",").mapNotNull { it.trim().toFloatOrNull() } else emptyList(),
-                        preampDb = if (enabled) preamp else 0f,
-                    )
+                .collect { config ->
+                    player.setEqualizerConfig(config)
                 }
         }
         // A collector of its own rather than more legs on the equalizer's: `combine` takes at most

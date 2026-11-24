@@ -30,6 +30,7 @@ import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.EightDOrbit
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.media3.di.StreamResolveCoordinator
 import com.maxrave.domain.data.player.GenericMediaItem
@@ -54,7 +55,6 @@ import com.maxrave.media3.audio.CrossfadeFilterAudioProcessor
 import com.maxrave.media3.audio.EchoAudioProcessor
 import com.maxrave.media3.audio.EightDAudioProcessor
 import com.maxrave.media3.audio.EqualizerAudioProcessor
-import com.maxrave.media3.audio.EqualizerCurve
 import com.maxrave.media3.audio.SleepFadeAudioProcessor
 import com.maxrave.media3.service.mediasourcefactory.isLiveStreamDetected
 import com.maxrave.media3.service.mediasourcefactory.isLiveStreamEnded
@@ -212,15 +212,15 @@ internal class CrossfadeExoPlayerAdapter(
     private var internalSleepFadeFactor = 1.0f
 
     /**
-     * The equalizer curve in force. Read the same way as [internalSleepFadeFactor]: every player's
-     * [EqualizerAudioProcessor] samples it on every buffer, so one write covers both players of a
-     * crossfade and every precached one without any of them having to be found first.
+     * The equalizer configuration in force. Read the same way as [internalSleepFadeFactor]: every
+     * player's [EqualizerAudioProcessor] samples it on every buffer, so one write covers both
+     * players of a crossfade and every precached one without any of them having to be found first.
      */
     @Volatile
-    private var internalEqualizerCurve: EqualizerCurve = EqualizerCurve.FLAT
+    private var internalEqualizerConfig: EqualizerConfig = EqualizerConfig.FLAT
 
     /**
-     * The delay and reverb settings in force. Read exactly like [internalEqualizerCurve]: every
+     * The delay and reverb settings in force. Read exactly like [internalEqualizerConfig]: every
      * player's [EchoAudioProcessor] and [ConvolutionReverbAudioProcessor] sample it on every
      * buffer, so one write covers both players of a crossfade and every precached one without any
      * of them having to be found first.
@@ -702,7 +702,7 @@ internal class CrossfadeExoPlayerAdapter(
     ): PlayerWithFilter {
         val crossfadeFilter = CrossfadeFilterAudioProcessor()
         val sleepFade = SleepFadeAudioProcessor { internalSleepFadeFactor }
-        val equalizer = EqualizerAudioProcessor { internalEqualizerCurve }
+        val equalizer = EqualizerAudioProcessor { internalEqualizerConfig }
         val echo = EchoAudioProcessor { internalAudioEffects }
         val reverb = ConvolutionReverbAudioProcessor { internalAudioEffects }
         val eightD = EightDAudioProcessor(eightDOrbit)
@@ -1853,7 +1853,11 @@ internal class CrossfadeExoPlayerAdapter(
         bandsDb: List<Float>,
         preampDb: Float,
     ) {
-        internalEqualizerCurve = EqualizerCurve(bandsDb, preampDb)
+        internalEqualizerConfig = EqualizerConfig.fromLegacy(bandsDb, preampDb)
+    }
+
+    override fun setEqualizerConfig(config: EqualizerConfig) {
+        internalEqualizerConfig = config
     }
 
     /**

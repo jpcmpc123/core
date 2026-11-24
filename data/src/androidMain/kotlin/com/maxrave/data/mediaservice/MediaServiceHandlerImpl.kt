@@ -40,7 +40,10 @@ import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.DelayEffect
 import com.maxrave.domain.data.player.EightDDirection
 import com.maxrave.domain.data.player.EightDEffect
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericCastState
+import com.maxrave.domain.data.player.audioOutputFallbackKeyFor
+import com.maxrave.domain.data.player.audioOutputKeyFor
 import com.maxrave.domain.data.player.GenericCommandButton
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
@@ -207,6 +210,8 @@ internal class MediaServiceHandlerImpl(
     private var appliedEnhancerSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
 
     private var restoreQueueJob: Job? = null
+
+    private val equalizerLivePreview = MutableStateFlow<EqualizerConfig?>(null)
 
     // PlayTiming (read only when debug logging is on): when the current track was asked
     // for, so the player callbacks below can report how long prepare and the wait for the
@@ -565,24 +570,79 @@ internal class MediaServiceHandlerImpl(
         // while music is playing, and a curve that only takes effect after a restart is useless
         // for judging what you just changed.
         backgroundScope.launch {
-            // While the system equalizer is selected the built-in curve goes flat, the same as its own switch being off.
-            combine(
-                dataStoreManager.equalizerType,
-                dataStoreManager.equalizerEnabled,
-                dataStoreManager.equalizerBands,
-                dataStoreManager.equalizerPreamp,
-            ) { type, enabled, bands, preamp -> Triple(enabled == TRUE && type != DataStoreManager.EQUALIZER_TYPE_SYSTEM, bands, preamp) }
-                .distinctUntilChanged()
-                .collect { (enabled, bands, preamp) ->
-                    // Switched off sends a flat curve rather than skipping the call: the filter
-                    // has to actually come out of the audio chain, and the stored bands are left
-                    // alone so switching back on returns to the user's own shape.
-                    player.setEqualizer(
-                        bandsDb =
-                            if (enabled) bands.split(",").mapNotNull { it.trim().toFloatOrNull() } else emptyList(),
-                        preampDb = if (enabled) preamp else 0f,
+            val baseEqualizerFlow =
+                combine(
+                    dataStoreManager.equalizerType,
+                    dataStoreManager.equalizerEnabled,
+                    dataStoreManager.equalizerBands,
+                    dataStoreManager.equalizerPreamp,
+                ) { type, enabled, bands, preamp ->
+                    Triple(enabled == TRUE && type != DataStoreManager.EQUALIZER_TYPE_SYSTEM, bands, preamp)
+                }
+            val fullEqualizerFlow =
+                combine(
+                    baseEqualizerFlow,
+                    dataStoreManager.equalizerEnhancements,
+                    dataStoreManager.equalizerAutoEqLayer,
+                ) { (enabled, bands, preamp), enhancements, autoEq ->
+                    EqualizerConfig(
+                        enabled = enabled,
+                        bandsDb = bands.split(",").mapNotNull { it.trim().toFloatOrNull() },
+                        manualPreampDb = preamp,
+                        enhancements = enhancements,
+                        autoEqLayer = autoEq,
                     )
                 }
+            combine(fullEqualizerFlow, equalizerLivePreview) { persisted, preview ->
+                preview ?: persisted
+            }.distinctUntilChanged()
+                .collect { config ->
+                    player.setEqualizerConfig(config)
+                }
+        }
+        // Automatically applies a user-bound saved profile whenever the active audio output changes
+        // (Bluetooth headset name/type, wired headset, USB DAC, or phone speaker).
+        backgroundScope.launch {
+            var lastAppliedOutputKey: String? = null
+            combine(
+                dataStoreManager.equalizerPerOutputEnabled,
+                player.audioOutputs,
+            ) { perOutputEnabled, outputs ->
+                if (!perOutputEnabled) {
+                    null
+                } else {
+                    outputs.firstOrNull { it.isActive }
+                }
+            }.collect { activeOutput ->
+                val primaryKey = audioOutputKeyFor(activeOutput)
+                if (primaryKey == null) {
+                    lastAppliedOutputKey = null
+                    return@collect
+                }
+                if (primaryKey == lastAppliedOutputKey) return@collect
+                lastAppliedOutputKey = primaryKey
+
+                val outputMap = dataStoreManager.equalizerOutputProfileMap.first()
+                val targetProfileId =
+                    outputMap[primaryKey]
+                        ?: audioOutputFallbackKeyFor(activeOutput)?.let { outputMap[it] }
+                        ?: return@collect
+                val currentActiveId = dataStoreManager.equalizerActiveProfileId.first()
+                if (targetProfileId == currentActiveId) return@collect
+
+                val saved =
+                    dataStoreManager.equalizerSavedProfiles
+                        .first()
+                        .firstOrNull { it.id == targetProfileId }
+                        ?: return@collect
+                equalizerLivePreview.value = null
+                dataStoreManager.setEqualizerPreamp(saved.manualPreampDb)
+                dataStoreManager.setEqualizerBands(saved.bandsDb)
+                dataStoreManager.setEqualizerEnhancements(saved.toEnhancements())
+                saved.autoEqLayer?.let { dataStoreManager.setEqualizerAutoEqLayer(it) }
+                dataStoreManager.setEqualizerActiveProfileId(saved.id)
+                Logger.d(TAG, "Auto-switched EQ profile '${saved.name}' for output $primaryKey")
+            }
         }
         // Switching while music plays must hand over at once, or both equalizers run together: the
         // adapter only asks to open or close when the player's own state changes, not the setting.
@@ -2745,6 +2805,10 @@ internal class MediaServiceHandlerImpl(
             val videoId = nowPlayingState.value.songEntity?.videoId ?: return@launch
             dataStoreManager.saveRecentSong(videoId, player.contentPosition)
         }
+    }
+
+    override fun previewEqualizerConfig(config: EqualizerConfig?) {
+        equalizerLivePreview.value = config
     }
 
     override fun mayBeNormalizeVolume() {

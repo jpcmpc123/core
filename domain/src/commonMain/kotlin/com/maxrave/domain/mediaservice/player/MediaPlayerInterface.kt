@@ -3,6 +3,7 @@ package com.maxrave.domain.mediaservice.player
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.EightDEffect
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -201,6 +202,14 @@ interface MediaPlayerInterface {
         bandsDb: List<Float>,
         preampDb: Float,
     ) = Unit
+
+    /**
+     * Apply the full DSP equalizer configuration (10-band curve, auto/manual preamp, Bass/Air
+     * shelves, Stereo Width M/S with Bass Mono, dynamic loudness, subsonic guard, limiter, and
+     * independent AutoEq parametric/fixed layer).
+     */
+    fun setEqualizerConfig(config: EqualizerConfig) =
+        setEqualizer(config.normalizedBandsDb, config.effectivePreampDb())
 
     /**
      * Apply the delay/echo and reverb effects, or remove them.

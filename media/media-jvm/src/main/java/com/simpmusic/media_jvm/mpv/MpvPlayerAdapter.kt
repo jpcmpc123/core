@@ -7,6 +7,7 @@ import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.AudioOutputKind
 import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.EightDOrbit
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import com.maxrave.domain.data.player.LiveStreamRegistry
@@ -1194,8 +1195,8 @@ class MpvPlayerAdapter(
         // A fresh handle starts with an empty filter chain, so the curve has to be re-applied or
         // the equalizer silently stops working at the next track — including on secondaryPlayer,
         // which belongs to neither collection while it is being promoted.
-        if (internalEqualizerBands.isNotEmpty() || internalEqualizerPreamp != 0f) {
-            setEqualizer(internalEqualizerBands, internalEqualizerPreamp)
+        if (!internalEqualizerConfig.isBypass) {
+            setEqualizerConfig(internalEqualizerConfig)
         }
         // Same reasoning for the effects tier, and the same handle to miss: an empty chain means a
         // track started mid-session would play dry while the switches still read "on".
@@ -1240,23 +1241,21 @@ class MpvPlayerAdapter(
 
     override var skipSilenceEnabled: Boolean = false
 
-    /** Current curve, so a handle created later can be brought up to the same setting. */
+    /** Current equalizer configuration, so a handle created later can be brought up to the same setting. */
     @Volatile
-    private var internalEqualizerBands: List<Float> = emptyList()
-
-    @Volatile
-    private var internalEqualizerPreamp: Float = 0f
+    private var internalEqualizerConfig: EqualizerConfig = EqualizerConfig.FLAT
 
     override fun setEqualizer(
         bandsDb: List<Float>,
         preampDb: Float,
-    ) {
-        internalEqualizerBands = bandsDb
-        internalEqualizerPreamp = preampDb
+    ) = setEqualizerConfig(EqualizerConfig.fromLegacy(bandsDb, preampDb))
+
+    override fun setEqualizerConfig(config: EqualizerConfig) {
+        internalEqualizerConfig = config
         // Same hop as volume and sleepFadeFactor: mpv properties are written on the player thread,
         // because a handle released between the isReleased check and the write is a use-after-free.
         coroutineScope.launch {
-            forEachLiveHandle { it.setEqualizer(bandsDb, preampDb) }
+            forEachLiveHandle { it.setEqualizerConfig(config) }
         }
     }
 

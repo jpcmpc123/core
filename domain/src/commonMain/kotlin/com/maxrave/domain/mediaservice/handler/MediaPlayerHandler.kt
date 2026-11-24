@@ -4,6 +4,7 @@ import com.maxrave.domain.data.entities.NewFormatEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.mediaService.SponsorSkipSegments
+import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericCommandButton
 import com.maxrave.domain.data.player.GenericMediaItem
@@ -152,6 +153,13 @@ interface MediaPlayerHandler {
 
     // Settings
     fun mayBeNormalizeVolume()
+
+    /**
+     * Temporarily overrides the live DSP equalizer configuration on backends that support zero-glitch
+     * live updates (Android Media3) without writing DataStore on every drag frame. Pass null to
+     * hand control back to the persisted DataStore collector.
+     */
+    fun previewEqualizerConfig(config: EqualizerConfig?) {}
 
     fun mayBeSaveRecentSong(runBlocking: Boolean = false)
 

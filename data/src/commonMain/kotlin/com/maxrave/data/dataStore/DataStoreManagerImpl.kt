@@ -12,10 +12,14 @@ import com.maxrave.common.SUPPORTED_LANGUAGE
 import com.maxrave.common.SponsorBlockType
 import com.maxrave.domain.data.model.discord.DiscordSession
 import com.maxrave.domain.data.model.network.ProxyConfiguration
-import com.maxrave.domain.data.player.ReverbPreset
+import com.maxrave.domain.data.player.AutoEqLayer
 import com.maxrave.domain.data.player.EightDDirection
 import com.maxrave.domain.data.player.EightDEffect
+import com.maxrave.domain.data.player.EqualizerEnhancements
+import com.maxrave.domain.data.player.ReverbPreset
+import com.maxrave.domain.data.player.SavedEqualizerProfile
 import com.maxrave.domain.manager.DataStoreManager
+import kotlinx.serialization.json.Json
 import com.maxrave.domain.manager.DataStoreManager.Values.AI_PROVIDER_GEMINI
 import com.maxrave.domain.manager.DataStoreManager.Values.FALSE
 import com.maxrave.domain.manager.DataStoreManager.Values.GITHUB
@@ -669,6 +673,133 @@ internal class DataStoreManagerImpl(
             settingsDataStore.edit { settings ->
                 settings[EQUALIZER_AUTOEQ_PROFILE] =
                     if (label.isBlank()) "" else label + "\n" + bandsDb.joinToString(",")
+            }
+        }
+    }
+
+    override val equalizerEnhancements: Flow<EqualizerEnhancements> =
+        settingsDataStore.data.map { preferences ->
+            val raw = preferences[EQUALIZER_ENHANCEMENTS]
+            if (raw.isNullOrBlank()) {
+                EqualizerEnhancements()
+            } else {
+                runCatching { eqJson.decodeFromString<EqualizerEnhancements>(raw).sanitized() }
+                    .getOrDefault(EqualizerEnhancements())
+            }
+        }
+
+    override suspend fun setEqualizerEnhancements(enhancements: EqualizerEnhancements) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[EQUALIZER_ENHANCEMENTS] = eqJson.encodeToString(enhancements.sanitized())
+            }
+        }
+    }
+
+    override val equalizerSavedProfiles: Flow<List<SavedEqualizerProfile>> =
+        settingsDataStore.data.map { preferences ->
+            val raw = preferences[EQUALIZER_SAVED_PROFILES]
+            if (raw.isNullOrBlank()) {
+                emptyList()
+            } else {
+                runCatching { eqJson.decodeFromString<List<SavedEqualizerProfile>>(raw) }
+                    .getOrDefault(emptyList())
+            }
+        }
+
+    override suspend fun setEqualizerSavedProfiles(profiles: List<SavedEqualizerProfile>) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[EQUALIZER_SAVED_PROFILES] = eqJson.encodeToString(profiles)
+            }
+        }
+    }
+
+    override val equalizerActiveProfileId: Flow<String?> =
+        settingsDataStore.data.map { preferences ->
+            preferences[EQUALIZER_ACTIVE_PROFILE_ID]?.takeIf { it.isNotBlank() }
+        }
+
+    override suspend fun setEqualizerActiveProfileId(profileId: String?) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                if (profileId.isNullOrBlank()) {
+                    settings.remove(EQUALIZER_ACTIVE_PROFILE_ID)
+                } else {
+                    settings[EQUALIZER_ACTIVE_PROFILE_ID] = profileId
+                }
+            }
+        }
+    }
+
+    override val equalizerAutoEqLayer: Flow<AutoEqLayer?> =
+        settingsDataStore.data.map { preferences ->
+            val raw = preferences[EQUALIZER_AUTOEQ_LAYER]
+            if (raw.isNullOrBlank()) {
+                null
+            } else {
+                runCatching { eqJson.decodeFromString<AutoEqLayer>(raw).sanitized() }.getOrNull()
+            }
+        }
+
+    override suspend fun setEqualizerAutoEqLayer(layer: AutoEqLayer?) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                if (layer == null) {
+                    settings.remove(EQUALIZER_AUTOEQ_LAYER)
+                } else {
+                    settings[EQUALIZER_AUTOEQ_LAYER] = eqJson.encodeToString(layer.sanitized())
+                }
+            }
+        }
+    }
+
+    override val equalizerCustomAutoEqProfiles: Flow<List<AutoEqLayer>> =
+        settingsDataStore.data.map { preferences ->
+            val raw = preferences[EQUALIZER_CUSTOM_AUTOEQ_PROFILES]
+            if (raw.isNullOrBlank()) {
+                emptyList()
+            } else {
+                runCatching { eqJson.decodeFromString<List<AutoEqLayer>>(raw).map { it.sanitized() } }
+                    .getOrDefault(emptyList())
+            }
+        }
+
+    override suspend fun setEqualizerCustomAutoEqProfiles(profiles: List<AutoEqLayer>) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[EQUALIZER_CUSTOM_AUTOEQ_PROFILES] = eqJson.encodeToString(profiles.map { it.sanitized() })
+            }
+        }
+    }
+
+    override val equalizerPerOutputEnabled: Flow<Boolean> =
+        settingsDataStore.data.map { preferences ->
+            preferences[EQUALIZER_PER_OUTPUT_ENABLED] == TRUE
+        }
+
+    override suspend fun setEqualizerPerOutputEnabled(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[EQUALIZER_PER_OUTPUT_ENABLED] = if (enabled) TRUE else FALSE
+            }
+        }
+    }
+
+    override val equalizerOutputProfileMap: Flow<Map<String, String>> =
+        settingsDataStore.data.map { preferences ->
+            val raw = preferences[EQUALIZER_OUTPUT_PROFILE_MAP]
+            if (raw.isNullOrBlank()) {
+                emptyMap()
+            } else {
+                runCatching { eqJson.decodeFromString<Map<String, String>>(raw) }.getOrDefault(emptyMap())
+            }
+        }
+
+    override suspend fun setEqualizerOutputProfileMap(map: Map<String, String>) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[EQUALIZER_OUTPUT_PROFILE_MAP] = eqJson.encodeToString(map)
             }
         }
     }
@@ -1992,6 +2123,19 @@ internal class DataStoreManagerImpl(
         val EQUALIZER_ENABLED = stringPreferencesKey("equalizer_enabled")
         val EQUALIZER_TYPE = stringPreferencesKey("equalizer_type")
         val EQUALIZER_PREAMP = stringPreferencesKey("equalizer_preamp")
+        val EQUALIZER_ENHANCEMENTS = stringPreferencesKey("equalizer_enhancements_json")
+        val EQUALIZER_SAVED_PROFILES = stringPreferencesKey("equalizer_saved_profiles_json")
+        val EQUALIZER_ACTIVE_PROFILE_ID = stringPreferencesKey("equalizer_active_profile_id")
+        val EQUALIZER_AUTOEQ_LAYER = stringPreferencesKey("equalizer_autoeq_layer_json")
+        val EQUALIZER_CUSTOM_AUTOEQ_PROFILES = stringPreferencesKey("equalizer_custom_autoeq_profiles_json")
+        val EQUALIZER_PER_OUTPUT_ENABLED = stringPreferencesKey("equalizer_per_output_enabled")
+        val EQUALIZER_OUTPUT_PROFILE_MAP = stringPreferencesKey("equalizer_output_profile_map_json")
+
+        private val eqJson =
+            Json {
+                ignoreUnknownKeys = true
+                encodeDefaults = true
+            }
         val DELAY_ENABLED = stringPreferencesKey("delay_enabled")
         val DELAY_TIME_MS = stringPreferencesKey("delay_time_ms")
         val DELAY_FEEDBACK = stringPreferencesKey("delay_feedback")
