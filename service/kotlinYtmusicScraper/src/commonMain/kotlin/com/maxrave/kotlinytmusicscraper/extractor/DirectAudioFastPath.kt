@@ -38,6 +38,7 @@ internal class DirectAudioFastPathState(
     private data class Snapshot(
         val trustedUntilMs: Long = 0L,
         val cooldownUntilMs: Long = 0L,
+        val consecutiveTransportFailures: Int = 0,
         val servedVideoIds: List<String> = emptyList(),
     )
 
@@ -55,7 +56,10 @@ internal class DirectAudioFastPathState(
             if (nowMs < current.cooldownUntilMs) {
                 current
             } else {
-                current.copy(trustedUntilMs = nowMs + trustWindowMs)
+                current.copy(
+                    trustedUntilMs = nowMs + trustWindowMs,
+                    consecutiveTransportFailures = 0,
+                )
             }
         }
     }
@@ -70,8 +74,37 @@ internal class DirectAudioFastPathState(
                 } else {
                     updated
                 }
-            current.copy(servedVideoIds = trimmed)
+            current.copy(
+                servedVideoIds = trimmed,
+                consecutiveTransportFailures = 0,
+            )
         }
+    }
+
+    /**
+     * Records a transient transport/network failure (e.g. mobile 4G timeout). Enters global
+     * cooldown only after [consecutiveThreshold] consecutive failures so a single network blip
+     * does not disable `VISIONOS` for 15 minutes.
+     */
+    fun recordTransportFailure(
+        nowMs: Long,
+        consecutiveThreshold: Int = DEFAULT_TRANSPORT_FAILURE_THRESHOLD,
+    ): Boolean {
+        var enteredCooldown = false
+        state.update { current ->
+            val nextCount = current.consecutiveTransportFailures + 1
+            if (nextCount >= consecutiveThreshold) {
+                enteredCooldown = true
+                current.copy(
+                    trustedUntilMs = 0L,
+                    cooldownUntilMs = nowMs + cooldownMs,
+                    consecutiveTransportFailures = 0,
+                )
+            } else {
+                current.copy(consecutiveTransportFailures = nextCount)
+            }
+        }
+        return enteredCooldown
     }
 
     fun markFailedOrRejected(nowMs: Long) {
@@ -79,6 +112,7 @@ internal class DirectAudioFastPathState(
             current.copy(
                 trustedUntilMs = 0L,
                 cooldownUntilMs = nowMs + cooldownMs,
+                consecutiveTransportFailures = 0,
             )
         }
     }
@@ -101,6 +135,7 @@ internal class DirectAudioFastPathState(
                 current.copy(
                     trustedUntilMs = 0L,
                     cooldownUntilMs = nowMs + cooldownMs,
+                    consecutiveTransportFailures = 0,
                     servedVideoIds = current.servedVideoIds.filterNot { it == videoId },
                 )
             }
@@ -115,7 +150,24 @@ internal class DirectAudioFastPathState(
     companion object {
         const val DEFAULT_TRUST_WINDOW_MS = 5 * 60 * 1000L
         const val DEFAULT_COOLDOWN_MS = 15 * 60 * 1000L
+        const val DEFAULT_TRANSPORT_FAILURE_THRESHOLD = 2
         const val MAX_SERVED_TRACKS = 32
+
+        private val PER_TRACK_REFUSAL_STATUSES =
+            setOf(
+                "UNPLAYABLE",
+                "LOGIN_REQUIRED",
+                "CONTENT_CHECK_REQUIRED",
+                "AGE_VERIFICATION_REQUIRED",
+                "LIVE_STREAM_OFFLINE",
+            )
+
+        /**
+         * Returns true when [status] indicates a restriction on the requested track itself rather
+         * than a broken `VISIONOS` client/visitor session, so global cooldown must not be triggered.
+         */
+        fun isPerTrackPlayabilityRefusal(status: String?): Boolean =
+            status?.uppercase() in PER_TRACK_REFUSAL_STATUSES
     }
 }
 

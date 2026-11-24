@@ -162,32 +162,13 @@ internal fun parsePlaylistData(
                 Logger.d("PlaylistParser", "title: $title")
                 val secondSubtitle = header.secondSubtitle?.runs
                 if (!secondSubtitle.isNullOrEmpty()) {
-                    /**
-                     * Fuck Kotlin
-                     * Ref: https://stackoverflow.com/q/48379981/20605098
-                     */
-                    trackCount =
-                        try {
-                            if (secondSubtitle.size >= 5) {
-                                secondSubtitle
-                                    .getOrNull(2)
-                                    ?.text
-                                    ?.split("\\s".toRegex())
-                                    ?.firstOrNull()
-                                    ?.toInt() ?: 0
-                            } else {
-                                secondSubtitle
-                                    .firstOrNull()
-                                    ?.text
-                                    ?.split("\\s".toRegex())
-                                    ?.firstOrNull()
-                                    ?.toInt() ?: 0
-                            }
-                        } catch (e: Exception) {
-                            Logger.e("PlaylistParser", "Error parsing track count: ${e.message}")
-                            e.printStackTrace()
-                            0
+                    val rawTrackCount =
+                        if (secondSubtitle.size >= 5) {
+                            secondSubtitle.getOrNull(2)?.text
+                        } else {
+                            secondSubtitle.firstOrNull()?.text
                         }
+                    trackCount = parsePlaylistTrackCount(rawTrackCount)
                 }
                 year =
                     header.subtitle
@@ -523,4 +504,14 @@ internal fun parsePodcastContinueData(
 
         return listEpisode
     }
+}
+
+/**
+ * Parses a localized YouTube Music playlist track count run (e.g. `"42 songs"`, `"1.234 músicas"`,
+ * `"Nenhuma música"`, `"Nenhum"`) into a non-negative integer without throwing on non-numeric words.
+ */
+internal fun parsePlaylistTrackCount(raw: String?): Int {
+    val firstToken = raw?.trim()?.split(Regex("\\s+"))?.firstOrNull() ?: return 0
+    val digitsOnly = firstToken.filter { it.isDigit() }
+    return digitsOnly.toIntOrNull() ?: 0
 }

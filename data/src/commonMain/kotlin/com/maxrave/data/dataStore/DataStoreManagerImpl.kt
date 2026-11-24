@@ -2069,7 +2069,21 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val omvToAtvMappingJson: Flow<String> =
+        settingsDataStore.data.map { preferences ->
+            preferences[OMV_TO_ATV_MAPPING_JSON] ?: ""
+        }
+
+    override suspend fun setOmvToAtvMappingJson(json: String) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[OMV_TO_ATV_MAPPING_JSON] = json
+            }
+        }
+    }
+
     companion object Settings {
+        val OMV_TO_ATV_MAPPING_JSON = stringPreferencesKey("omv_to_atv_mapping_json")
         val APP_VERSION = stringPreferencesKey("app_version")
         val COOKIE = stringPreferencesKey("cookie")
 

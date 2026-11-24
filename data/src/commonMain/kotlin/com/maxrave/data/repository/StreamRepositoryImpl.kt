@@ -20,6 +20,7 @@ import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.domain.utils.MusicVideoType
 import com.maxrave.domain.data.model.streams.YouTubeWatchEndpoint.WatchEndpointMusicSupportedConfigs.WatchEndpointMusicConfig.Companion.MUSIC_VIDEO_TYPE_OMV
 import com.maxrave.domain.utils.Resource
+import com.maxrave.kotlinytmusicscraper.AudioVariantResolution
 import com.maxrave.kotlinytmusicscraper.StreamResolutionException
 import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.kotlinytmusicscraper.extractor.isUrlDurationCompatible
@@ -44,6 +45,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlin.math.abs
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
@@ -72,6 +75,8 @@ internal class StreamRepositoryImpl(
     private var nextFormatSeq = 0L
     private val verifiedAudioIds = MutableStateFlow<Set<String>>(emptySet())
     private val omvAudioTargetResolver = OmvAudioTargetResolver()
+    private val omvMappingPersistMutex = Mutex()
+    private val omvMappingJson = Json { ignoreUnknownKeys = true }
 
     private val trackingJobLock = Any()
     private var trackingResolveSeq = 0L
@@ -93,8 +98,13 @@ internal class StreamRepositoryImpl(
     private var cachedWatchVideo: String? = null
     @kotlin.concurrent.Volatile
     private var cachedSendBackToGoogle: String? = null
+    @kotlin.concurrent.Volatile
+    private var activeDataStoreManager: DataStoreManager? = null
+    @kotlin.concurrent.Volatile
+    private var omvMappingsHydrated = false
 
     private fun ensurePrefCollectors(dataStoreManager: DataStoreManager) {
+        activeDataStoreManager = dataStoreManager
         if (prefCollectorsStarted) return
         prefCollectorsStarted = true
         backgroundScope.launch { dataStoreManager.quality.distinctUntilChanged().collect { cachedQuality = it } }
@@ -104,6 +114,46 @@ internal class StreamRepositoryImpl(
         backgroundScope.launch { dataStoreManager.preferredAudioLanguage.distinctUntilChanged().collect { cachedPreferredAudioLanguage = it } }
         backgroundScope.launch { dataStoreManager.watchVideoInsteadOfPlayingAudio.distinctUntilChanged().collect { cachedWatchVideo = it } }
         backgroundScope.launch { dataStoreManager.sendBackToGoogle.distinctUntilChanged().collect { cachedSendBackToGoogle = it } }
+        backgroundScope.launch {
+            dataStoreManager.omvToAtvMappingJson.distinctUntilChanged().collect { raw ->
+                hydrateOmvMappingsFromJson(raw)
+                omvMappingsHydrated = true
+            }
+        }
+    }
+
+    private suspend fun ensureOmvMappingsHydrated(dataStoreManager: DataStoreManager) {
+        if (omvMappingsHydrated) return
+        val raw = runCatching { dataStoreManager.omvToAtvMappingJson.first() }.getOrDefault("")
+        hydrateOmvMappingsFromJson(raw)
+        omvMappingsHydrated = true
+    }
+
+    private fun hydrateOmvMappingsFromJson(raw: String) {
+        if (raw.isBlank()) return
+        val parsed =
+            runCatching {
+                omvMappingJson.decodeFromString<Map<String, String>>(raw)
+            }.getOrNull() ?: return
+        omvAudioTargetResolver.seedPositiveMappings(parsed)
+    }
+
+    private fun persistOmvMappingsAsync(dataStoreManager: DataStoreManager?) {
+        val manager = dataStoreManager ?: activeDataStoreManager ?: return
+        val snapshot = omvAudioTargetResolver.snapshotPositiveMappings()
+        backgroundScope.launch {
+            omvMappingPersistMutex.withLock {
+                runCatching {
+                    val encoded =
+                        if (snapshot.isEmpty()) {
+                            ""
+                        } else {
+                            omvMappingJson.encodeToString(snapshot)
+                        }
+                    manager.setOmvToAtvMappingJson(encoded)
+                }
+            }
+        }
     }
 
     private fun beginBackgroundTrackingResolution(): Long =
@@ -265,25 +315,24 @@ internal class StreamRepositoryImpl(
         withContext(Dispatchers.IO) {
             val song = localDataSource.getSong(videoId) ?: return@withContext
             val storedFormat = formatCache.value[videoId]?.second ?: localDataSource.getNewFormat(videoId)
-            val omvNeedsUpgrade =
-                song.videoType == MUSIC_VIDEO_TYPE_OMV &&
-                    (storedFormat == null ||
-                        (song.durationSeconds > 0 &&
-                            storedFormat.lengthSeconds != null &&
-                            abs(storedFormat.lengthSeconds!! - song.durationSeconds) >= 2))
             val durationMismatch =
                 song.durationSeconds > 0 &&
                     storedFormat?.lengthSeconds != null &&
                     abs(storedFormat.lengthSeconds!! - song.durationSeconds) >= 2
+            val omvNeedsUpgrade =
+                song.videoType == MUSIC_VIDEO_TYPE_OMV &&
+                    (storedFormat == null || durationMismatch)
             if (omvNeedsUpgrade || durationMismatch) {
-                Logger.i(
-                    "Stream",
-                    "Evicting mismatched OMV/duration cache for $videoId " +
-                        "(songType=${song.videoType}, songDur=${song.durationSeconds}s, formatDur=${storedFormat?.lengthSeconds}s)",
-                )
-                cacheRepository.removeCachedSong(videoId)
                 if (storedFormat != null) {
+                    Logger.i(
+                        "Stream",
+                        "Evicting mismatched OMV/duration cache for $videoId " +
+                            "(songType=${song.videoType}, songDur=${song.durationSeconds}s, formatDur=${storedFormat.lengthSeconds}s)",
+                    )
+                    cacheRepository.removeCachedSong(videoId)
                     invalidateFormat(videoId)
+                } else {
+                    cacheRepository.removeCachedSong(videoId)
                 }
             } else if (storedFormat != null) {
                 verifiedAudioIds.update { it + videoId }
@@ -469,13 +518,16 @@ internal class StreamRepositoryImpl(
                 )
             }
             try {
+                if (allowAudioUpgrade) {
+                    ensureOmvMappingsHydrated(dataStoreManager)
+                }
                 val initialResolution =
                     omvAudioTargetResolver.resolveInitialTarget(
                         videoId = videoId,
                         localVideoType = localSong?.videoType,
                         allowAudioUpgrade = allowAudioUpgrade,
                     ) {
-                        youTube.resolveOfficialAudioVariantId(
+                        youTube.resolveOfficialAudioVariantResult(
                             videoId = videoId,
                             title = localSong?.title,
                             artist = localSong?.artistName?.firstOrNull(),
@@ -485,6 +537,7 @@ internal class StreamRepositoryImpl(
                 var initialResolveId = initialResolution.targetId
                 if (initialResolution.upgradedBeforePlayer && initialResolveId != videoId) {
                     Logger.i("Stream", "Pre-resolved OMV $videoId -> ATV $initialResolveId before extraction")
+                    persistOmvMappingsAsync(dataStoreManager)
                 }
                 val expectedSongDuration = localSong?.durationSeconds?.takeIf { it > 0 }
                 val primaryPlayerResult =
@@ -510,6 +563,7 @@ internal class StreamRepositoryImpl(
                             "Pre-resolved ATV $initialResolveId failed for $videoId (${failure?.message}); falling back to original ID",
                         )
                         omvAudioTargetResolver.evictMapping(videoId)
+                        persistOmvMappingsAsync(dataStoreManager)
                         initialResolveId = videoId
                         youTube.player(
                             videoId,
@@ -533,58 +587,85 @@ internal class StreamRepositoryImpl(
                         var data = initialData
                         var response = data.second
                         var isLive = response.videoDetails?.isLive == true
+                        val initialDur = response.videoDetails?.lengthSeconds?.toIntOrNull()
+                        val hasDurationMismatch =
+                            localSong != null &&
+                                localSong.durationSeconds > 0 &&
+                                initialDur != null &&
+                                abs(initialDur - localSong.durationSeconds) >= 2
                         if (allowAudioUpgrade &&
                             !isLive &&
                             omvAudioTargetResolver.shouldAttemptPostPlayerLookup(
                                 videoId = videoId,
                                 resolvedSourceId = resolvedSourceId,
                                 preResolvedAtvAttempted = initialResolution.preResolvedAtvAttempted,
+                                preResolveTransientFailure = initialResolution.preResolveTransientFailure,
+                                hasDurationMismatch = hasDurationMismatch,
                             )
                         ) {
-                            val initialDur = response.videoDetails?.lengthSeconds?.toIntOrNull()
                             val shouldTryAudioVariant =
                                 localSong?.videoType == MUSIC_VIDEO_TYPE_OMV ||
                                     (data.third == MediaType.Video && !localSong?.albumId.isNullOrEmpty()) ||
-                                    (localSong != null &&
-                                        localSong.durationSeconds > 0 &&
-                                        initialDur != null &&
-                                        abs(initialDur - localSong.durationSeconds) >= 2)
+                                    hasDurationMismatch
                             if (shouldTryAudioVariant) {
-                                val atvId =
-                                    youTube.resolveOfficialAudioVariantId(
-                                        videoId = videoId,
-                                        title = localSong.title.ifBlank { response.videoDetails?.title ?: "" }.ifBlank { null },
-                                        artist = localSong.artistName?.firstOrNull() ?: response.videoDetails?.author,
-                                        expectedDurationSec = localSong.durationSeconds.takeIf { it > 0 },
-                                    )
-                                if (atvId != null && atvId != videoId) {
-                                    youTube
-                                        .player(
-                                            atvId,
-                                            noLogIn = muxed,
-                                            preferredAudioLanguage = preferredAudioLanguage,
-                                            isVideo = false,
-                                            preferImmediateDirect = preferImmediate,
-                                            expectedDurationSec = expectedSongDuration,
-                                            knownMusicVideoType = "MUSIC_VIDEO_TYPE_ATV",
-                                            sendPlaybackTracking = sendTracking,
-                                            backgroundScope = backgroundScope,
-                                            registerBackgroundJob = { job -> registerBackgroundTrackingJob(resolveSeq, job) },
-                                            onBackgroundTrackingUpdate = onBgTrackingUpdate,
-                                        ).onSuccess { atvData ->
-                                            val atvDur = atvData.second.videoDetails?.lengthSeconds?.toIntOrNull()
-                                            Logger.i(
-                                                "Stream",
-                                                "Upgraded OMV stream $videoId (${initialDur}s) -> ATV $atvId (${atvDur}s)",
-                                            )
-                                            omvAudioTargetResolver.recordPositive(videoId, atvId)
-                                            resolvedSourceId = atvId
-                                            data = atvData
-                                            response = atvData.second
-                                            isLive = response.videoDetails?.isLive == true
+                                val lookupTitle =
+                                    localSong?.title?.ifBlank { response.videoDetails?.title ?: "" }?.ifBlank { null }
+                                        ?: response.videoDetails?.title?.ifBlank { null }
+                                val lookupArtist =
+                                    localSong?.artistName?.firstOrNull() ?: response.videoDetails?.author
+                                val lookupExpectedDur = localSong?.durationSeconds?.takeIf { it > 0 }
+                                when (
+                                    val outcome =
+                                        youTube.resolveOfficialAudioVariantResult(
+                                            videoId = videoId,
+                                            title = lookupTitle,
+                                            artist = lookupArtist,
+                                            expectedDurationSec = lookupExpectedDur,
+                                        )
+                                ) {
+                                    is AudioVariantResolution.Found -> {
+                                        val atvId = outcome.videoId
+                                        if (atvId.isNotBlank() && atvId != videoId) {
+                                            youTube
+                                                .player(
+                                                    atvId,
+                                                    noLogIn = muxed,
+                                                    preferredAudioLanguage = preferredAudioLanguage,
+                                                    isVideo = false,
+                                                    preferImmediateDirect = preferImmediate,
+                                                    expectedDurationSec = expectedSongDuration,
+                                                    knownMusicVideoType = "MUSIC_VIDEO_TYPE_ATV",
+                                                    sendPlaybackTracking = sendTracking,
+                                                    backgroundScope = backgroundScope,
+                                                    registerBackgroundJob = { job -> registerBackgroundTrackingJob(resolveSeq, job) },
+                                                    onBackgroundTrackingUpdate = onBgTrackingUpdate,
+                                                ).onSuccess { atvData ->
+                                                    val atvDur = atvData.second.videoDetails?.lengthSeconds?.toIntOrNull()
+                                                    Logger.i(
+                                                        "Stream",
+                                                        "Upgraded OMV stream $videoId (${initialDur}s) -> ATV $atvId (${atvDur}s)",
+                                                    )
+                                                    cacheRepository.removeCachedSong(videoId)
+                                                    omvAudioTargetResolver.recordPositive(videoId, atvId)
+                                                    persistOmvMappingsAsync(dataStoreManager)
+                                                    resolvedSourceId = atvId
+                                                    data = atvData
+                                                    response = atvData.second
+                                                    isLive = response.videoDetails?.isLive == true
+                                                }
                                         }
-                                } else {
-                                    omvAudioTargetResolver.recordNegative(videoId)
+                                    }
+
+                                    AudioVariantResolution.NotFound -> {
+                                        omvAudioTargetResolver.recordNegative(videoId)
+                                    }
+
+                                    is AudioVariantResolution.TransientFailure -> {
+                                        Logger.w(
+                                            "Stream",
+                                            "OMV -> ATV lookup failed transiently for $videoId (${outcome.reason}); will retry next play",
+                                        )
+                                    }
                                 }
                             }
                         }

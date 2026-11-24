@@ -7,8 +7,10 @@ import com.maxrave.kotlinytmusicscraper.models.SongItem
 import com.maxrave.kotlinytmusicscraper.models.WatchEndpoint
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.ANDROID
+import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.ANDROID_MUSIC
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.IOS
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.TVHTML5
+import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.TVHTML5_SIMPLY
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.VISIONOS
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.WEB_REMIX
 import com.maxrave.kotlinytmusicscraper.models.YouTubeLocale
@@ -40,6 +42,7 @@ import io.ktor.client.engine.ProxyConfig
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.HttpRedirect
 import io.ktor.client.plugins.HttpResponseValidator
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.compression.ContentEncoding
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
@@ -259,6 +262,7 @@ class Ytmusic {
         setLogin: Boolean = false,
         isUsingReferer: Boolean = true,
         customCookie: String? = null,
+        origin: String = "https://music.youtube.com",
     ) {
         contentType(ContentType.Application.Json)
         headers {
@@ -269,7 +273,7 @@ class Ytmusic {
             pageId?.let {
                 append("X-Goog-Pageid", it)
             }
-            append("x-origin", "https://music.youtube.com")
+            append("x-origin", origin)
             if (client.referer != null && isUsingReferer) {
                 append("Referer", client.referer)
             }
@@ -281,7 +285,7 @@ class Ytmusic {
                     val activeMap = if (customCookie != null) parseCookieString(cookieValue) else storedMap
                     val sapisidCookie = activeMap["SAPISID"] ?: activeMap["__Secure-3PAPISID"] ?: return@let
                     val currentTime = now().toInstant(TimeZone.currentSystemDefault()).epochSeconds
-                    val sapisidHash = sha1("$currentTime $sapisidCookie https://music.youtube.com")
+                    val sapisidHash = sha1("$currentTime $sapisidCookie $origin")
                     Logger.d(TAG, "SAPI SID Hash: SAPISIDHASH ${currentTime}_$sapisidHash")
                     append("Authorization", "SAPISIDHASH ${currentTime}_$sapisidHash")
                 }
@@ -610,33 +614,42 @@ class Ytmusic {
         cpn: String?,
         signatureTimestamp: Int? = null,
         setLogin: Boolean = true,
-    ) = httpClient.post("player") {
-        ytClient(client, setLogin = setLogin)
-        setBody(
-            PlayerBody(
-                context =
-                    client.toContext(locale, visitorData).let {
-                        if (client == TVHTML5) {
-                            it.copy(
-                                thirdParty =
-                                    Context.ThirdParty(
-                                        embedUrl = "https://www.youtube.com/watch?v=$videoId",
-                                    ),
-                            )
-                        } else {
-                            it
-                        }
-                    },
-                videoId = videoId,
-                playlistId = playlistId,
-                cpn = cpn,
-                playbackContext =
-                    PlayerBody.PlaybackContext(
-                        contentPlaybackContext =
-                            PlayerBody.PlaybackContext.ContentPlaybackContext(
-                                signatureTimestamp = signatureTimestamp ?: 20073,
-                            ),
-                    ),
+    ): HttpResponse {
+        val isMusicClient = client == WEB_REMIX || client == ANDROID_MUSIC
+        val endpointUrl =
+            if (isMusicClient) {
+                "player"
+            } else {
+                "https://youtubei.googleapis.com/youtubei/v1/player"
+            }
+        val origin = if (isMusicClient) "https://music.youtube.com" else "https://www.youtube.com"
+        return httpClient.post(endpointUrl) {
+            ytClient(client, setLogin = setLogin, origin = origin)
+            setBody(
+                PlayerBody(
+                    context =
+                        client.toContext(locale, visitorData).let {
+                            if (client == TVHTML5 || client == TVHTML5_SIMPLY) {
+                                it.copy(
+                                    thirdParty =
+                                        Context.ThirdParty(
+                                            embedUrl = "https://www.youtube.com/watch?v=$videoId",
+                                        ),
+                                )
+                            } else {
+                                it
+                            }
+                        },
+                    videoId = videoId,
+                    playlistId = playlistId,
+                    cpn = cpn,
+                    playbackContext =
+                        PlayerBody.PlaybackContext(
+                            contentPlaybackContext =
+                                PlayerBody.PlaybackContext.ContentPlaybackContext(
+                                    signatureTimestamp = signatureTimestamp ?: 20073,
+                                ),
+                        ),
 //                serviceIntegrityDimensions =
 //                    if (poToken != null) {
 //                        PlayerBody.ServiceIntegrityDimensions(
@@ -645,8 +658,9 @@ class Ytmusic {
 //                    } else {
 //                        null
 //                    },
-            ),
-        )
+                ),
+            )
+        }
     }
 
     suspend fun pipedStreams(
@@ -985,8 +999,10 @@ class Ytmusic {
         index: Int?,
         params: String?,
         continuation: String? = null,
+        noLogin: Boolean = false,
     ) = httpClient.post("next") {
-        ytClient(client, setLogin = true)
+        val sendLogin = !noLogin && !cookie.isNullOrEmpty()
+        ytClient(client, setLogin = sendLogin)
         setBody(
             NextBody(
                 context = client.toContext(locale, visitorData),

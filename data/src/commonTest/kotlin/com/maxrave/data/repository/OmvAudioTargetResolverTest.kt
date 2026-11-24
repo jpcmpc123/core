@@ -2,6 +2,7 @@ package com.maxrave.data.repository
 
 import com.maxrave.domain.data.model.streams.YouTubeWatchEndpoint.WatchEndpointMusicSupportedConfigs.WatchEndpointMusicConfig.Companion.MUSIC_VIDEO_TYPE_ATV
 import com.maxrave.domain.data.model.streams.YouTubeWatchEndpoint.WatchEndpointMusicSupportedConfigs.WatchEndpointMusicConfig.Companion.MUSIC_VIDEO_TYPE_OMV
+import com.maxrave.kotlinytmusicscraper.AudioVariantResolution
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -21,12 +22,13 @@ class OmvAudioTargetResolverTest {
                 allowAudioUpgrade = true,
             ) {
                 lookups++
-                "OCY9vN4QzqY"
+                AudioVariantResolution.Found("OCY9vN4QzqY")
             }
 
         assertEquals("OCY9vN4QzqY", first.targetId)
         assertTrue(first.upgradedBeforePlayer)
         assertTrue(first.preResolvedAtvAttempted)
+        assertFalse(first.preResolveTransientFailure)
         assertEquals(1, lookups)
         assertEquals("OCY9vN4QzqY", resolver.mappedAtvOf("ukbiRcyzrpc"))
 
@@ -38,7 +40,7 @@ class OmvAudioTargetResolverTest {
                 allowAudioUpgrade = true,
             ) {
                 lookups++
-                "SHOULD_NOT_RUN"
+                AudioVariantResolution.Found("SHOULD_NOT_RUN")
             }
 
         assertEquals("OCY9vN4QzqY", second.targetId)
@@ -47,8 +49,62 @@ class OmvAudioTargetResolverTest {
     }
 
     @Test
-    fun omvWithoutAtvCounterpartIsNegativelyCachedAcrossSession() {
+    fun transientTimeoutNeverBlacklistsOmvAndAllowsNextPlayToUpgrade() {
         val resolver = OmvAudioTargetResolver()
+        var lookups = 0
+
+        // First play: 4G stall causes timeout -> TransientFailure.
+        val first =
+            resolver.resolveInitialTarget(
+                videoId = "KLD_OyCSloA",
+                localVideoType = MUSIC_VIDEO_TYPE_OMV,
+                allowAudioUpgrade = true,
+            ) {
+                lookups++
+                AudioVariantResolution.TransientFailure("timeout")
+            }
+
+        assertEquals("KLD_OyCSloA", first.targetId)
+        assertFalse(first.upgradedBeforePlayer)
+        assertTrue(first.preResolvedAtvAttempted)
+        assertTrue(first.preResolveTransientFailure)
+        assertFalse(resolver.hasNegativeEntry("KLD_OyCSloA"))
+        // Duration mismatch detected post-player still triggers retry even in the same call.
+        assertTrue(
+            resolver.shouldAttemptPostPlayerLookup(
+                videoId = "KLD_OyCSloA",
+                resolvedSourceId = "KLD_OyCSloA",
+                preResolvedAtvAttempted = first.preResolvedAtvAttempted,
+                preResolveTransientFailure = first.preResolveTransientFailure,
+                hasDurationMismatch = true,
+            ),
+        )
+
+        // Second play: network recovers -> resolves official ATV studio track immediately.
+        val second =
+            resolver.resolveInitialTarget(
+                videoId = "KLD_OyCSloA",
+                localVideoType = MUSIC_VIDEO_TYPE_OMV,
+                allowAudioUpgrade = true,
+            ) {
+                lookups++
+                AudioVariantResolution.Found("HzYrZoALCCA")
+            }
+
+        assertEquals("HzYrZoALCCA", second.targetId)
+        assertTrue(second.upgradedBeforePlayer)
+        assertEquals(2, lookups)
+        assertEquals("HzYrZoALCCA", resolver.mappedAtvOf("KLD_OyCSloA"))
+    }
+
+    @Test
+    fun confirmedNotFoundIsCachedUntilTtlExpiresAndOverriddenByDurationMismatch() {
+        var nowMs = 1_000L
+        val resolver =
+            OmvAudioTargetResolver(
+                negativeTtlMs = 60_000L,
+                clockMs = { nowMs },
+            )
         var lookups = 0
 
         val first =
@@ -58,7 +114,7 @@ class OmvAudioTargetResolverTest {
                 allowAudioUpgrade = true,
             ) {
                 lookups++
-                null
+                AudioVariantResolution.NotFound
             }
 
         assertEquals("OMV_ONLY_ID", first.targetId)
@@ -70,10 +126,12 @@ class OmvAudioTargetResolverTest {
                 videoId = "OMV_ONLY_ID",
                 resolvedSourceId = "OMV_ONLY_ID",
                 preResolvedAtvAttempted = first.preResolvedAtvAttempted,
+                hasDurationMismatch = true,
             ),
         )
 
-        // Repeat play in same session skips lookup completely.
+        // Within TTL, repeat pre-lookup is skipped — unless a real duration mismatch is detected post-player.
+        nowMs += 30_000L
         val second =
             resolver.resolveInitialTarget(
                 videoId = "OMV_ONLY_ID",
@@ -81,9 +139,8 @@ class OmvAudioTargetResolverTest {
                 allowAudioUpgrade = true,
             ) {
                 lookups++
-                "SHOULD_NOT_RUN"
+                AudioVariantResolution.Found("SHOULD_NOT_RUN")
             }
-
         assertEquals("OMV_ONLY_ID", second.targetId)
         assertEquals(1, lookups)
         assertFalse(
@@ -91,8 +148,33 @@ class OmvAudioTargetResolverTest {
                 videoId = "OMV_ONLY_ID",
                 resolvedSourceId = "OMV_ONLY_ID",
                 preResolvedAtvAttempted = second.preResolvedAtvAttempted,
+                hasDurationMismatch = false,
             ),
         )
+        assertTrue(
+            resolver.shouldAttemptPostPlayerLookup(
+                videoId = "OMV_ONLY_ID",
+                resolvedSourceId = "OMV_ONLY_ID",
+                preResolvedAtvAttempted = second.preResolvedAtvAttempted,
+                hasDurationMismatch = true,
+            ),
+        )
+
+        // Once TTL expires, pre-lookup runs again automatically.
+        nowMs += 31_000L
+        assertFalse(resolver.hasNegativeEntry("OMV_ONLY_ID"))
+        val third =
+            resolver.resolveInitialTarget(
+                videoId = "OMV_ONLY_ID",
+                localVideoType = MUSIC_VIDEO_TYPE_OMV,
+                allowAudioUpgrade = true,
+            ) {
+                lookups++
+                AudioVariantResolution.Found("NEW_ATV_ID")
+            }
+        assertEquals("NEW_ATV_ID", third.targetId)
+        assertTrue(third.upgradedBeforePlayer)
+        assertEquals(2, lookups)
     }
 
     @Test
@@ -107,7 +189,7 @@ class OmvAudioTargetResolverTest {
                 allowAudioUpgrade = false,
             ) {
                 lookups++
-                "OCY9vN4QzqY"
+                AudioVariantResolution.Found("OCY9vN4QzqY")
             }
         assertEquals("ukbiRcyzrpc", videoMode.targetId)
         assertFalse(videoMode.preResolvedAtvAttempted)
@@ -120,7 +202,7 @@ class OmvAudioTargetResolverTest {
                 allowAudioUpgrade = true,
             ) {
                 lookups++
-                "SHOULD_NOT_RUN"
+                AudioVariantResolution.Found("SHOULD_NOT_RUN")
             }
         assertEquals("HzYrZoALCCA", atvTrack.targetId)
         assertFalse(atvTrack.preResolvedAtvAttempted)
@@ -132,6 +214,26 @@ class OmvAudioTargetResolverTest {
                 preResolvedAtvAttempted = atvTrack.preResolvedAtvAttempted,
             ),
         )
+    }
+
+    @Test
+    fun seedAndSnapshotPositiveMappingsRespectLruAndSessionPrecedence() {
+        val resolver = OmvAudioTargetResolver(maxPositiveEntries = 2)
+        resolver.recordPositive("KLD_OyCSloA", "HzYrZoALCCA")
+        resolver.seedPositiveMappings(
+            mapOf(
+                "OLD_OMV" to "OLD_ATV",
+                "KLD_OyCSloA" to "STALE_ATV",
+                "MID_OMV" to "MID_ATV",
+            ),
+        )
+
+        val snapshot = resolver.snapshotPositiveMappings()
+        assertEquals(2, snapshot.size)
+        // Session mapping for KLD_OyCSloA wins over stale persisted entry and stays newest.
+        assertEquals("HzYrZoALCCA", snapshot["KLD_OyCSloA"])
+        assertEquals("MID_ATV", snapshot["MID_OMV"])
+        assertNull(snapshot["OLD_OMV"])
     }
 
     @Test

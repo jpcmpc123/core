@@ -224,6 +224,9 @@ internal class MediaServiceHandlerImpl(
     private var playTimingVideoId: String? = null
 
     @Volatile
+    private var playTimingReadyLogged: Boolean = false
+
+    @Volatile
     private var pendingInsertSongJob: Pair<String, Job>? = null
 
     private val networkCallback =
@@ -2721,6 +2724,7 @@ internal class MediaServiceHandlerImpl(
 
         playTimingStartMs = SystemClock.elapsedRealtime()
         playTimingVideoId = track.videoId
+        playTimingReadyLogged = false
         pendingInsertSongJob =
             track.videoId to
             coroutineScope.launch(Dispatchers.IO) {
@@ -3097,14 +3101,24 @@ internal class MediaServiceHandlerImpl(
                 val durMs = player.duration
                 val activeBaseId = player.currentMediaItem?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO)
                 if (timingVideoId != null &&
+                    !playTimingReadyLogged &&
                     activeBaseId == timingVideoId &&
                     durMs > 0L &&
                     (player.bufferedPosition > 0L || player.currentPosition > 0L)
                 ) {
+                    val elapsed = SystemClock.elapsedRealtime() - playTimingStartMs
+                    playTimingReadyLogged = true
                     Logger.i(
                         "PlayTiming",
-                        "id=$timingVideoId ready=${SystemClock.elapsedRealtime() - playTimingStartMs}ms",
+                        "id=$timingVideoId ready=${elapsed}ms",
                     )
+                    if (player.isPlaying) {
+                        Logger.i(
+                            "PlayTiming",
+                            "id=$timingVideoId playing=${elapsed}ms",
+                        )
+                        playTimingVideoId = null
+                    }
                 }
                 if (durMs > 0L) {
                     val durSec = (durMs / 1000L).toInt()

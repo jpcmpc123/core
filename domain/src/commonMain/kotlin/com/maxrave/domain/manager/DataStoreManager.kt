@@ -708,6 +708,12 @@ interface DataStoreManager {
 
     suspend fun setAutoBackupLastTime(time: Long)
 
+    /** Persisted JSON map of confirmed `OMV -> ATV` audio track upgrades (bounded LRU). */
+    val omvToAtvMappingJson: Flow<String>
+        get() = kotlinx.coroutines.flow.flowOf("")
+
+    suspend fun setOmvToAtvMappingJson(json: String) {}
+
     enum class ProxyType {
         PROXY_TYPE_HTTP,
         PROXY_TYPE_SOCKS,

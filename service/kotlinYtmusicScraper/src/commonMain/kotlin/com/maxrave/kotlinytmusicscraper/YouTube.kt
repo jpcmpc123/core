@@ -39,6 +39,7 @@ import com.maxrave.kotlinytmusicscraper.models.YTItemType
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.ANDROID
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.IOS
+import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.ANDROID_MUSIC
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.TVHTML5
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.TVHTML5_SIMPLY
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.WEB
@@ -118,6 +119,8 @@ import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -157,8 +160,11 @@ private const val TAG = "YouTubeScraper"
  * resolver budget instead of eating the whole budget while the resolver waits on it. */
 private const val PLAYER_REQUEST_TIMEOUT_MS = 10_000L
 
-/** Short cap on OMV -> ATV official audio lookup so poor networks never stall playback start. */
-private const val AUDIO_VARIANT_RESOLVE_TIMEOUT_MS = 3_500L
+/** Cap on OMV -> ATV official audio lookup so poor networks still resolve studio tracks reliably. */
+private const val AUDIO_VARIANT_RESOLVE_TIMEOUT_MS = 5_000L
+
+/** Sub-budget for the `next` counterpart step so a slow `next` never starves `FILTER_SONG` search. */
+private const val AUDIO_VARIANT_NEXT_TIMEOUT_MS = 2_200L
 
 /** Fast cap on the anonymous VISIONOS direct audio POST before yielding to BravePipe. */
 private const val VISIONOS_FAST_PATH_TIMEOUT_MS = 3_000L
@@ -168,6 +174,22 @@ private const val VISIONOS_BRAVE_HEDGE_DELAY_MS = 700L
 
 /** Reuse anonymous VISIONOS visitorData (fetched without session cookies) for up to 30 minutes. */
 private const val VISIONOS_VISITOR_DATA_TTL_MS = 30 * 60 * 1000L
+
+/**
+ * Typed outcome of an `OMV -> ATV` official studio audio lookup so callers distinguish between a
+ * confirmed absence ([NotFound]) and a transient network/timeout error ([TransientFailure]).
+ */
+sealed interface AudioVariantResolution {
+    data class Found(
+        val videoId: String,
+    ) : AudioVariantResolution
+
+    data object NotFound : AudioVariantResolution
+
+    data class TransientFailure(
+        val reason: String,
+    ) : AudioVariantResolution
+}
 
 /**
  * Special thanks to [z-huang/InnerTune](https://github.com/z-huang/InnerTune)
@@ -599,51 +621,113 @@ class YouTube {
     ): List<SongItem> {
         if (songs.none { MusicVideoType.isVideoSong(it.musicVideoType) }) return songs
         val nextItems =
-            withTimeoutOrNull(1_000L) {
+            withTimeoutOrNull(2_500L) {
                 runCatching {
-                    next(WatchEndpoint(playlistId = playlistId)).getOrNull()?.items.orEmpty()
+                    next(WatchEndpoint(playlistId = playlistId), noLogin = true).getOrNull()?.items.orEmpty()
                 }.getOrDefault(emptyList())
             }.orEmpty()
-        if (nextItems.isEmpty()) return songs
-        return songs.map { song ->
-            if (!MusicVideoType.isVideoSong(song.musicVideoType)) {
-                return@map song
-            }
-            val resolvedAudio =
-                nextItems
-                    .firstOrNull { it.id == song.id }
-                    ?.counterpart
-                    ?.takeIf { MusicVideoType.isAudio(it.musicVideoType) }
-                    ?: nextItems.firstOrNull { candidate ->
-                        MusicVideoType.isAudio(candidate.musicVideoType) &&
-                            AudioVariantMatcher.isAudioCandidateMatch(
-                                candidate = candidate,
-                                expectedTitle = song.title,
-                                expectedArtist = song.artists.firstOrNull()?.name,
-                                expectedDurationSec = song.duration,
-                                excludeVideoId = song.id,
-                            )
-                    }
-            if (resolvedAudio != null) {
-                Logger.i(
-                    TAG,
-                    "Album track upgraded to ATV audio: ${song.title} (${song.id} ${song.musicVideoType} -> ${resolvedAudio.id} ${resolvedAudio.musicVideoType})",
-                )
-                song.copy(
-                    id = resolvedAudio.id,
-                    duration = resolvedAudio.duration ?: song.duration,
-                    musicVideoType = resolvedAudio.musicVideoType ?: "MUSIC_VIDEO_TYPE_ATV",
-                )
+        val afterNext =
+            if (nextItems.isEmpty()) {
+                songs
             } else {
-                song
+                songs.map { song ->
+                    if (!MusicVideoType.isVideoSong(song.musicVideoType)) {
+                        return@map song
+                    }
+                    val resolvedAudio =
+                        nextItems
+                            .firstOrNull { it.id == song.id }
+                            ?.counterpart
+                            ?.takeIf { MusicVideoType.isAudio(it.musicVideoType) }
+                            ?: nextItems.firstOrNull { candidate ->
+                                MusicVideoType.isAudio(candidate.musicVideoType) &&
+                                    AudioVariantMatcher.isAudioCandidateMatch(
+                                        candidate = candidate,
+                                        expectedTitle = song.title,
+                                        expectedArtist = song.artists.firstOrNull()?.name,
+                                        expectedDurationSec = song.duration,
+                                        excludeVideoId = song.id,
+                                    )
+                            }
+                    if (resolvedAudio != null) {
+                        Logger.i(
+                            TAG,
+                            "Album track upgraded to ATV audio: ${song.title} (${song.id} ${song.musicVideoType} -> ${resolvedAudio.id} ${resolvedAudio.musicVideoType})",
+                        )
+                        song.copy(
+                            id = resolvedAudio.id,
+                            duration = resolvedAudio.duration ?: song.duration,
+                            musicVideoType = resolvedAudio.musicVideoType ?: "MUSIC_VIDEO_TYPE_ATV",
+                        )
+                    } else {
+                        song
+                    }
+                }
             }
+        val unresolvedVideoIndices =
+            afterNext.indices
+                .filter { MusicVideoType.isVideoSong(afterNext[it].musicVideoType) }
+                .take(3)
+        if (unresolvedVideoIndices.isEmpty()) return afterNext
+
+        val searchReplacements =
+            withTimeoutOrNull(2_000L) {
+                coroutineScope {
+                    unresolvedVideoIndices
+                        .map { idx ->
+                            val song = afterNext[idx]
+                            async {
+                                val cleanedTitle =
+                                    AudioVariantMatcher.cleanTrackTitleForAudioSearch(song.title)
+                                        ?: return@async null
+                                val artistName = song.artists.firstOrNull()?.name?.trim().orEmpty()
+                                val query = "$cleanedTitle $artistName".trim()
+                                val candidates =
+                                    try {
+                                        search(query, SearchFilter.FILTER_SONG)
+                                            .getOrNull()
+                                            ?.items
+                                            .orEmpty()
+                                            .filterIsInstance<SongItem>()
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (_: Exception) {
+                                        emptyList()
+                                    }
+                                val best =
+                                    AudioVariantMatcher.pickBestAudioCandidate(
+                                        candidates = candidates,
+                                        expectedTitle = cleanedTitle,
+                                        expectedArtist = artistName.ifBlank { null },
+                                        expectedDurationSec = song.duration,
+                                        excludeVideoId = song.id,
+                                    )
+                                best?.let { idx to it }
+                            }
+                        }.awaitAll()
+                        .filterNotNull()
+                        .toMap()
+                }
+            }.orEmpty()
+        if (searchReplacements.isEmpty()) return afterNext
+        return afterNext.mapIndexed { idx, song ->
+            val resolvedAudio = searchReplacements[idx] ?: return@mapIndexed song
+            Logger.i(
+                TAG,
+                "Album track upgraded to ATV audio (search): ${song.title} (${song.id} ${song.musicVideoType} -> ${resolvedAudio.id} ${resolvedAudio.musicVideoType})",
+            )
+            song.copy(
+                id = resolvedAudio.id,
+                duration = resolvedAudio.duration ?: song.duration,
+                musicVideoType = resolvedAudio.musicVideoType ?: "MUSIC_VIDEO_TYPE_ATV",
+            )
         }
     }
 
     /**
      * Resolves an official `MUSIC_VIDEO_TYPE_ATV` audio track ID for [videoId] (e.g. an `OMV` music
      * video whose audio stream carries an intro silence or credit roll). Returns null if no closely
-     * matching official studio track exists.
+     * matching official studio track exists or the lookup fails transiently.
      */
     suspend fun resolveOfficialAudioVariantId(
         videoId: String,
@@ -651,56 +735,84 @@ class YouTube {
         artist: String?,
         expectedDurationSec: Int? = null,
     ): String? =
-        resolveOfficialAudioVariant(
-            excludeVideoId = videoId,
-            title = title,
-            artist = artist,
-            expectedDurationSec = expectedDurationSec,
-        )?.id
+        (resolveOfficialAudioVariantResult(videoId, title, artist, expectedDurationSec) as? AudioVariantResolution.Found)?.videoId
 
-    private suspend fun resolveOfficialAudioVariant(
-        excludeVideoId: String,
+    /**
+     * Typed version of [resolveOfficialAudioVariantId] that distinguishes confirmed absence
+     * ([AudioVariantResolution.NotFound]) from transient network/timeout failures
+     * ([AudioVariantResolution.TransientFailure]) so transient 4G stalls never poison the negative cache.
+     */
+    suspend fun resolveOfficialAudioVariantResult(
+        videoId: String,
         title: String?,
         artist: String?,
-        expectedDurationSec: Int?,
-    ): SongItem? =
+        expectedDurationSec: Int? = null,
+    ): AudioVariantResolution =
         withTimeoutOrNull(AUDIO_VARIANT_RESOLVE_TIMEOUT_MS) {
-            val nextItems =
-                try {
-                    next(WatchEndpoint(videoId = excludeVideoId)).getOrNull()?.items.orEmpty()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    emptyList()
+            var nextCompletedCleanly = false
+            val nextResult =
+                withTimeoutOrNull(AUDIO_VARIANT_NEXT_TIMEOUT_MS) {
+                    try {
+                        val res = next(WatchEndpoint(videoId = videoId), noLogin = true)
+                        if (res.isSuccess) {
+                            nextCompletedCleanly = true
+                            res.getOrNull()?.items.orEmpty()
+                        } else {
+                            null
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
                 }
-            nextItems
-                .firstOrNull { it.id == excludeVideoId }
+            nextResult
+                ?.firstOrNull { it.id == videoId }
                 ?.counterpart
                 ?.takeIf { counterpart ->
-                    counterpart.id != excludeVideoId &&
+                    counterpart.id != videoId &&
                         MusicVideoType.isAudio(counterpart.musicVideoType) &&
                         AudioVariantMatcher.isDurationClose(counterpart.duration, expectedDurationSec)
-                }?.let { return@withTimeoutOrNull it }
+                }?.let { return@withTimeoutOrNull AudioVariantResolution.Found(it.id) }
 
-            val cleanedTitle = AudioVariantMatcher.cleanTrackTitleForAudioSearch(title) ?: return@withTimeoutOrNull null
+            val cleanedTitle = AudioVariantMatcher.cleanTrackTitleForAudioSearch(title)
+            if (cleanedTitle == null) {
+                return@withTimeoutOrNull if (nextCompletedCleanly) {
+                    AudioVariantResolution.NotFound
+                } else {
+                    AudioVariantResolution.TransientFailure("next_failed_no_title")
+                }
+            }
             val cleanedArtist = artist?.trim().orEmpty()
             val query = "$cleanedTitle $cleanedArtist".trim()
-            val results =
+            val searchResult =
                 try {
-                    search(query, SearchFilter.FILTER_SONG).getOrNull()?.items.orEmpty()
+                    search(query, SearchFilter.FILTER_SONG)
                 } catch (e: CancellationException) {
                     throw e
-                } catch (_: Exception) {
-                    emptyList()
-                }.filterIsInstance<SongItem>()
-            AudioVariantMatcher.pickBestAudioCandidate(
-                candidates = results,
-                expectedTitle = cleanedTitle,
-                expectedArtist = cleanedArtist.ifBlank { null },
-                expectedDurationSec = expectedDurationSec,
-                excludeVideoId = excludeVideoId,
-            )
-        }
+                } catch (e: Exception) {
+                    return@withTimeoutOrNull AudioVariantResolution.TransientFailure(e.message ?: "search_exception")
+                }
+            if (searchResult.isFailure) {
+                return@withTimeoutOrNull AudioVariantResolution.TransientFailure(
+                    searchResult.exceptionOrNull()?.message ?: "search_failed",
+                )
+            }
+            val candidates = searchResult.getOrNull()?.items.orEmpty().filterIsInstance<SongItem>()
+            val best =
+                AudioVariantMatcher.pickBestAudioCandidate(
+                    candidates = candidates,
+                    expectedTitle = cleanedTitle,
+                    expectedArtist = cleanedArtist.ifBlank { null },
+                    expectedDurationSec = expectedDurationSec,
+                    excludeVideoId = videoId,
+                )
+            if (best != null) {
+                AudioVariantResolution.Found(best.id)
+            } else {
+                AudioVariantResolution.NotFound
+            }
+        } ?: AudioVariantResolution.TransientFailure("timeout")
 
     internal object AudioVariantMatcher {
         private val VIDEO_SUFFIX_REGEX =
@@ -2000,13 +2112,14 @@ class YouTube {
             } catch (e: Exception) {
                 val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
                 Logger.w(TAG, "VISIONOS player request failed for $videoId (${e.message})")
-                invalidateVisionOsVisitorData()
-                directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
+                if (directAudioFastPath.recordTransportFailure(Clock.System.now().toEpochMilliseconds())) {
+                    invalidateVisionOsVisitorData()
+                }
                 return DirectAudioOutcome.Failure("err", elapsed)
             }
         val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
         if (rawBody == null) {
-            directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
+            directAudioFastPath.recordTransportFailure(Clock.System.now().toEpochMilliseconds())
             return DirectAudioOutcome.Failure("timeout", elapsed)
         }
         val parsed = DirectAudioFastPathParser.parsePlayerJson(rawBody)
@@ -2021,8 +2134,10 @@ class YouTube {
         }
         if (parsed.status != "OK") {
             Logger.w(TAG, "VISIONOS refused $videoId (${parsed.status}: ${parsed.reason})")
-            invalidateVisionOsVisitorData()
-            directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
+            if (!DirectAudioFastPathState.isPerTrackPlayabilityRefusal(parsed.status)) {
+                invalidateVisionOsVisitorData()
+                directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
+            }
             return DirectAudioOutcome.Failure(parsed.status.lowercase(), elapsed)
         }
         val directStreams = DirectAudioFastPathParser.extractDirectAudioStreams(parsed)
@@ -2236,7 +2351,9 @@ class YouTube {
                             )
                         return@runCatching Triple(cpn, standalone, mediaType)
                     } else {
-                        directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
+                        // A duration mismatch means the requested videoId itself disagrees with
+                        // album/metadata duration (e.g. an OMV music video) — VISIONOS itself is
+                        // healthy, so do not put it into global 15-minute cooldown.
                         vrFailurePrefix = "visionos:dur_mismatch/${directOutcome.elapsedMs}ms"
                         immediateFallbackOutcome = directOutcome
                     }
@@ -2347,7 +2464,6 @@ class YouTube {
                         vrTierOverride = "visionos:ok/${directOutcome.elapsedMs}ms/${directOutcome.headLabel}"
                         response = merged
                     } else {
-                        directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
                         vrFailurePrefix = "visionos:dur_mismatch/${directOutcome.elapsedMs}ms"
                         streams = streamsDeferred.await()
                         if (streams.isEmpty()) {
@@ -2401,13 +2517,19 @@ class YouTube {
                     response = directFromTemp
                 } else {
                     // Cascade through clients that often serve direct URLs without web PO tokens
-                    // (including Made-for-Kids tracks where anonymous web extractors fail).
+                    // (including Made-for-Kids and LOGIN_REQUIRED tracks where anonymous web
+                    // extractors fail).
+                    val hasLoginCookie = !noLogIn && !cookie.isNullOrBlank()
                     val fallbackClients =
                         buildList {
                             if (!altClientTried) add(ANDROID to false)
                             add(IOS to false)
                             add(TVHTML5_SIMPLY to false)
-                            add(ANDROID to true)
+                            if (hasLoginCookie) {
+                                add(ANDROID_MUSIC to true)
+                                add(TVHTML5 to true)
+                                add(ANDROID to true)
+                            }
                         }
                     for ((client, withLogin) in fallbackClients) {
                         altClientTried = true
@@ -2666,6 +2788,7 @@ class YouTube {
     suspend fun next(
         endpoint: WatchEndpoint,
         continuation: String? = null,
+        noLogin: Boolean = false,
     ): Result<NextResult> =
         runCatching {
             val response =
@@ -2678,6 +2801,7 @@ class YouTube {
                         endpoint.index,
                         endpoint.params,
                         continuation,
+                        noLogin = noLogin,
                     ).body<NextResponse>()
             val playlistPanelRenderer =
                 response.continuationContents?.playlistPanelContinuation
@@ -2710,6 +2834,7 @@ class YouTube {
                             ?.automixPlaylistVideoRenderer
                             ?.navigationEndpoint
                             ?.watchPlaylistEndpoint!!,
+                        noLogin = noLogin,
                     ).getOrThrow()
                         .let { result ->
                             result.copy(

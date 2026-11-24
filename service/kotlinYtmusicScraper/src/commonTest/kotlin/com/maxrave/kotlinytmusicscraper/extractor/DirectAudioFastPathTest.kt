@@ -409,5 +409,38 @@ class DirectAudioFastPathTest {
             ),
         )
     }
+
+    @Test
+    fun perTrackPlayabilityRefusalsAreClassifiedSeparatelyFromClientErrors() {
+        assertTrue(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("UNPLAYABLE"))
+        assertTrue(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("login_required"))
+        assertTrue(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("CONTENT_CHECK_REQUIRED"))
+        assertTrue(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("AGE_VERIFICATION_REQUIRED"))
+        assertTrue(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("LIVE_STREAM_OFFLINE"))
+
+        assertFalse(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("ERROR"))
+        assertFalse(DirectAudioFastPathState.isPerTrackPlayabilityRefusal("OK"))
+        assertFalse(DirectAudioFastPathState.isPerTrackPlayabilityRefusal(null))
+    }
+
+    @Test
+    fun singleTransportFailureDoesNotCooldownUntilThresholdAndResetsOnSuccess() {
+        val state = DirectAudioFastPathState()
+        val t0 = 50_000L
+
+        // First isolated 4G timeout leaves VISIONOS available.
+        assertFalse(state.recordTransportFailure(t0))
+        assertTrue(state.isAvailable(t0 + 1_000L))
+
+        // Successful serve resets consecutive counter.
+        state.recordServed("HzYrZoALCCA")
+        assertFalse(state.recordTransportFailure(t0 + 2_000L))
+        assertTrue(state.isAvailable(t0 + 3_000L))
+
+        // Second consecutive transport failure enters 15-minute cooldown.
+        assertTrue(state.recordTransportFailure(t0 + 4_000L))
+        assertFalse(state.isAvailable(t0 + 5_000L))
+        assertTrue(state.isAvailable(t0 + 4_000L + DirectAudioFastPathState.DEFAULT_COOLDOWN_MS))
+    }
 }
 
