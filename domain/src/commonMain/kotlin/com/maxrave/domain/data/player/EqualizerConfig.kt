@@ -22,18 +22,19 @@ const val EQUALIZER_BASS_MAX_DB: Float = 9f
 const val EQUALIZER_TREBLE_MIN_DB: Float = -6f
 const val EQUALIZER_TREBLE_MAX_DB: Float = 9f
 const val EQUALIZER_STEREO_WIDTH_MIN: Float = 0f
-const val EQUALIZER_STEREO_WIDTH_MAX: Float = 1.5f
+const val EQUALIZER_STEREO_WIDTH_MAX: Float = 1.75f
+const val EQUALIZER_SPATIAL_STAGE_MAX: Float = 1.0f
 
 const val EQUALIZER_SUBSONIC_HZ: Double = 28.0
 const val EQUALIZER_BASS_SHELF_HZ: Double = 70.0
-const val EQUALIZER_TREBLE_SHELF_HZ: Double = 9_500.0
+const val EQUALIZER_TREBLE_SHELF_HZ: Double = 6_000.0
 const val EQUALIZER_LOUDNESS_LOW_HZ: Double = 85.0
 const val EQUALIZER_LOUDNESS_HIGH_HZ: Double = 10_000.0
-const val EQUALIZER_BASS_MONO_HZ: Double = 140.0
+const val EQUALIZER_BASS_MONO_HZ: Double = 100.0
 
 @Serializable
 enum class PreampMode {
-    /** Cuts ~55% of positive peak sum (capped at -6 dB) and lets the true-peak limiter handle transients. */
+    /** Cuts ~35% of positive peak above +1 dB (capped at -4.5 dB) and lets the transparent limiter handle rare peaks. */
     AUTO_BALANCED,
 
     /** Cuts the full summed response peak (-0.5 dB margin) for strict studio headroom. */
@@ -73,6 +74,7 @@ data class EqualizerEnhancements(
     val trebleBoostDb: Float = 0f,
     val stereoWidth: Float = 1f,
     val bassMonoEnabled: Boolean = true,
+    val spatialStage: Float = 0f,
     val loudnessAmount: Float = 0f,
     val subsonicFilterEnabled: Boolean = true,
     val limiterEnabled: Boolean = true,
@@ -82,6 +84,7 @@ data class EqualizerEnhancements(
             bassBoostDb = finiteOr(bassBoostDb, 0f).coerceIn(0f, EQUALIZER_BASS_MAX_DB),
             trebleBoostDb = finiteOr(trebleBoostDb, 0f).coerceIn(EQUALIZER_TREBLE_MIN_DB, EQUALIZER_TREBLE_MAX_DB),
             stereoWidth = finiteOr(stereoWidth, 1f).coerceIn(EQUALIZER_STEREO_WIDTH_MIN, EQUALIZER_STEREO_WIDTH_MAX),
+            spatialStage = finiteOr(spatialStage, 0f).coerceIn(0f, EQUALIZER_SPATIAL_STAGE_MAX),
             loudnessAmount = finiteOr(loudnessAmount, 0f).coerceIn(0f, 1f),
         )
 
@@ -90,6 +93,7 @@ data class EqualizerEnhancements(
             bassBoostDb == 0f &&
                 trebleBoostDb == 0f &&
                 abs(stereoWidth - 1f) < 0.005f &&
+                spatialStage < 0.01f &&
                 loudnessAmount == 0f
 }
 
@@ -163,8 +167,8 @@ data class EqualizerConfig(
             }
             PreampMode.AUTO_BALANCED -> {
                 val peak = computePeakResponseDb(this, sampleRate)
-                val target = if (peak > 0.5f) -((peak - 0.5f) * 0.55f) else 0f
-                target.coerceIn(-6f, 0f)
+                val target = if (peak > 1.0f) -((peak - 1.0f) * 0.35f) else 0f
+                target.coerceIn(-4.5f, 0f)
             }
         }
     }
@@ -259,6 +263,7 @@ data class SavedEqualizerProfile(
     val trebleBoostDb: Float = 0f,
     val stereoWidth: Float = 1f,
     val bassMonoEnabled: Boolean = true,
+    val spatialStage: Float = 0f,
     val loudnessAmount: Float = 0f,
     val subsonicFilterEnabled: Boolean = true,
     val limiterEnabled: Boolean = true,
@@ -272,6 +277,7 @@ data class SavedEqualizerProfile(
             trebleBoostDb = trebleBoostDb,
             stereoWidth = stereoWidth,
             bassMonoEnabled = bassMonoEnabled,
+            spatialStage = spatialStage,
             loudnessAmount = loudnessAmount,
             subsonicFilterEnabled = subsonicFilterEnabled,
             limiterEnabled = limiterEnabled,
@@ -294,6 +300,7 @@ data class SavedEqualizerProfile(
         if (abs(trebleBoostDb - safeEnh.trebleBoostDb) >= 0.05f) return false
         if (abs(stereoWidth - safeEnh.stereoWidth) >= 0.02f) return false
         if (bassMonoEnabled != safeEnh.bassMonoEnabled) return false
+        if (abs(spatialStage - safeEnh.spatialStage) >= 0.02f) return false
         if (abs(loudnessAmount - safeEnh.loudnessAmount) >= 0.02f) return false
         if (subsonicFilterEnabled != safeEnh.subsonicFilterEnabled) return false
         if (limiterEnabled != safeEnh.limiterEnabled) return false

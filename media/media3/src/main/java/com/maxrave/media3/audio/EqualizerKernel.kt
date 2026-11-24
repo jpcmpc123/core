@@ -46,7 +46,7 @@ internal class EqualizerKernel {
     private var bassMonoY1 = 0.0
     private var bassMonoY2 = 0.0
 
-    /** Preamp, stereo width & A-B wet/dry smoothing ramps (10 ms). */
+    /** Preamp, stereo width, spatial stage & A-B wet/dry smoothing ramps (10 ms). */
     private var currentPreampGain = 1.0
     private var targetPreampGain = 1.0
     private var preampStep = 0.0
@@ -59,11 +59,36 @@ internal class EqualizerKernel {
     private var targetStereoWidth = 1.0
     private var stereoWidthStep = 0.0
 
+    private var currentSpatialStage = 0.0
+    private var targetSpatialStage = 0.0
+    private var spatialStageStep = 0.0
+
+    /** Pre-allocated early-reflection delay lines for Wavelet-style open spatial stage (L/R). */
+    private var spatialDelayL = DoubleArray(0)
+    private var spatialDelayR = DoubleArray(0)
+    private var spatialWriteIdx = 0
+    private var spatialTapL1 = 1
+    private var spatialTapL2 = 1
+    private var spatialTapL3 = 1
+    private var spatialTapL4 = 1
+    private var spatialTapR1 = 1
+    private var spatialTapR2 = 1
+    private var spatialTapR3 = 1
+    private var spatialTapR4 = 1
+    private var spatialHpfAlpha = 0.96
+    private var spatialLpfAlpha = 0.55
+    private var spatialSendPrevInL = 0.0
+    private var spatialSendPrevInR = 0.0
+    private var spatialSendHpfL = 0.0
+    private var spatialSendHpfR = 0.0
+    private var spatialSendLpfL = 0.0
+    private var spatialSendLpfR = 0.0
+
     private var bassMonoEnabled = true
     private var limiterEnabled = true
     private var bypassActive = true
 
-    /** Zero-latency fast-attack (0.25 ms) stereo-linked soft-knee limiter state. */
+    /** Zero-latency fast-attack (0.25 ms) stereo-linked transparent soft-knee limiter state. */
     private var limiterGain = 1.0
     private var limiterAttackCoeff = 0.9
     private var limiterReleaseCoeff = 0.999
@@ -83,7 +108,28 @@ internal class EqualizerKernel {
         this.channelCount = channelCount
         this.stageState = DoubleArray(channelCount * MAX_STAGES * STATE_PER_STAGE)
         this.limiterAttackCoeff = exp(-1.0 / (sampleRate * 0.00025))
-        this.limiterReleaseCoeff = exp(-1.0 / (sampleRate * 0.075))
+        this.limiterReleaseCoeff = exp(-1.0 / (sampleRate * 0.045))
+        val delayLen = max(64, (sampleRate * 0.032).roundToInt())
+        if (channelCount == 2) {
+            this.spatialDelayL = DoubleArray(delayLen)
+            this.spatialDelayR = DoubleArray(delayLen)
+            this.spatialTapL1 = max(1, (sampleRate * 0.0073).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapL2 = max(1, (sampleRate * 0.0137).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapL3 = max(1, (sampleRate * 0.0191).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapL4 = max(1, (sampleRate * 0.0247).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapR1 = max(1, (sampleRate * 0.0089).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapR2 = max(1, (sampleRate * 0.0153).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapR3 = max(1, (sampleRate * 0.0217).roundToInt()).coerceAtMost(delayLen - 1)
+            this.spatialTapR4 = max(1, (sampleRate * 0.0271).roundToInt()).coerceAtMost(delayLen - 1)
+        } else {
+            this.spatialDelayL = DoubleArray(0)
+            this.spatialDelayR = DoubleArray(0)
+        }
+        val dt = 1.0 / sampleRate
+        val hpfRc = 1.0 / (2.0 * PI * 240.0)
+        val lpfRc = 1.0 / (2.0 * PI * 6_500.0)
+        this.spatialHpfAlpha = hpfRc / (hpfRc + dt)
+        this.spatialLpfAlpha = dt / (lpfRc + dt)
         computeBassMonoHpCoeffs(sampleRate.toDouble())
         flush()
         this.appliedConfig = null
@@ -98,6 +144,15 @@ internal class EqualizerKernel {
         bassMonoX2 = 0.0
         bassMonoY1 = 0.0
         bassMonoY2 = 0.0
+        spatialDelayL.fill(0.0)
+        spatialDelayR.fill(0.0)
+        spatialWriteIdx = 0
+        spatialSendPrevInL = 0.0
+        spatialSendPrevInR = 0.0
+        spatialSendHpfL = 0.0
+        spatialSendHpfR = 0.0
+        spatialSendLpfL = 0.0
+        spatialSendLpfR = 0.0
         limiterGain = 1.0
     }
 
@@ -107,6 +162,8 @@ internal class EqualizerKernel {
         appliedConfig = null
         stageCount = 0
         stageState = DoubleArray(0)
+        spatialDelayL = DoubleArray(0)
+        spatialDelayR = DoubleArray(0)
         flush()
         currentPreampGain = 1.0
         targetPreampGain = 1.0
@@ -114,6 +171,8 @@ internal class EqualizerKernel {
         targetWet = 0.0
         currentStereoWidth = 1.0
         targetStereoWidth = 1.0
+        currentSpatialStage = 0.0
+        targetSpatialStage = 0.0
         bypassActive = true
     }
 
@@ -130,6 +189,8 @@ internal class EqualizerKernel {
             preampStep = (targetPreampGain - currentPreampGain) / rampSamples
             targetStereoWidth = 1.0
             stereoWidthStep = (targetStereoWidth - currentStereoWidth) / rampSamples
+            targetSpatialStage = 0.0
+            spatialStageStep = (targetSpatialStage - currentSpatialStage) / rampSamples
             if (currentWet <= 1e-6) {
                 bypassActive = true
             }
@@ -142,21 +203,21 @@ internal class EqualizerKernel {
         val preampDb = config.effectivePreampDb(sampleRate.toDouble())
         targetPreampGain = 10.0.pow(preampDb / 20.0).coerceIn(0.05, 4.0)
         if (wasFullBypass) {
-            stageState.fill(0.0)
-            bassMonoX1 = 0.0
-            bassMonoX2 = 0.0
-            bassMonoY1 = 0.0
-            bassMonoY2 = 0.0
-            limiterGain = 1.0
+            flush()
             currentPreampGain = targetPreampGain
             preampStep = 0.0
             currentStereoWidth = config.safeEnhancements.stereoWidth.toDouble()
             targetStereoWidth = currentStereoWidth
             stereoWidthStep = 0.0
+            currentSpatialStage = config.safeEnhancements.spatialStage.toDouble()
+            targetSpatialStage = currentSpatialStage
+            spatialStageStep = 0.0
         } else {
             preampStep = (targetPreampGain - currentPreampGain) / rampSamples
             targetStereoWidth = config.safeEnhancements.stereoWidth.toDouble()
             stereoWidthStep = (targetStereoWidth - currentStereoWidth) / rampSamples
+            targetSpatialStage = config.safeEnhancements.spatialStage.toDouble()
+            spatialStageStep = (targetSpatialStage - currentSpatialStage) / rampSamples
         }
 
         targetWet = 1.0
@@ -343,11 +404,7 @@ internal class EqualizerKernel {
         if (targetWet <= 1e-6 && currentWet <= 1e-6) {
             currentWet = 0.0
             bypassActive = true
-            stageState.fill(0.0)
-            bassMonoX1 = 0.0
-            bassMonoX2 = 0.0
-            bassMonoY1 = 0.0
-            bassMonoY2 = 0.0
+            flush()
         }
     }
 
@@ -379,6 +436,15 @@ internal class EqualizerKernel {
                 stereoWidthStep = 0.0
             }
         }
+        if (spatialStageStep != 0.0) {
+            currentSpatialStage += spatialStageStep
+            if ((spatialStageStep > 0.0 && currentSpatialStage >= targetSpatialStage) ||
+                (spatialStageStep < 0.0 && currentSpatialStage <= targetSpatialStage)
+            ) {
+                currentSpatialStage = targetSpatialStage
+                spatialStageStep = 0.0
+            }
+        }
     }
 
     private fun processStereoFrame(
@@ -391,7 +457,7 @@ internal class EqualizerKernel {
         var eqL = runBiquads(safeL * currentPreampGain, 0)
         var eqR = runBiquads(safeR * currentPreampGain, 1)
 
-        // Stereo width M/S + Bass Mono (< 140 Hz)
+        // Stereo width M/S + Bass Mono (< 100 Hz Butterworth, unity phase polarity)
         if (abs(currentStereoWidth - 1.0) > 0.002) {
             val mid = 0.5 * (eqL + eqR)
             val side = 0.5 * (eqL - eqR)
@@ -415,6 +481,43 @@ internal class EqualizerKernel {
             eqR = mid - shapedSide
         }
 
+        // Spatial Stage: Wavelet-style open early reflections (band-limited 240 Hz..6.5 kHz, zero echo)
+        val delayLen = spatialDelayL.size
+        if (delayLen > 0 && (currentSpatialStage > 0.002 || targetSpatialStage > 0.002)) {
+            val hpfL = spatialHpfAlpha * (spatialSendHpfL + eqL - spatialSendPrevInL)
+            spatialSendPrevInL = eqL
+            spatialSendHpfL = hpfL
+            val sendL = spatialSendLpfL + spatialLpfAlpha * (hpfL - spatialSendLpfL)
+            spatialSendLpfL = sendL
+
+            val hpfR = spatialHpfAlpha * (spatialSendHpfR + eqR - spatialSendPrevInR)
+            spatialSendPrevInR = eqR
+            spatialSendHpfR = hpfR
+            val sendR = spatialSendLpfR + spatialLpfAlpha * (hpfR - spatialSendLpfR)
+            spatialSendLpfR = sendR
+
+            val erL =
+                0.38 * readSpatialDelay(spatialDelayR, spatialTapL1) -
+                    0.28 * readSpatialDelay(spatialDelayL, spatialTapL2) +
+                    0.20 * readSpatialDelay(spatialDelayR, spatialTapL3) -
+                    0.14 * readSpatialDelay(spatialDelayL, spatialTapL4)
+            val erR =
+                0.38 * readSpatialDelay(spatialDelayL, spatialTapR1) -
+                    0.28 * readSpatialDelay(spatialDelayR, spatialTapR2) +
+                    0.20 * readSpatialDelay(spatialDelayL, spatialTapR3) -
+                    0.14 * readSpatialDelay(spatialDelayR, spatialTapR4)
+
+            spatialDelayL[spatialWriteIdx] = sendL
+            spatialDelayR[spatialWriteIdx] = sendR
+            var nextIdx = spatialWriteIdx + 1
+            if (nextIdx >= delayLen) nextIdx = 0
+            spatialWriteIdx = nextIdx
+
+            val erGain = currentSpatialStage * SPATIAL_WET_MAX
+            eqL += erL * erGain
+            eqR += erR * erGain
+        }
+
         val wet = currentWet
         val dryWeight = 1.0 - wet
         val preLimL = dryWeight * safeL + wet * eqL
@@ -432,6 +535,15 @@ internal class EqualizerKernel {
         val limR = softCeilingGuard(preLimR * gain)
         outFrameL = if (limL.isFinite()) limL else 0.0
         outFrameR = if (limR.isFinite()) limR else 0.0
+    }
+
+    private fun readSpatialDelay(
+        buf: DoubleArray,
+        tap: Int,
+    ): Double {
+        var idx = spatialWriteIdx - tap
+        if (idx < 0) idx += buf.size
+        return buf[idx]
     }
 
     private fun stepLimiter(framePeak: Double): Double {
@@ -517,12 +629,13 @@ internal class EqualizerKernel {
         val w0 = 2.0 * PI * EQUALIZER_BASS_MONO_HZ / fs
         val cosW0 = cos(w0)
         val sinW0 = sin(w0)
-        // Inverted LR2 high-pass (Q = 0.5) matches LPF with < 1e-12 magnitude sum error.
-        val alpha = sinW0 / (2.0 * 0.5)
+        // Butterworth 2nd-order HPF (Q = 0.7071) with positive polarity keeps bass centered
+        // without inverting L/R Side phase or narrowing stereo midrange.
+        val alpha = sinW0 / (2.0 * 0.7071067811865476)
         val a0 = 1.0 + alpha
-        val v = -(1.0 + cosW0) / 2.0
+        val v = (1.0 + cosW0) / 2.0
         bassMonoHpCoeffs[0] = v / a0
-        bassMonoHpCoeffs[1] = (1.0 + cosW0) / a0
+        bassMonoHpCoeffs[1] = -(1.0 + cosW0) / a0
         bassMonoHpCoeffs[2] = v / a0
         bassMonoHpCoeffs[3] = (-2.0 * cosW0) / a0
         bassMonoHpCoeffs[4] = (1.0 - alpha) / a0
@@ -534,9 +647,11 @@ internal class EqualizerKernel {
         private const val STATE_PER_STAGE = 4
         private const val RAMP_SECONDS = 0.010
 
-        private const val LIMITER_THRESHOLD = 0.80 // -1.94 dBFS soft-knee start
-        private const val LIMITER_CEILING = 0.96   // -0.35 dBFS compressor target ceiling
-        private const val LIMITER_SOFT_START = 0.96
+        private const val SPATIAL_WET_MAX = 0.24
+
+        private const val LIMITER_THRESHOLD = 0.93 // -0.63 dBFS transparent soft-knee start
+        private const val LIMITER_CEILING = 0.98   // -0.18 dBFS compressor target ceiling
+        private const val LIMITER_SOFT_START = 0.98
         private const val LIMITER_HARD_LIMIT = 0.995
 
         private const val PCM16_SCALE = 32_768.0

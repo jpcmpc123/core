@@ -1059,8 +1059,24 @@ class MpvPlayer private constructor(
             stages += "extrastereo=m=${mpvNumber(enh.stereoWidth)}:c=false"
         }
         val coreChain = stages.joinToString(",")
+        val spatialFilter =
+            if (enh.spatialStage > 0.02f) {
+                val decay1 = mpvNumber((0.10f * enh.spatialStage).coerceIn(0.01f, 0.14f))
+                val decay2 = mpvNumber((0.07f * enh.spatialStage).coerceIn(0.01f, 0.10f))
+                ",aecho=1.0:0.95:11|19:$decay1|$decay2"
+            } else {
+                ""
+            }
         if (enh.limiterEnabled) {
-            eqEntry = "@$EQ_LABEL:lavfi=[$coreChain,alimiter=limit=0.96:attack=3:release=75]"
+            eqEntry = "@$EQ_LABEL:lavfi=[$coreChain$spatialFilter,alimiter=limit=0.985:attack=1:release=45:level=disabled]"
+            if (applyAudioFilters()) return true
+            if (spatialFilter.isNotEmpty()) {
+                eqEntry = "@$EQ_LABEL:lavfi=[$coreChain,alimiter=limit=0.985:attack=1:release=45:level=disabled]"
+                if (applyAudioFilters()) return true
+            }
+        }
+        if (spatialFilter.isNotEmpty()) {
+            eqEntry = "@$EQ_LABEL:lavfi=[$coreChain$spatialFilter]"
             if (applyAudioFilters()) return true
         }
         eqEntry = "@$EQ_LABEL:lavfi=[$coreChain]"

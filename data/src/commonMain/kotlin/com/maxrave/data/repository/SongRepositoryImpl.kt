@@ -517,10 +517,13 @@ internal class SongRepositoryImpl(
                                 ),
                             )
                         }.onFailure {
+                            if (it is CancellationException) throw it
                             Logger.e(TAG, "getContinueTrack -> Error: ${it.message}")
                             emit(Pair(null, null))
                         }
                 }
+            }.onFailure {
+                if (it is CancellationException) throw it
             }
         }.flowOn(Dispatchers.IO)
 

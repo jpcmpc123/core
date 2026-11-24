@@ -20,9 +20,9 @@ class EqualizerConfigTest {
             "Overlapping bass bands should produce > 7 dB summed peak (was $peakDb)",
         )
 
-        // Balanced mode avoids crushing mids to -8 dB while still reclaiming most headroom.
+        // Balanced mode preserves punch while gently reclaiming headroom above +1 dB.
         val balancedPre = bassBoost.copy(enhancements = bassBoost.enhancements.copy(preampMode = PreampMode.AUTO_BALANCED)).effectivePreampDb()
-        assertTrue(balancedPre in -6f..-2f, "AUTO_BALANCED preamp should sit cleanly between -6 and -2 dB (was $balancedPre)")
+        assertTrue(balancedPre in -4.5f..-1.5f, "AUTO_BALANCED preamp should sit cleanly between -4.5 and -1.5 dB (was $balancedPre)")
 
         // Strict mode cuts full peak + 0.5 dB margin.
         val strictPre = bassBoost.copy(enhancements = bassBoost.enhancements.copy(preampMode = PreampMode.AUTO_STRICT)).effectivePreampDb()
@@ -31,7 +31,7 @@ class EqualizerConfigTest {
 
     @Test
     fun savedEqualizerProfileDetectsMatchesAndModifications() {
-        val enh = EqualizerEnhancements(bassBoostDb = 3.5f, trebleBoostDb = 2f, stereoWidth = 1.2f)
+        val enh = EqualizerEnhancements(bassBoostDb = 3.5f, trebleBoostDb = 2f, stereoWidth = 1.2f, spatialStage = 0.3f)
         val profile =
             SavedEqualizerProfile(
                 id = "p1",
@@ -42,6 +42,7 @@ class EqualizerConfigTest {
                 trebleBoostDb = enh.trebleBoostDb,
                 stereoWidth = enh.stereoWidth,
                 bassMonoEnabled = enh.bassMonoEnabled,
+                spatialStage = enh.spatialStage,
                 loudnessAmount = enh.loudnessAmount,
                 subsonicFilterEnabled = enh.subsonicFilterEnabled,
                 limiterEnabled = enh.limiterEnabled,
@@ -50,6 +51,7 @@ class EqualizerConfigTest {
         assertTrue(profile.matches(profile.bandsDb, 0f, enh, null))
         assertFalse(profile.matches(listOf(4f, 2f, 0f, 0f, 0f, 0.5f, 1.5f, 2f, 1.5f, 2f), 0f, enh, null))
         assertFalse(profile.matches(profile.bandsDb, 0f, enh.copy(bassBoostDb = 5f), null))
+        assertFalse(profile.matches(profile.bandsDb, 0f, enh.copy(spatialStage = 0f), null))
     }
 
     @Test

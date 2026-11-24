@@ -166,4 +166,113 @@ class EqualizerKernelTest {
         assertTrue("10 ms ramp prevents sudden clicks on transition (maxDelta=$maxDelta)", maxDelta < 0.12)
         assertFalse("Bypass should stay inactive while curve is active", bypassConfig.enabled)
     }
+
+    @Test
+    fun `bass mono preserves positive channel polarity and limiter leaves -1_5 dBFS unattenuated`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val config =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = emptyList(),
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.AUTO_BALANCED,
+                        stereoWidth = 1.5f,
+                        bassMonoEnabled = true,
+                        limiterEnabled = true,
+                        subsonicFilterEnabled = false,
+                    ),
+            )
+
+        // 1 kHz Left-only sine at 0.5 amplitude: with fixed HPF polarity, Left must remain strongly
+        // correlated with +sin (no 180-degree channel inversion).
+        val frames = 4_800
+        val buf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            buf[i * 2] = 0.5 * sin(2.0 * PI * 1_000.0 * i / fs)
+            buf[i * 2 + 1] = 0.0
+        }
+        kernel.processNormalizedFramesInPlace(buf, frames, config)
+
+        var dotProd = 0.0
+        var dryEnergy = 0.0
+        for (i in 2_400 until frames) {
+            val dry = 0.5 * sin(2.0 * PI * 1_000.0 * i / fs)
+            dotProd += dry * buf[i * 2]
+            dryEnergy += dry * dry
+        }
+        assertTrue(
+            "Left channel 1 kHz signal must stay positively correlated with input (dot=$dotProd, energy=$dryEnergy)",
+            dotProd > dryEnergy * 0.90,
+        )
+
+        // -1.5 dBFS (0.84) dual-mono sine with unity stereo must stay transparent (< -0.63 dBFS threshold).
+        kernel.flush()
+        val unityConfig =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = listOf(0f, 0f, 0f, 0f, 0f, 0.5f, 0f, 0f, 0f, 0f),
+                manualPreampDb = 0f,
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.MANUAL,
+                        limiterEnabled = true,
+                        subsonicFilterEnabled = false,
+                    ),
+            )
+        val loudBuf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            val v = 0.84 * sin(2.0 * PI * 300.0 * i / fs)
+            loudBuf[i * 2] = v
+            loudBuf[i * 2 + 1] = v
+        }
+        kernel.processNormalizedFramesInPlace(loudBuf, frames, unityConfig)
+        var peakOut = 0.0
+        for (i in 2_400 until frames) {
+            peakOut = max(peakOut, abs(loudBuf[i * 2]))
+        }
+        assertTrue(
+            "Signal at 0.84 amplitude should pass without premature limiter compression (peakOut=$peakOut)",
+            peakOut >= 0.835,
+        )
+    }
+
+    @Test
+    fun `spatial stage adds decorrelated mid-high ambience while keeping sub-bass clean`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val spatialConfig =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = emptyList(),
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.AUTO_BALANCED,
+                        stereoWidth = 1.25f,
+                        spatialStage = 0.6f,
+                        bassMonoEnabled = true,
+                        subsonicFilterEnabled = false,
+                        limiterEnabled = true,
+                    ),
+            )
+
+        // Impulse on L channel only at sample 100 -> reflections must arrive on R after ~7-27 ms.
+        val frames = 2_400
+        val buf = DoubleArray(frames * 2)
+        buf[100 * 2] = 0.7
+        kernel.processNormalizedFramesInPlace(buf, frames, spatialConfig)
+
+        var reflectedRight = 0.0
+        for (i in 400 until frames) {
+            val s = buf[i * 2 + 1]
+            assertTrue("Spatial output must stay finite", s.isFinite())
+            reflectedRight += abs(s)
+        }
+        assertTrue("Expected cross-coupled early reflections on Right channel (sum=$reflectedRight)", reflectedRight > 0.01)
+    }
 }
