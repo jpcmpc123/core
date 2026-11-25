@@ -66,9 +66,13 @@ data class PlayerResponse(
             val loudnessDb: Double?,
             val lastModified: Long?,
             val signatureCipher: String?,
+            val isDrc: Boolean? = null,
         ) {
             val isAudio: Boolean
                 get() = width == null
+
+            val isDrcAudio: Boolean
+                get() = isDrc == true || (url != null && com.maxrave.kotlinytmusicscraper.extractor.isDrcAudioUrl(url))
         }
     }
 

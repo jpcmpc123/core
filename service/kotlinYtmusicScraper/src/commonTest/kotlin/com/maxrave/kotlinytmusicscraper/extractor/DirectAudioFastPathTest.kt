@@ -442,5 +442,41 @@ class DirectAudioFastPathTest {
         assertFalse(state.isAvailable(t0 + 5_000L))
         assertTrue(state.isAvailable(t0 + 4_000L + DirectAudioFastPathState.DEFAULT_COOLDOWN_MS))
     }
+
+    @Test
+    fun buildStandalonePlayerResponseKeepsNonDrcOpus251AndItsMetadataWhenDrcAppearsFirst() {
+        val rawJson =
+            """
+            {
+              "playabilityStatus": {"status": "OK"},
+              "videoDetails": {"videoId": "drcTest01", "title": "Track", "lengthSeconds": "200"},
+              "streamingData": {
+                "expiresInSeconds": 21540,
+                "adaptiveFormats": [
+                  {
+                    "itag": 251,
+                    "url": "https://rr1.googlevideo.com/videoplayback?itag=251&clen=2100000&dur=200.0&xtags=acont%3Doriginal%3Adrc%3D1%3Alang%3Den",
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "bitrate": 135000,
+                    "isDrc": true
+                  },
+                  {
+                    "itag": 251,
+                    "url": "https://rr1.googlevideo.com/videoplayback?itag=251&clen=3400000&dur=200.0&xtags=acont%3Doriginal%3Alang%3Den",
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "bitrate": 148000,
+                    "isDrc": false
+                  }
+                ]
+              }
+            }
+            """.trimIndent()
+        val parsed = assertNotNull(DirectAudioFastPathParser.parsePlayerJson(rawJson))
+        val built = assertNotNull(DirectAudioFastPathParser.buildStandalonePlayerResponse("drcTest01", parsed))
+        val first251 = built.streamingData!!.adaptiveFormats.first { it.itag == ITAG.AUDIO_OPUS_MEDIUM }
+        assertFalse(first251.isDrcAudio)
+        assertEquals(3_400_000L, first251.contentLength)
+        assertEquals(148_000, first251.bitrate)
+    }
 }
 

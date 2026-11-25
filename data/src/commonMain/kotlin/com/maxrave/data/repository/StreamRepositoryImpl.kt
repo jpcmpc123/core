@@ -23,6 +23,7 @@ import com.maxrave.domain.utils.Resource
 import com.maxrave.kotlinytmusicscraper.AudioVariantResolution
 import com.maxrave.kotlinytmusicscraper.StreamResolutionException
 import com.maxrave.kotlinytmusicscraper.YouTube
+import com.maxrave.kotlinytmusicscraper.extractor.audioTrackRank
 import com.maxrave.kotlinytmusicscraper.extractor.isUrlDurationCompatible
 import com.maxrave.kotlinytmusicscraper.models.MediaType
 import com.maxrave.kotlinytmusicscraper.models.response.PlayerResponse
@@ -394,10 +395,12 @@ internal class StreamRepositoryImpl(
                             )
                             val expectedDur = response.videoDetails?.lengthSeconds?.toIntOrNull() ?: oldFormat.lengthSeconds
                             val freshAudio =
-                                formatList.find {
-                                    it.itag == oldFormat.itag &&
-                                        it.url?.let { url -> isUrlDurationCompatible(url, expectedDur) } != false
-                                }
+                                selectBestAudioFormat(
+                                    formats = formatList,
+                                    requestedItag = oldFormat.itag,
+                                    preferredLanguage = cachedPreferredAudioLanguage,
+                                    expectedDurationSec = expectedDur,
+                                )
                             val freshVideo =
                                 formatList.find { it.itag == ITAG.VIDEO_720P }
                                     ?: formatList.find { it.itag == ITAG.VIDEO_360P }
@@ -721,22 +724,16 @@ internal class StreamRepositoryImpl(
                                 ?: formatList.find { it.itag == ITAG.VIDEO_720P }
                                 ?: formatList.find { it.itag == ITAG.VIDEO_360P }
                                 ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
-                        val audioTwinItag = ITAG.highQualityTwinOf(itag)
-                        // The last resort is the BEST audio the response actually carries,
-                        // never an arbitrary entry. When the chosen itag and its high-quality
-                        // twin are both absent — a free account asking for a Premium quality
-                        // is served neither 774 nor 141 — the selection used to fall through
-                        // to the last format in the list, in practice one of the lowest
-                        // bitrate streams (~48-70 kbps), below even the Low setting.
                         val expectedDurationSec =
                             response.videoDetails?.lengthSeconds?.toIntOrNull()
                                 ?: localSong?.durationSeconds?.takeIf { it > 0 }
                         val audioFormat =
-                            formatList.find { it.itag == itag }
-                                ?: audioTwinItag?.let { twin -> formatList.find { it.itag == twin } }
-                                ?: formatList
-                                    .filter { it.isAudio && it.url.isNullOrEmpty().not() }
-                                    .maxByOrNull { it.bitrate }
+                            selectBestAudioFormat(
+                                formats = formatList,
+                                requestedItag = itag,
+                                preferredLanguage = preferredAudioLanguage,
+                                expectedDurationSec = expectedDurationSec,
+                            )
                         var format =
                             if (isVideo) {
                                 videoFormat
@@ -1111,6 +1108,40 @@ internal class StreamRepositoryImpl(
     private companion object {
         const val TIDAL_COOLDOWN_SECONDS = 120
     }
+}
+
+internal fun selectBestAudioFormat(
+    formats: List<PlayerResponse.StreamingData.Format>,
+    requestedItag: Int,
+    preferredLanguage: String?,
+    expectedDurationSec: Int?,
+): PlayerResponse.StreamingData.Format? {
+    val candidates =
+        formats
+            .filter { format ->
+                format.isAudio &&
+                    !format.url.isNullOrEmpty() &&
+                    isUrlDurationCompatible(format.url!!, expectedDurationSec)
+            }.sortedBy { format ->
+                audioTrackRank(
+                    url = format.url!!,
+                    preferredLanguage = preferredLanguage,
+                    isDrcFlag = format.isDrc == true,
+                )
+            }
+    if (candidates.isEmpty()) return null
+
+    val nonDrcCandidates = candidates.filterNot { it.isDrcAudio }
+    val audioTwinItag = ITAG.highQualityTwinOf(requestedItag)
+
+    fun List<PlayerResponse.StreamingData.Format>.pickTier(): PlayerResponse.StreamingData.Format? =
+        firstOrNull { it.itag == requestedItag }
+            ?: audioTwinItag?.let { twin -> firstOrNull { it.itag == twin } }
+            ?: firstOrNull { it.itag == ITAG.AUDIO_OPUS_MEDIUM }
+            ?: firstOrNull { it.itag == ITAG.AUDIO_AAC_MEDIUM }
+            ?: maxByOrNull { it.bitrate }
+
+    return nonDrcCandidates.pickTier() ?: candidates.pickTier()
 }
 
 internal fun isPremiumOnlyAudioItag(itag: Int): Boolean =

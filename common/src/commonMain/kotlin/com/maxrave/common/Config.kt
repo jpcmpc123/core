@@ -363,11 +363,17 @@ object QUALITY {
         )
 
     /**
+     * Default quality for new installs or unrecognised stored labels: Medium (Opus itag 251,
+     * ~130-160 kbps VBR 48 kHz), which is the highest-quality tier YouTube serves without Premium.
+     */
+    val defaultItem: String = items[1].toString()
+
+    /**
      * Labels written by older builds, mapped to the item that replaced them.
      *
      * The setting is persisted as the label STRING, not as an index, so renaming an entry orphans
      * every device that already stored the old text. Without this map such a device falls through
-     * to [items]`[0]` — silently dropping a Premium account from 256 kbps to 66 kbps.
+     * to [defaultItem].
      */
     private val LEGACY_ITEMS: Map<String, String> =
         mapOf(
@@ -377,15 +383,15 @@ object QUALITY {
 
     /**
      * The stored label as a currently-valid one: itself when still valid, its replacement when it
-     * is a known older label, and [items]`[0]` for anything unrecognised.
+     * is a known older label, and [defaultItem] for anything unrecognised or unset.
      *
      * Migration is lazy on purpose — nothing rewrites the stored value, so a read never races a
      * write. The stored text is replaced the next time the user picks an entry themselves.
      */
     fun normalize(saved: String?): String {
-        val label = saved ?: return items[0].toString()
+        val label = saved ?: return defaultItem
         if (items.any { it.toString() == label }) return label
-        return LEGACY_ITEMS[label] ?: items[0].toString()
+        return LEGACY_ITEMS[label] ?: defaultItem
     }
 
     /** The itag a stored label selects. Goes through [normalize], so older labels still resolve. */

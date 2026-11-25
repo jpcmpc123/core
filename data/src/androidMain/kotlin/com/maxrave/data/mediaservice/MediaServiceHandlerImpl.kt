@@ -2860,24 +2860,23 @@ internal class MediaServiceHandlerImpl(
                         .distinctUntilChanged()
                         .collectLatest { format ->
                             if (format != null) {
-                                val loudnessMb =
-                                    format.loudnessDb.toMb().let {
-                                        if (it !in -2000..2000) 0 else it
-                                    }
-                                Logger.d(TAG, "Loudness: ${format.loudnessDb} db, $loudnessMb")
+                                val norm = computeVolumeNormalization(format.loudnessDb)
+                                Logger.d(
+                                    TAG,
+                                    "Loudness: ${format.loudnessDb} dB -> volume=${norm.playerVolume}, enhancer=${norm.enhancerGainMb} mB",
+                                )
+                                if (!_castState.value.isRemote && player.volume != norm.playerVolume) {
+                                    player.volume = norm.playerVolume
+                                }
                                 try {
-                                    loudnessEnhancer?.setTargetGain(0f.toMb() - loudnessMb)
-                                    loudnessEnhancer?.enabled = true
-                                    Logger.w(
-                                        TAG,
-                                        "mayBeNormalizeVolume: ${loudnessEnhancer?.targetGain}",
-                                    )
+                                    loudnessEnhancer?.setTargetGain(norm.enhancerGainMb)
+                                    loudnessEnhancer?.enabled = norm.enhancerGainMb > 0
                                 } catch (e: Exception) {
                                     Logger.e(TAG, "mayBeNormalizeVolume: ${e.message}")
                                 }
                                 try {
-                                    secondLoudnessEnhancer?.setTargetGain(0f.toMb() - loudnessMb)
-                                    secondLoudnessEnhancer?.enabled = true
+                                    secondLoudnessEnhancer?.setTargetGain(norm.enhancerGainMb)
+                                    secondLoudnessEnhancer?.enabled = norm.enhancerGainMb > 0
                                 } catch (e: Exception) {
                                     Logger.e(TAG, "mayBeNormalizeVolume: ${e.message}")
                                 }

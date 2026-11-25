@@ -295,6 +295,7 @@ internal object DirectAudioFastPathParser {
             loudnessDb = obj.doubleOrNull("loudnessDb"),
             lastModified = obj.longOrNull("lastModified"),
             signatureCipher = obj.stringOrNull("signatureCipher") ?: obj.stringOrNull("cipher"),
+            isDrc = obj.booleanOrNull("isDrc"),
         )
     }
 
@@ -317,7 +318,8 @@ internal object DirectAudioFastPathParser {
                     format.itag in ITAG.AUDIO_PLAYABLE &&
                     !format.url.isNullOrEmpty() &&
                     isUrlDurationCompatible(format.url, effectiveExpectedDur)
-            }.map { format -> format.itag to format.url!! }
+            }.sortedBy { format -> if (format.isDrc == true) 1 else 0 }
+            .map { format -> format.itag to format.url!! }
             .toList()
     }
 
@@ -359,21 +361,25 @@ internal object DirectAudioFastPathParser {
                 .orderByAudioTrack(preferredAudioLanguage)
         if (directStreams.isEmpty()) return null
 
-        val directFormatsByItag =
+        val directPlayableAudio =
             directResponse.adaptiveFormats
                 .filter { it.isAudio && it.itag in ITAG.AUDIO_PLAYABLE && !it.url.isNullOrEmpty() }
-                .associateBy { it.itag }
+        val directFormatsByUrl = directPlayableAudio.associateBy { it.url!! }
 
         if (baseResponse.playabilityStatus.status != "OK" || baseResponse.streamingData == null) {
+            val seenItags = HashSet<Int>()
             val filteredAdaptive =
-                directResponse.adaptiveFormats
-                    .mapNotNull { format ->
-                        val url = directStreams.firstOrNull { it.first == format.itag }?.second ?: return@mapNotNull null
-                        format.copy(
-                            url = url,
-                            contentLength = contentLengthOf(url) ?: format.contentLength,
-                        )
-                    }
+                directStreams.mapNotNull { (itag, url) ->
+                    if (!seenItags.add(itag)) return@mapNotNull null
+                    val format =
+                        directFormatsByUrl[url]
+                            ?: directPlayableAudio.firstOrNull { it.itag == itag }
+                            ?: return@mapNotNull null
+                    format.copy(
+                        url = url,
+                        contentLength = contentLengthOf(url) ?: format.contentLength,
+                    )
+                }
             if (filteredAdaptive.isEmpty()) return null
             val mergedConfig =
                 baseResponse.playerConfig
@@ -410,10 +416,13 @@ internal object DirectAudioFastPathParser {
                 val matchedUrl = directStreams.firstOrNull { it.first == format.itag }?.second
                 if (matchedUrl != null && format.isAudio && format.itag in ITAG.AUDIO_PLAYABLE) {
                     matchedItags += format.itag
-                    val directFormat = directFormatsByItag[format.itag]
+                    val directFormat = directFormatsByUrl[matchedUrl]
                     format.copy(
                         url = matchedUrl,
                         contentLength = contentLengthOf(matchedUrl) ?: directFormat?.contentLength ?: format.contentLength,
+                        bitrate = directFormat?.bitrate ?: format.bitrate,
+                        audioSampleRate = directFormat?.audioSampleRate ?: format.audioSampleRate,
+                        isDrc = directFormat?.isDrc ?: format.isDrc,
                     )
                 } else {
                     format
@@ -423,7 +432,10 @@ internal object DirectAudioFastPathParser {
         // Append any playable audio format carried by VISIONOS that WEB_REMIX omitted.
         for ((itag, url) in directStreams) {
             if (itag !in matchedItags) {
-                val directFormat = directFormatsByItag[itag] ?: continue
+                val directFormat =
+                    directFormatsByUrl[url]
+                        ?: directPlayableAudio.firstOrNull { it.itag == itag }
+                        ?: continue
                 matchedItags += itag
                 updatedAdaptive +=
                     directFormat.copy(
@@ -472,14 +484,17 @@ internal object DirectAudioFastPathParser {
                 .orderByAudioTrack(preferredAudioLanguage)
         if (directStreams.isEmpty()) return null
 
-        val directFormatsByItag =
+        val directPlayableAudio =
             directResponse.adaptiveFormats
                 .filter { it.isAudio && it.itag in ITAG.AUDIO_PLAYABLE && !it.url.isNullOrEmpty() }
-                .associateBy { it.itag }
+        val directFormatsByUrl = directPlayableAudio.associateBy { it.url!! }
 
         val adaptiveFormats =
             directStreams.mapNotNull { (itag, url) ->
-                val format = directFormatsByItag[itag] ?: return@mapNotNull null
+                val format =
+                    directFormatsByUrl[url]
+                        ?: directPlayableAudio.firstOrNull { it.itag == itag }
+                        ?: return@mapNotNull null
                 format.copy(
                     url = url,
                     contentLength = contentLengthOf(url) ?: format.contentLength,

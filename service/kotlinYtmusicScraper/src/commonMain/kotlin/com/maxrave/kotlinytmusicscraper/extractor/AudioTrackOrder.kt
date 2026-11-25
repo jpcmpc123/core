@@ -17,33 +17,50 @@ private val DUR = Regex("[?&]dur=([0-9]+(?:\\.[0-9]+)?)")
  * [preferredLanguage], then the original, then everything else. A single-track video carries no
  * `xtags` at all, ranks as original and keeps its order — songs are unaffected.
  */
+internal fun parseXtags(url: String): Map<String, String> =
+    XTAGS
+        .find(url)
+        ?.groupValues
+        ?.get(1)
+        ?.replace("%3D", "=", ignoreCase = true)
+        ?.replace("%3A", ":", ignoreCase = true)
+        ?.split(':')
+        ?.associate { it.substringBefore('=') to it.substringAfter('=', "") }
+        .orEmpty()
+
+/**
+ * Returns true when the googlevideo stream URL carries a Dynamic Range Compression marker (`drc=1`
+ * or `drc=true` inside `xtags`), which YouTube serves alongside the unaltered master under the
+ * same `itag`.
+ */
+fun isDrcAudioUrl(url: String): Boolean {
+    val drc = parseXtags(url)["drc"] ?: return false
+    return drc == "1" || drc.equals("true", ignoreCase = true)
+}
+
 internal fun List<Pair<Int, String>>.orderByAudioTrack(preferredLanguage: String?): List<Pair<Int, String>> =
     sortedBy { (_, url) -> audioTrackRank(url, preferredLanguage) }
 
-internal fun audioTrackRank(
+fun audioTrackRank(
     url: String,
     preferredLanguage: String?,
+    isDrcFlag: Boolean = false,
 ): Int {
-    val tags =
-        XTAGS
-            .find(url)
-            ?.groupValues
-            ?.get(1)
-            ?.replace("%3D", "=", ignoreCase = true)
-            ?.replace("%3A", ":", ignoreCase = true)
-            ?.split(':')
-            ?.associate { it.substringBefore('=') to it.substringAfter('=', "") }
-            .orEmpty()
+    val tags = parseXtags(url)
     val acont = tags["acont"]
     val lang = tags["lang"]?.substringBefore('-')
-    return when {
-        // "descriptive" is narration for blind viewers — never what a language preference means.
-        !preferredLanguage.isNullOrBlank() &&
-            acont != "descriptive" &&
-            lang.equals(preferredLanguage.substringBefore('-'), ignoreCase = true) -> 0
-        acont == null || acont == "original" -> 1
-        else -> 2
-    }
+    val drcVal = tags["drc"]
+    val isDrc = isDrcFlag || drcVal == "1" || drcVal.equals("true", ignoreCase = true)
+    val baseRank =
+        when {
+            // "descriptive" is narration for blind viewers — never what a language preference means.
+            !preferredLanguage.isNullOrBlank() &&
+                acont != "descriptive" &&
+                lang.equals(preferredLanguage.substringBefore('-'), ignoreCase = true) -> 0
+            acont == null || acont == "original" -> 1
+            else -> 2
+        }
+    return baseRank * 2 + if (isDrc) 1 else 0
 }
 
 /**
