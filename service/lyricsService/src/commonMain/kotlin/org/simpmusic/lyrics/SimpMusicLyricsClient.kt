@@ -280,11 +280,13 @@ class SimpMusicLyricsClient(
                         }
                         if (metaOk && !exact.instrumental) {
                             val exactTitle = exact.trackName?.takeIf { it.isNotBlank() } ?: exact.name
+                            val exactDurDiff = abs(exact.duration.toInt() - validDuration)
                             val editionOkForSync =
                                 LyricsMetadataMatcher.editionsCompatibleForSync(
                                     expectedTitle = q_track,
                                     candidateTitle = exactTitle,
                                     candidateAlbum = exact.albumName,
+                                    durationDiffSeconds = exactDurDiff,
                                 )
                             if (editionOkForSync && (exact.hasWordSync || !exact.syncedLyrics.isNullOrBlank())) {
                                 val overflowMs = lrclibSyncedOverflowMs(exact, validDuration)
@@ -322,11 +324,13 @@ class SimpMusicLyricsClient(
                             )
                         if (best != null) {
                             val bestTitle = best.trackName?.takeIf { it.isNotBlank() } ?: best.name
+                            val bestDurDiff = validDuration?.let { abs(best.duration.toInt() - it) }
                             val bestEditionOk =
                                 LyricsMetadataMatcher.editionsCompatibleForSync(
                                     expectedTitle = q_track,
                                     candidateTitle = bestTitle,
                                     candidateAlbum = best.albumName,
+                                    durationDiffSeconds = bestDurDiff,
                                 )
                             val bestHasSync = bestEditionOk && (best.hasWordSync || !best.syncedLyrics.isNullOrBlank())
                             if (!bestHasSync) {
@@ -369,9 +373,10 @@ class SimpMusicLyricsClient(
                 }
             val chosen = bestDeferred ?: plainFallbackRecord
             val chosenTitle = chosen?.trackName?.takeIf { it.isNotBlank() } ?: chosen?.name
+            val chosenDurDiff = if (chosen != null && validDuration != null) abs(chosen.duration.toInt() - validDuration) else null
             val chosenSyncOk =
                 chosen != null &&
-                    LyricsMetadataMatcher.editionsCompatibleForSync(q_track, chosenTitle, chosen.albumName)
+                    LyricsMetadataMatcher.editionsCompatibleForSync(q_track, chosenTitle, chosen.albumName, chosenDurDiff)
             val normalizedChosen =
                 if (chosen != null && !chosenSyncOk && !chosen.plainLyrics.isNullOrBlank()) {
                     chosen.copy(syncedLyrics = null, hasWordSync = false)
@@ -411,10 +416,17 @@ class SimpMusicLyricsClient(
                                 expectedTitle = q_track,
                                 expectedArtist = q_artist,
                             )
+                        val ttmlDurDiff =
+                            if (validDuration != null && ttmlMeta.durationSeconds != null) {
+                                abs(ttmlMeta.durationSeconds - validDuration)
+                            } else {
+                                null
+                            }
                         val editionOk =
                             LyricsMetadataMatcher.editionsCompatibleForSync(
                                 expectedTitle = q_track,
                                 candidateTitle = ttmlMeta.title,
+                                durationDiffSeconds = ttmlDurDiff,
                             )
                         val durationOk =
                             LyricsMetadataMatcher.durationsMatch(
@@ -721,15 +733,15 @@ internal fun selectLrclibLyricsRecord(
         usable.filter { candidate ->
             val hasSync = candidate.hasWordSync || !candidate.syncedLyrics.isNullOrBlank()
             if (!hasSync) return@filter false
-            val durOk =
-                validDuration == null ||
-                    abs(candidate.duration.toInt() - validDuration) <= LRCLIB_SYNCED_DURATION_TOLERANCE_SECONDS
+            val durDiff = validDuration?.let { abs(candidate.duration.toInt() - it) }
+            val durOk = durDiff == null || durDiff <= LRCLIB_SYNCED_DURATION_TOLERANCE_SECONDS
             if (!durOk) return@filter false
             val candTitle = candidate.trackName?.takeIf { it.isNotBlank() } ?: candidate.name
             LyricsMetadataMatcher.editionsCompatibleForSync(
                 expectedTitle = expectedTrack,
                 candidateTitle = candTitle,
                 candidateAlbum = candidate.albumName,
+                durationDiffSeconds = durDiff,
             )
         }
     if (syncedCandidates.isNotEmpty()) {

@@ -136,13 +136,24 @@ class LyricsResolver(
                 overflow: Boolean,
                 isFromCache: Boolean = false,
             ) {
+                val cleanedResolution =
+                    if (!isFromCache && !resolution.source.isCatalogVerified() && verifiedBestLyrics != null) {
+                        val stripped =
+                            LyricsHeaderSanitizer.stripLeadingNonSungLinesAgainstReference(
+                                candidate = resolution.lyrics,
+                                reference = verifiedBestLyrics,
+                            )
+                        if (stripped !== resolution.lyrics) resolution.copy(lyrics = stripped) else resolution
+                    } else {
+                        resolution
+                    }
                 if (!isFromCache) onlineAcceptedAny = true
-                currentBestLyrics = resolution.lyrics
+                currentBestLyrics = cleanedResolution.lyrics
                 currentBestLevel = level
                 currentBestOverflow = overflow
-                currentBestSource = resolution.source
+                currentBestSource = cleanedResolution.source
                 currentFromCache = isFromCache
-                send(LyricsResolutionEvent.Found(resolution))
+                send(LyricsResolutionEvent.Found(cleanedResolution))
             }
 
             suspend fun ensureFallbackJudgesChecked() {
@@ -529,8 +540,8 @@ class LyricsResolver(
         ): List<LyricsSource> {
             val baseOrder =
                 listOf(
-                    LyricsSource.BETTER_LYRICS,
                     LyricsSource.LRCLIB,
+                    LyricsSource.BETTER_LYRICS,
                     LyricsSource.SPOTIFY,
                     LyricsSource.SIMPMUSIC,
                     LyricsSource.YTM_OFFICIAL,

@@ -302,18 +302,30 @@ internal fun LyricsResponse.toLyrics(): Lyrics? {
             ?.takeIf { it.isNotBlank() }
             ?.let(::parseRichSyncLyrics)
             ?.takeIf { !it.lyrics?.lines.isNullOrEmpty() }
+    val syncedCandidate =
+        syncedLyrics
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::parseSyncedLyrics)
+            ?.takeIf { !it.lyrics?.lines.isNullOrEmpty() }
+    val plainCandidate =
+        plainLyric
+            .takeIf { it.isNotBlank() }
+            ?.let(::parseUnsyncedLyrics)
+            ?.takeIf { !it.lyrics?.lines.isNullOrEmpty() }
+
     val selected =
         richCandidate?.takeIf { it.lyrics?.syncType == "RICH_SYNCED" }
-            ?: syncedLyrics
-                ?.takeIf { it.isNotBlank() }
-                ?.let(::parseSyncedLyrics)
-                ?.takeIf { !it.lyrics?.lines.isNullOrEmpty() }
+            ?: syncedCandidate
             ?: richCandidate
-            ?: plainLyric
-                .takeIf { it.isNotBlank() }
-                ?.let(::parseUnsyncedLyrics)
-                ?.takeIf { !it.lyrics?.lines.isNullOrEmpty() }
-    return selected?.toLyrics()?.takeIf { !it.lines.isNullOrEmpty() }
+            ?: plainCandidate
+    val mapped = selected?.toLyrics()?.takeIf { !it.lines.isNullOrEmpty() } ?: return null
+    val reference = (syncedCandidate ?: plainCandidate)?.toLyrics()
+    return if (selected === richCandidate && reference != null) {
+        com.maxrave.domain.lyrics.LyricsHeaderSanitizer
+            .stripLeadingNonSungLinesAgainstReference(mapped, reference)
+    } else {
+        mapped
+    }
 }
 
 internal fun TranslatedLyricsResponse.toLyrics(): Lyrics? =

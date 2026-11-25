@@ -1117,7 +1117,8 @@ internal class LyricsCanvasRepositoryImpl(
                             }
                         },
                         onFailure = { error ->
-                            if ((error as? SimpMusicLyricsApiException)?.code == 404) {
+                            val code = (error as? SimpMusicLyricsApiException)?.code
+                            if (code == 404 || code == 401 || code == 403) {
                                 ProviderFetchOutcome.DefinitiveNotFound
                             } else {
                                 ProviderFetchOutcome.TransientFailure(error.message)
@@ -1681,11 +1682,18 @@ internal fun pickBestSimpMusicCandidate(
         val level = LyricsQuality.level(rawMapped)
         if (level <= LyricsQuality.LEVEL_INVALID) continue
         val isSyncedCandidate = level >= LyricsQuality.LEVEL_LINE_SYNCED
+        val candidateDurDiff =
+            if (validExpectedDur != null && candidate.durationSeconds > 0) {
+                abs(candidate.durationSeconds - validExpectedDur)
+            } else {
+                null
+            }
         if (isSyncedCandidate &&
             !LyricsMetadataMatcher.editionsCompatibleForSync(
                 expectedTitle = expectedTitle,
                 candidateTitle = candidate.songTitle.takeIf { it.isNotBlank() } ?: embeddedMeta.title,
                 candidateAlbum = candidate.albumName.takeIf { it.isNotBlank() },
+                durationDiffSeconds = candidateDurDiff,
             )
         ) {
             continue

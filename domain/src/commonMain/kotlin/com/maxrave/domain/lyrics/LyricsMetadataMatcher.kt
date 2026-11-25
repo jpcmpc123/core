@@ -4,7 +4,7 @@ import kotlin.math.abs
 
 private val MATCHER_NOISE_PAREN_REGEX =
     Regex(
-        """\s*[\(\[](?:official(?:\s+(?:music|lyric|lyrics|audio|visual|hd|4k|video))*\s*(?:video|audio|visualizer|mv)?|(?:music|lyric|lyrics)\s+video|lyrics?|audio|visualizer|mv|remaster(?:ed)?(?:\s+\d{4})?|\d{4}\s+remaster(?:ed)?|explicit|clean|hd|4k|feat\.?[^\)\]]*|ft\.?[^\)\]]*|instrumental|off\s*vocal|karaoke(?:\s+version)?)[\)\]]""",
+        """\s*[\(\[](?:official(?:\s+(?:music|lyric|lyrics|audio|visual|hd|4k|video))*\s*(?:video|audio|visualizer|mv)?|(?:music|lyric|lyrics)\s+video|lyrics?|audio|visualizer|mv|remaster(?:ed)?(?:\s+\d{4})?|\d{4}\s+remaster(?:ed)?|explicit|clean|hd|4k|feat\.?[^\)\]]*|ft\.?[^\)\]]*|instrumental|off\s*vocal|karaoke(?:\s+version)?|ao\s+vivo|en\s+vivo|live)[\)\]]""",
         RegexOption.IGNORE_CASE,
     )
 private val MATCHER_FEAT_TAIL_REGEX = Regex("""\s+(?:feat\.?|ft\.?|featuring)\s+.*$""", RegexOption.IGNORE_CASE)
@@ -68,16 +68,27 @@ object LyricsMetadataMatcher {
     /**
      * Ensures synced lyrics come from a compatible recording edition (e.g. `(Ao Vivo)` does not
      * receive studio-timed LRC/TTML, and a studio track does not receive `Remix`/`Slowed`/`Live` LRC).
+     *
+     * When a live track's catalog entry omits the `(Ao Vivo)` / `(Live)` suffix from its title
+     * (common on LRCLIB/Spotify albums like *Casa de Samba, Vol. 2*), allows sync ONLY if the
+     * duration matches within `<= 2s` and the candidate has no conflicting edition tags.
      */
     fun editionsCompatibleForSync(
         expectedTitle: String?,
         candidateTitle: String?,
         candidateAlbum: String? = null,
+        durationDiffSeconds: Int? = null,
     ): Boolean {
         if (expectedTitle.isNullOrBlank() || candidateTitle.isNullOrBlank()) return true
         val expectedEditions = extractEditionTags(expectedTitle, album = null)
         val candidateEditions = extractEditionTags(candidateTitle, album = candidateAlbum)
-        return expectedEditions == candidateEditions
+        if (expectedEditions == candidateEditions) return true
+        val liveOnlyOmittedInCatalog =
+            expectedEditions == setOf(TrackEditionTag.LIVE) &&
+                candidateEditions.isEmpty() &&
+                durationDiffSeconds != null &&
+                durationDiffSeconds <= 2
+        return liveOnlyOmittedInCatalog
     }
 
     fun titlesMatch(

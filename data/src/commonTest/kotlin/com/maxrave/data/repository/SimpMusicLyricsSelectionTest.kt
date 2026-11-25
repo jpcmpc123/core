@@ -101,7 +101,7 @@ class SimpMusicLyricsSelectionTest {
                 vote = 10,
                 songTitle = "Flor De Lis",
                 albumName = "Luz Studio",
-                durationSeconds = 180,
+                durationSeconds = 184,
                 syncedLyrics = "[00:05.00]Valei-me Deus\n[00:10.00]E o fim",
             )
         assertNull(
@@ -138,6 +138,30 @@ class SimpMusicLyricsSelectionTest {
                 ),
             )
         kotlin.test.assertTrue(picked.requiresVerification)
+
+        val yagamiRealPayload =
+            candidate(
+                id = "69c21ee50010278b4afd",
+                vote = 0,
+                songTitle = "夜空のイヤリング",
+                albumName = "LONELY GIRL",
+                durationSeconds = 238,
+                syncedLyrics = "[00:15.09] 夜空に向って走る車のライト\n[00:24.05] あなたと寄り添えば 流星になるのよ...",
+                richSyncLyrics =
+                    "[00:07.22] <00:07.22>三 <00:08.12>浦 <00:09.03>徳 <00:09.93>子\n" +
+                        "[00:16.26] <00:16.26>夜 <00:16.63>空 <00:17.90>に <00:19.16>向 <00:19.44>っ <00:19.73>て <00:21.41>走 <00:21.65>る <00:22.01>車 <00:22.44>の <00:22.86>ラ <00:23.23>イ <00:23.85>ト\n" +
+                        "[00:24.82] <00:24.82>あ <00:25.12>な <00:25.34>た <00:26.06>と <00:27.11>寄 <00:27.36>り <00:27.60>添 <00:27.95>え <00:28.24>ば",
+            ).copy(artistName = "八神純子")
+        val cleanedYagami =
+            assertNotNull(
+                pickBestSimpMusicLyrics(
+                    candidates = listOf(yagamiRealPayload),
+                    expectedTitle = "夜空のイヤリング",
+                    expectedArtist = "八神純子",
+                    expectedDurationSeconds = 238,
+                ),
+            )
+        assertEquals("16260", cleanedYagami.lines?.first()?.startTimeMs)
     }
 
     private fun candidate(

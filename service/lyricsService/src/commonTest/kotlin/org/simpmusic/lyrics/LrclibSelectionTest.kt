@@ -40,40 +40,44 @@ class LrclibSelectionTest {
     }
 
     @Test
-    fun rejectsStudioSyncedForLiveTrackWhileAllowingStaticPlainFallback() {
-        val studioSynced =
+    fun allowsExactDurationLiveCatalogMatchAndStripsSyncWhenDurationDiffers() {
+        val exactCatalogLive =
             record(
-                id = 10,
-                duration = 169f,
+                id = 26056296,
+                duration = 169.56f,
+                hasWordSync = true,
                 plainLyrics = "Valei-me Deus, é o fim do nosso amor",
                 syncedLyrics = "[00:12.00]Valei-me Deus, é o fim do nosso amor",
-            ).copy(trackName = "Flor De Lis", artistName = "Djavan")
+            ).copy(trackName = "Flor de Lis", artistName = "Alcione/Emilio Santiago", albumName = "Casa de Samba, Vol. 2")
 
-        val picked =
+        val pickedExact =
             selectLrclibLyricsRecord(
-                records = listOf(studioSynced),
+                records = listOf(exactCatalogLive),
                 duration = 169,
                 expectedTrack = "Flor De Lis (Ao Vivo)",
-                expectedArtist = "Djavan",
+                expectedArtist = "Emílio Santiago, Alcione",
             )
-        // Since titles differ ("Flor De Lis (Ao Vivo)" vs "Flor De Lis"), wait: test normalized "(Ao Vivo)" vs studio with same stripped title or matching plain
-        assertNull(picked)
+        assertEquals(exactCatalogLive, pickedExact)
 
-        val liveTitleStudioAlbum =
+        // A studio cut off by 4s must NOT supply synced timing to an (Ao Vivo) track;
+        // it safely falls back to static plainLyrics (syncedLyrics stripped).
+        val driftedStudio =
             record(
-                id = 11,
-                duration = 169f,
-                plainLyrics = "Valei-me Deus",
-                syncedLyrics = "[00:12.00]Valei-me Deus",
-            ).copy(trackName = "Flor De Lis (Ao Vivo)", albumName = "Luz Studio")
-        val selectedLive =
+                id = 10,
+                duration = 173f,
+                plainLyrics = "Valei-me Deus, é o fim do nosso amor",
+                syncedLyrics = "[00:12.00]Valei-me Deus, é o fim do nosso amor",
+            ).copy(trackName = "Flor de Lis", artistName = "Emílio Santiago", albumName = "Luz Studio")
+
+        val pickedDrifted =
             selectLrclibLyricsRecord(
-                records = listOf(liveTitleStudioAlbum),
+                records = listOf(driftedStudio),
                 duration = 169,
                 expectedTrack = "Flor De Lis (Ao Vivo)",
-                expectedArtist = "Example",
+                expectedArtist = "Emílio Santiago",
             )
-        assertEquals(liveTitleStudioAlbum, selectedLive)
+        assertEquals("Valei-me Deus, é o fim do nosso amor", pickedDrifted?.plainLyrics)
+        assertNull(pickedDrifted?.syncedLyrics)
     }
 
     @Test

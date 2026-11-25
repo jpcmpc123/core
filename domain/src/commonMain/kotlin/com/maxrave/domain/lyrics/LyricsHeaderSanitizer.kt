@@ -20,8 +20,10 @@ private val FEAT_TAIL_REGEX = Regex("""\s+(?:feat\.?|ft\.?|featuring)\s+.*$""", 
 private val TITLE_ARTIST_SEPARATORS = listOf(" - ", " – ", " — ", " － ", " | ", " / ", " ／ ", " • ", " : ", " ： ")
 private val PAREN_GROUP_REGEX = Regex("""[\(\[（［]([^\)\]）］]+)[\)\]）］]""")
 private val ARTIST_SPLIT_CHARS_REGEX = Regex("""[,&•/／・、;]""")
-private const val INTRO_CREDIT_MAX_TIME_MS = 3_500L
-private const val INTRO_CREDIT_MIN_VOCAL_GAP_MS = 7_000L
+private const val INTRO_CREDIT_MAX_TIME_MS = 15_000L
+private const val INTRO_CREDIT_MIN_VOCAL_GAP_MS = 5_000L
+private const val REF_STRIP_MAX_INTRO_TIME_MS = 25_000L
+private const val REF_STRIP_MAX_LEADING_LINES = 3
 
 private val EXPLICIT_CREDIT_PREFIXES =
     listOf(
@@ -265,6 +267,75 @@ object LyricsHeaderSanitizer {
         } else {
             lyrics.copy(lines = cleanedLines)
         }
+    }
+
+    /**
+     * Deterministically strips leading non-sung intro credit lines (such as `[00:07.22] 三 浦 徳 子`
+     * in community rich-sync uploads) when a clean reference lyric sheet (e.g. LRCLIB, YouTube Music
+     * official lyrics, or the same record's `syncedLyrics`/`plainLyric`) begins directly on a
+     * subsequent line `k` (`1..3`) and the skipped leading lines do not appear in [reference].
+     */
+    fun stripLeadingNonSungLinesAgainstReference(
+        candidate: Lyrics,
+        reference: Lyrics?,
+    ): Lyrics {
+        val candLines = candidate.lines ?: return candidate
+        val refLines = reference?.lines ?: return candidate
+        if (candLines.size <= 2 || refLines.isEmpty()) return candidate
+
+        val refNormalized =
+            refLines
+                .asSequence()
+                .map { normalizeComparable(stripRichSyncTags(it.words)) }
+                .filter { it.length >= 2 }
+                .toList()
+        if (refNormalized.isEmpty()) return candidate
+        val refFirst = refNormalized.first()
+        val refWholeText = refNormalized.joinToString("")
+
+        val isUnsynced = candidate.syncType != "LINE_SYNCED" && candidate.syncType != "RICH_SYNCED"
+        val maxProbe = minOf(REF_STRIP_MAX_LEADING_LINES, candLines.size - 1)
+
+        var matchedAnchorIndex = -1
+        for (k in 1..maxProbe) {
+            val candNorm = normalizeComparable(stripRichSyncTags(candLines[k].words))
+            if (candNorm.length < 3) continue
+            if (linesMatchClosely(candNorm, refFirst)) {
+                matchedAnchorIndex = k
+                break
+            }
+        }
+        if (matchedAnchorIndex <= 0) return candidate
+
+        // Ensure every line before matchedAnchorIndex is genuinely an intro line absent from reference.
+        for (i in 0 until matchedAnchorIndex) {
+            val startMs = candLines[i].startTimeMs.toLongOrNull() ?: 0L
+            if (!isUnsynced && startMs > REF_STRIP_MAX_INTRO_TIME_MS) return candidate
+            val plain = stripRichSyncTags(candLines[i].words)
+            if (plain.isEmpty() || plain == "♫" || plain == "♪") continue
+            val norm = normalizeComparable(plain)
+            if (norm.length >= 2 && norm in refWholeText) {
+                return candidate
+            }
+        }
+
+        return candidate.copy(lines = candLines.subList(matchedAnchorIndex, candLines.size))
+    }
+
+    private fun linesMatchClosely(
+        a: String,
+        b: String,
+    ): Boolean {
+        if (a == b) return true
+        if (a.length >= 4 && b.length >= 4 && (a in b || b in a)) return true
+        val shorter = if (a.length <= b.length) a else b
+        val longer = if (a.length <= b.length) b else a
+        if (shorter.length < 4) return false
+        var common = 0
+        for (ch in shorter) {
+            if (ch in longer) common++
+        }
+        return common.toFloat() / shorter.length.toFloat() >= 0.72f
     }
 
     /**

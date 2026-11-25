@@ -230,6 +230,50 @@ class LyricsHeaderSanitizerTest {
         assertEquals(3, sanitized.lines?.size)
     }
 
+    @Test
+    fun removesRealBegH0F3uE5QSpacedRichSyncLyricistCreditAtSevenSeconds() {
+        val richSyncFromSimpMusic =
+            Lyrics(
+                error = false,
+                syncType = "RICH_SYNCED",
+                lines =
+                    listOf(
+                        line("7220", "<00:07.22>三 <00:08.12>浦 <00:09.03>徳 <00:09.93>子"),
+                        line("16260", "<00:16.26>夜 <00:16.63>空 <00:17.90>に <00:19.16>向 <00:19.44>っ <00:19.73>て <00:21.41>走 <00:21.65>る <00:22.01>車 <00:22.44>の <00:22.86>ラ <00:23.23>イ <00:23.85>ト"),
+                        line("24820", "<00:24.82>あ <00:25.12>な <00:25.34>た <00:26.06>と <00:27.11>寄 <00:27.36>り <00:27.60>添 <00:27.95>え <00:28.24>ば"),
+                    ),
+            )
+        val lrclibReference =
+            Lyrics(
+                error = false,
+                syncType = "LINE_SYNCED",
+                lines =
+                    listOf(
+                        line("16000", "夜空に向って走る車のライト"),
+                        line("24530", "あなたと寄り添えば 流星になるのよ..."),
+                    ),
+            )
+
+        // 1. Offline / standalone sanitize strips `[00:07.22] 三 浦 徳 子`
+        val standalone =
+            LyricsHeaderSanitizer.sanitize(
+                lyrics = richSyncFromSimpMusic,
+                songTitle = "夜空のイヤリング",
+                artistName = "八神純子",
+            )
+        assertEquals(2, standalone.lines?.size)
+        assertEquals("16260", standalone.lines?.first()?.startTimeMs)
+
+        // 2. Deterministic cross-reference strip also removes any intro credit absent from LRCLIB
+        val refStripped =
+            LyricsHeaderSanitizer.stripLeadingNonSungLinesAgainstReference(
+                candidate = richSyncFromSimpMusic,
+                reference = lrclibReference,
+            )
+        assertEquals(2, refStripped.lines?.size)
+        assertEquals("16260", refStripped.lines?.first()?.startTimeMs)
+    }
+
     private fun line(
         startMs: String,
         words: String,
