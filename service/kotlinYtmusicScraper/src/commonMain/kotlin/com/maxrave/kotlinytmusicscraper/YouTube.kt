@@ -2987,30 +2987,14 @@ class YouTube {
         }
 
     /**
-     * Fetches official YouTube Music lyrics (Musixmatch / LyricFind).
-     * When the session has login cookies, queries [ANDROID_MUSIC] first to retrieve
-     * `timedLyricsData` cue ranges (`LINE_SYNCED`), falling back cleanly to [WEB_REMIX] plain text.
+     * Fetches official YouTube Music lyrics (Musixmatch / LyricFind) via [WEB_REMIX].
+     * Note: YouTube Music's InnerTube rejects web `SAPISIDHASH` cookies on mobile `ANDROID_MUSIC`
+     * with HTTP `400 INVALID_ARGUMENT`, and anonymous mobile clients receive `staticLayout: true`
+     * without `cueRange`, so querying [WEB_REMIX] directly eliminates a wasted 400 round-trip per
+     * track while keeping [parseAndroidMusicOfficialLyrics] available for future OAuth mobile tokens.
      */
     suspend fun officialLyrics(endpoint: BrowseEndpoint): Result<YouTubeMusicOfficialLyrics?> =
         try {
-            if (!ytMusic.cookie.isNullOrBlank()) {
-                val androidTimed =
-                    try {
-                        val rawJson =
-                            ytMusic
-                                .browse(ANDROID_MUSIC, endpoint.browseId, endpoint.params, setLogin = true)
-                                .bodyAsText()
-                        parseAndroidMusicOfficialLyrics(rawJson)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Throwable) {
-                        Logger.w(TAG, "ANDROID_MUSIC timed lyrics fallback to WEB_REMIX: ${e.message}")
-                        null
-                    }
-                if (androidTimed != null) {
-                    return Result.success(androidTimed)
-                }
-            }
             val response = ytMusic.browse(WEB_REMIX, endpoint.browseId, endpoint.params).body<BrowseResponse>()
             val shelf =
                 response.contents

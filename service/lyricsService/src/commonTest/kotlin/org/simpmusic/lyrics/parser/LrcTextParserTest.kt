@@ -167,4 +167,19 @@ class LrcTextParserTest {
         assertEquals("2500", parsed?.lines?.single()?.startTimeMs)
         assertEquals("Rock & Roll", parsed?.lines?.single()?.words)
     }
+
+    @Test
+    fun parseSyncedAndUnsyncedStripInlineRichSyncAndHtmlTagsPreservingHyphensAndCjk() {
+        val raw =
+            """
+            [00:19.99]<00:19.99>Há<00:20.00> <00:20.02>muito<00:20.03> <00:20.05>tempo<00:23.92>
+            [00:44.04]v1: <i>mestre-<00:44.70>sala</i> [00:45.00]
+            [00:50.00]<00:50.00>三<00:50.50>浦
+            """.trimIndent()
+        val lines = parseSyncedLyrics(raw).lyrics?.lines.orEmpty().map { it.words }
+        assertEquals(listOf("Há muito tempo", "mestre-sala", "三浦"), lines)
+
+        val unsynced = parseUnsyncedLyrics("<00:10.00>Hello <00:10.50>world\n<00:12.00>v2: <b>Test</b>").lyrics?.lines.orEmpty().map { it.words }
+        assertEquals(listOf("Hello world", "Test"), unsynced)
+    }
 }

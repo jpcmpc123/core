@@ -265,15 +265,24 @@ class Ytmusic {
         origin: String = "https://music.youtube.com",
     ) {
         contentType(ContentType.Application.Json)
+        val isWebClient =
+            client == YouTubeClient.WEB ||
+                client == WEB_REMIX ||
+                client == YouTubeClient.WEB_EMBEDDED ||
+                client == TVHTML5 ||
+                client == TVHTML5_SIMPLY ||
+                client == YouTubeClient.MWEB
         headers {
             append("X-Goog-Api-Format-Version", "1")
             append("X-YouTube-Client-Name", "${client.xClientName ?: 1}")
             append("X-YouTube-Client-Version", client.clientVersion)
-            append("X-Goog-Authuser", authUser.toString())
-            pageId?.let {
-                append("X-Goog-Pageid", it)
+            if (setLogin || isWebClient) {
+                append("X-Goog-Authuser", authUser.toString())
+                pageId?.let {
+                    append("X-Goog-Pageid", it)
+                }
+                append("x-origin", origin)
             }
-            append("x-origin", origin)
             if (client.referer != null && isUsingReferer) {
                 append("Referer", client.referer)
             }

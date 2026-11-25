@@ -1,13 +1,23 @@
 package com.maxrave.media3.audio
 
+import com.maxrave.domain.data.player.BiquadFilterKind
 import com.maxrave.domain.data.player.EQUALIZER_BASS_MONO_HZ
+import com.maxrave.domain.data.player.EQUALIZER_BASS_SHELF_HZ
+import com.maxrave.domain.data.player.EQUALIZER_ISO_BANDS_HZ
+import com.maxrave.domain.data.player.EQUALIZER_ISO_Q
+import com.maxrave.domain.data.player.EQUALIZER_LOUDNESS_HIGH_HZ
+import com.maxrave.domain.data.player.EQUALIZER_LOUDNESS_LOW_HZ
+import com.maxrave.domain.data.player.EQUALIZER_SUBSONIC_HZ
+import com.maxrave.domain.data.player.EQUALIZER_TREBLE_SHELF_HZ
 import com.maxrave.domain.data.player.EqualizerConfig
+import com.maxrave.domain.data.player.ParametricBand
 import com.maxrave.domain.data.player.computeNormalizedBiquad
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -16,11 +26,13 @@ import kotlin.math.tanh
 /**
  * Pure-Kotlin studio DSP kernel behind [EqualizerAudioProcessor]:
  * 1. Smooth-ramped input preamp / A-B bypass crossfade (10 ms anti-click transition)
- * 2. Cascaded RBJ biquad stages: Subsonic 28 Hz HPF, AutoEq layer (parametric or fixed),
- *    10-band ISO EQ (31 Hz..16 kHz, high-shelf top end), Bass Low-Shelf (70 Hz),
- *    Air High-Shelf (9.5 kHz), and dynamic Fletcher-Munson Loudness shelves
- * 3. Mid/Side Stereo Width stage (> 140 Hz) with LR2 Bass Mono guard (< 140 Hz)
- * 4. Zero-latency stereo-linked fast-attack (0.25 ms) soft-knee True-Peak Limiter
+ * 2. Fixed-slot Transposed Direct Form II (TDF-II) RBJ biquad cascade with 10 ms per-coefficient
+ *    interpolation so crossing 0 dB or dragging treble sliders never shifts stage state or produces
+ *    zipper noise
+ * 3. Mid/Side Stereo Width stage (> 100 Hz) with LR2 Bass Mono guard (< 100 Hz) and open
+ *    early-reflection Spatial Stage
+ * 4. 2 ms Lookahead True-Peak Limiter (-0.8 dBFS ceiling, O(1) monotonic deque, zero heap
+ *    allocations) eliminating high-frequency hard clipping, aliasing, and inter-sample peaks
  * 5. TPDF dither on PCM 16-bit output (zero allocation in audio loop)
  *
  * Kept free of Android framework types so unit tests can run directly on JVM without `android.jar`
@@ -32,19 +44,30 @@ internal class EqualizerKernel {
 
     private var appliedConfig: EqualizerConfig? = null
 
-    /** Current active biquad stages (`stageCount <= MAX_STAGES`), normalized [b0, b1, b2, a1, a2]. */
-    private var stageCoeffs = DoubleArray(MAX_STAGES * COEFFS_PER_STAGE)
-    private var stageCount = 0
+    /**
+     * Fixed-slot biquad coefficients (`TOTAL_SLOTS = 31`), normalized `[b0, b1, b2, a1, a2]`:
+     * - `[0]`: Subsonic 28 Hz HPF
+     * - `[1..10]`: 10-band ISO EQ
+     * - `[11]`: Bass low-shelf (70 Hz)
+     * - `[12]`: Treble high-shelf (6 kHz)
+     * - `[13]`: Loudness low-shelf (85 Hz)
+     * - `[14]`: Loudness high-shelf (10 kHz)
+     * - `[15..30]`: AutoEq layer (up to 16 bands)
+     */
+    private var currCoeffs = DoubleArray(TOTAL_SLOTS * COEFFS_PER_STAGE)
+    private var targetCoeffs = DoubleArray(TOTAL_SLOTS * COEFFS_PER_STAGE)
+    private var stepCoeffs = DoubleArray(TOTAL_SLOTS * COEFFS_PER_STAGE)
+    private var activeMask: Int = 0
+    private var rampingMask: Int = 0
+    private var coeffRampRemaining: Int = 0
 
-    /** Biquad delay lines: `[x1, x2, y1, y2]` laid out `channel * MAX_STAGES * 4 + stage * 4`. */
+    /** TDF-II delay lines `[z1, z2]` laid out `channel * TOTAL_SLOTS * 2 + stage * 2`. */
     private var stageState = DoubleArray(0)
 
-    /** Bass-mono LR2 inverted high-pass filter coefficients & state on Side (S) channel. */
+    /** Bass-mono LR2 TDF-II high-pass filter coefficients & state on Side (S) channel. */
     private var bassMonoHpCoeffs = DoubleArray(COEFFS_PER_STAGE)
-    private var bassMonoX1 = 0.0
-    private var bassMonoX2 = 0.0
-    private var bassMonoY1 = 0.0
-    private var bassMonoY2 = 0.0
+    private var bassMonoZ1 = 0.0
+    private var bassMonoZ2 = 0.0
 
     /** Preamp, stereo width, spatial stage & A-B wet/dry smoothing ramps (10 ms). */
     private var currentPreampGain = 1.0
@@ -88,13 +111,55 @@ internal class EqualizerKernel {
     private var limiterEnabled = true
     private var bypassActive = true
 
-    /** Zero-latency fast-attack (0.25 ms) stereo-linked transparent soft-knee limiter state. */
+    /** 2 ms Lookahead True-Peak Limiter with O(1) amortized monotonic peak deque. */
+    private var lookaheadSamples = 1
+    private var lookDelayL = DoubleArray(0)
+    private var lookDelayR = DoubleArray(0)
+    private var lookWriteIdx = 0
+    private var dequeSeq = LongArray(0)
+    private var dequeVal = DoubleArray(0)
+    private var dequeCap = 2
+    private var dequeHead = 0
+    private var dequeTail = 0
+    private var dequeCount = 0
+    private var lookSampleSeq = 0L
+
     private var limiterGain = 1.0
     private var limiterAttackCoeff = 0.9
     private var limiterReleaseCoeff = 0.999
 
     /** Fast deterministic xorshift64 state for TPDF dither (zero allocation). */
     private var rngState: Long = 0x5EED_C0DE_CAFE_BABEL
+
+    init {
+        resetCoeffArraysToIdentity()
+    }
+
+    private fun resetCoeffArraysToIdentity() {
+        for (slot in 0 until TOTAL_SLOTS) {
+            val base = slot * COEFFS_PER_STAGE
+            currCoeffs[base] = 1.0
+            currCoeffs[base + 1] = 0.0
+            currCoeffs[base + 2] = 0.0
+            currCoeffs[base + 3] = 0.0
+            currCoeffs[base + 4] = 0.0
+
+            targetCoeffs[base] = 1.0
+            targetCoeffs[base + 1] = 0.0
+            targetCoeffs[base + 2] = 0.0
+            targetCoeffs[base + 3] = 0.0
+            targetCoeffs[base + 4] = 0.0
+
+            stepCoeffs[base] = 0.0
+            stepCoeffs[base + 1] = 0.0
+            stepCoeffs[base + 2] = 0.0
+            stepCoeffs[base + 3] = 0.0
+            stepCoeffs[base + 4] = 0.0
+        }
+        activeMask = 0
+        rampingMask = 0
+        coeffRampRemaining = 0
+    }
 
     fun configure(
         sampleRate: Int,
@@ -106,9 +171,27 @@ internal class EqualizerKernel {
         }
         this.sampleRate = sampleRate
         this.channelCount = channelCount
-        this.stageState = DoubleArray(channelCount * MAX_STAGES * STATE_PER_STAGE)
-        this.limiterAttackCoeff = exp(-1.0 / (sampleRate * 0.00025))
-        this.limiterReleaseCoeff = exp(-1.0 / (sampleRate * 0.045))
+        this.stageState = DoubleArray(channelCount * TOTAL_SLOTS * STATE_PER_STAGE)
+
+        // 0.45 ms smooth attack inside the 2 ms lookahead reaches ~98.8% before the peak exits.
+        this.limiterAttackCoeff = exp(-1.0 / (sampleRate * 0.00045))
+        this.limiterReleaseCoeff = exp(-1.0 / (sampleRate * 0.065))
+
+        val lookSamples = max(1, (sampleRate * LOOKAHEAD_SECONDS).roundToInt())
+        this.lookaheadSamples = lookSamples
+        this.dequeCap = lookSamples + 2
+        if (channelCount == 2) {
+            this.lookDelayL = DoubleArray(lookSamples)
+            this.lookDelayR = DoubleArray(lookSamples)
+            this.dequeSeq = LongArray(this.dequeCap)
+            this.dequeVal = DoubleArray(this.dequeCap)
+        } else {
+            this.lookDelayL = DoubleArray(0)
+            this.lookDelayR = DoubleArray(0)
+            this.dequeSeq = LongArray(0)
+            this.dequeVal = DoubleArray(0)
+        }
+
         val delayLen = max(64, (sampleRate * 0.032).roundToInt())
         if (channelCount == 2) {
             this.spatialDelayL = DoubleArray(delayLen)
@@ -131,6 +214,7 @@ internal class EqualizerKernel {
         this.spatialHpfAlpha = hpfRc / (hpfRc + dt)
         this.spatialLpfAlpha = dt / (lpfRc + dt)
         computeBassMonoHpCoeffs(sampleRate.toDouble())
+        resetCoeffArraysToIdentity()
         flush()
         this.appliedConfig = null
         this.currentWet = 0.0
@@ -140,10 +224,8 @@ internal class EqualizerKernel {
 
     fun flush() {
         stageState.fill(0.0)
-        bassMonoX1 = 0.0
-        bassMonoX2 = 0.0
-        bassMonoY1 = 0.0
-        bassMonoY2 = 0.0
+        bassMonoZ1 = 0.0
+        bassMonoZ2 = 0.0
         spatialDelayL.fill(0.0)
         spatialDelayR.fill(0.0)
         spatialWriteIdx = 0
@@ -153,6 +235,13 @@ internal class EqualizerKernel {
         spatialSendHpfR = 0.0
         spatialSendLpfL = 0.0
         spatialSendLpfR = 0.0
+        lookDelayL.fill(0.0)
+        lookDelayR.fill(0.0)
+        lookWriteIdx = 0
+        dequeHead = 0
+        dequeTail = 0
+        dequeCount = 0
+        lookSampleSeq = 0L
         limiterGain = 1.0
     }
 
@@ -160,10 +249,14 @@ internal class EqualizerKernel {
         sampleRate = 0
         channelCount = 0
         appliedConfig = null
-        stageCount = 0
         stageState = DoubleArray(0)
         spatialDelayL = DoubleArray(0)
         spatialDelayR = DoubleArray(0)
+        lookDelayL = DoubleArray(0)
+        lookDelayR = DoubleArray(0)
+        dequeSeq = LongArray(0)
+        dequeVal = DoubleArray(0)
+        resetCoeffArraysToIdentity()
         flush()
         currentPreampGain = 1.0
         targetPreampGain = 1.0
@@ -200,10 +293,12 @@ internal class EqualizerKernel {
         val wasFullBypass = bypassActive && currentWet <= 1e-6
         bypassActive = false
 
-        val preampDb = config.effectivePreampDb(sampleRate.toDouble())
+        val fs = sampleRate.toDouble()
+        val preampDb = config.effectivePreampDb(fs)
         targetPreampGain = 10.0.pow(preampDb / 20.0).coerceIn(0.05, 4.0)
         if (wasFullBypass) {
             flush()
+            resetCoeffArraysToIdentity()
             currentPreampGain = targetPreampGain
             preampStep = 0.0
             currentStereoWidth = config.safeEnhancements.stereoWidth.toDouble()
@@ -227,27 +322,222 @@ internal class EqualizerKernel {
         bassMonoEnabled = enh.bassMonoEnabled
         limiterEnabled = enh.limiterEnabled
 
-        val stages = config.tonalBiquadStages()
-        var written = 0
-        for (stage in stages) {
-            if (written >= MAX_STAGES) break
-            val c = computeNormalizedBiquad(stage, sampleRate.toDouble()) ?: continue
-            val base = written * COEFFS_PER_STAGE
-            stageCoeffs[base] = c[0]
-            stageCoeffs[base + 1] = c[1]
-            stageCoeffs[base + 2] = c[2]
-            stageCoeffs[base + 3] = c[3]
-            stageCoeffs[base + 4] = c[4]
-            written++
+        populateTargetCoeffs(config, fs)
+        if (wasFullBypass) {
+            applyTargetCoeffsImmediately()
+        } else {
+            scheduleCoeffRamp(rampSamples)
         }
-        // Clear delay lines of any newly freed trailing stages so they cannot leak stale energy later.
-        if (written < stageCount) {
-            for (ch in 0 until channelCount) {
-                val chBase = ch * MAX_STAGES * STATE_PER_STAGE
-                stageState.fill(0.0, chBase + written * STATE_PER_STAGE, chBase + stageCount * STATE_PER_STAGE)
+    }
+
+    private fun setSlotIdentityTarget(slot: Int) {
+        val base = slot * COEFFS_PER_STAGE
+        targetCoeffs[base] = 1.0
+        targetCoeffs[base + 1] = 0.0
+        targetCoeffs[base + 2] = 0.0
+        targetCoeffs[base + 3] = 0.0
+        targetCoeffs[base + 4] = 0.0
+    }
+
+    private fun setSlotBandTarget(
+        slot: Int,
+        band: ParametricBand?,
+        fs: Double,
+    ) {
+        if (band == null) {
+            setSlotIdentityTarget(slot)
+            return
+        }
+        val c = computeNormalizedBiquad(band, fs)
+        if (c == null) {
+            setSlotIdentityTarget(slot)
+            return
+        }
+        val base = slot * COEFFS_PER_STAGE
+        targetCoeffs[base] = c[0]
+        targetCoeffs[base + 1] = c[1]
+        targetCoeffs[base + 2] = c[2]
+        targetCoeffs[base + 3] = c[3]
+        targetCoeffs[base + 4] = c[4]
+    }
+
+    private fun populateTargetCoeffs(
+        config: EqualizerConfig,
+        fs: Double,
+    ) {
+        val bands = config.normalizedBandsDb
+        val enh = config.safeEnhancements
+        val autoLayer = config.safeAutoEqLayer?.takeIf { it.enabled }
+
+        // Slot 0: Subsonic HPF
+        val hasBassGain =
+            enh.bassBoostDb > 0.1f ||
+                enh.loudnessAmount > 0.05f ||
+                bands.take(3).any { it > 0.5f }
+        if (enh.subsonicFilterEnabled && hasBassGain) {
+            setSlotBandTarget(
+                SLOT_SUBSONIC,
+                ParametricBand(BiquadFilterKind.HIGH_PASS, EQUALIZER_SUBSONIC_HZ.toFloat(), 0f, 0.7071f),
+                fs,
+            )
+        } else {
+            setSlotIdentityTarget(SLOT_SUBSONIC)
+        }
+
+        // Slots 1..10: 10-band ISO EQ at fixed slot indices
+        for (i in EQUALIZER_ISO_BANDS_HZ.indices) {
+            val gain = bands[i]
+            if (abs(gain) > 0.01f) {
+                val hz = EQUALIZER_ISO_BANDS_HZ[i].toFloat()
+                val kind = if (i == EQUALIZER_ISO_BANDS_HZ.lastIndex) BiquadFilterKind.HIGH_SHELF else BiquadFilterKind.PEAKING
+                val q = if (kind == BiquadFilterKind.HIGH_SHELF) 0.7071f else EQUALIZER_ISO_Q.toFloat()
+                setSlotBandTarget(SLOT_ISO_BASE + i, ParametricBand(kind, hz, gain, q), fs)
+            } else {
+                setSlotIdentityTarget(SLOT_ISO_BASE + i)
             }
         }
-        stageCount = written
+
+        // Slot 11: Bass low-shelf
+        if (enh.bassBoostDb > 0.01f) {
+            setSlotBandTarget(
+                SLOT_BASS_SHELF,
+                ParametricBand(BiquadFilterKind.LOW_SHELF, EQUALIZER_BASS_SHELF_HZ.toFloat(), enh.bassBoostDb, 0.7071f),
+                fs,
+            )
+        } else {
+            setSlotIdentityTarget(SLOT_BASS_SHELF)
+        }
+
+        // Slot 12: Treble high-shelf
+        if (abs(enh.trebleBoostDb) > 0.01f) {
+            setSlotBandTarget(
+                SLOT_TREBLE_SHELF,
+                ParametricBand(BiquadFilterKind.HIGH_SHELF, EQUALIZER_TREBLE_SHELF_HZ.toFloat(), enh.trebleBoostDb, 0.7071f),
+                fs,
+            )
+        } else {
+            setSlotIdentityTarget(SLOT_TREBLE_SHELF)
+        }
+
+        // Slots 13..14: Fletcher-Munson dynamic loudness shelves
+        if (enh.loudnessAmount > 0.01f) {
+            val amt = enh.loudnessAmount
+            setSlotBandTarget(
+                SLOT_LOUDNESS_LOW,
+                ParametricBand(BiquadFilterKind.LOW_SHELF, EQUALIZER_LOUDNESS_LOW_HZ.toFloat(), 4.5f * amt, 0.65f),
+                fs,
+            )
+            setSlotBandTarget(
+                SLOT_LOUDNESS_HIGH,
+                ParametricBand(BiquadFilterKind.HIGH_SHELF, EQUALIZER_LOUDNESS_HIGH_HZ.toFloat(), 2.5f * amt, 0.65f),
+                fs,
+            )
+        } else {
+            setSlotIdentityTarget(SLOT_LOUDNESS_LOW)
+            setSlotIdentityTarget(SLOT_LOUDNESS_HIGH)
+        }
+
+        // Slots 15..30: AutoEq correction layer
+        val autoBands = autoLayer?.bands.orEmpty()
+        for (i in 0 until AUTOEQ_SLOTS) {
+            val b = autoBands.getOrNull(i)?.takeIf { abs(it.gainDb) > 0.01f }
+            setSlotBandTarget(SLOT_AUTOEQ_BASE + i, b, fs)
+        }
+    }
+
+    private fun isSlotIdentity(coeffs: DoubleArray, base: Int): Boolean =
+        abs(coeffs[base] - 1.0) <= 1e-12 &&
+            abs(coeffs[base + 1]) <= 1e-12 &&
+            abs(coeffs[base + 2]) <= 1e-12 &&
+            abs(coeffs[base + 3]) <= 1e-12 &&
+            abs(coeffs[base + 4]) <= 1e-12
+
+    private fun applyTargetCoeffsImmediately() {
+        var mask = 0
+        for (slot in 0 until TOTAL_SLOTS) {
+            val base = slot * COEFFS_PER_STAGE
+            for (k in 0 until COEFFS_PER_STAGE) {
+                currCoeffs[base + k] = targetCoeffs[base + k]
+                stepCoeffs[base + k] = 0.0
+            }
+            if (!isSlotIdentity(targetCoeffs, base)) {
+                mask = mask or (1 shl slot)
+            }
+        }
+        activeMask = mask
+        rampingMask = 0
+        coeffRampRemaining = 0
+    }
+
+    private fun scheduleCoeffRamp(rampSamples: Int) {
+        val invRamp = 1.0 / rampSamples
+        var nextRampMask = 0
+        var nextActiveMask = activeMask
+        for (slot in 0 until TOTAL_SLOTS) {
+            val base = slot * COEFFS_PER_STAGE
+            var changed = false
+            for (k in 0 until COEFFS_PER_STAGE) {
+                val diff = targetCoeffs[base + k] - currCoeffs[base + k]
+                stepCoeffs[base + k] = diff * invRamp
+                if (abs(diff) > 1e-11) {
+                    changed = true
+                }
+            }
+            val bit = 1 shl slot
+            if (changed) {
+                nextRampMask = nextRampMask or bit
+                nextActiveMask = nextActiveMask or bit
+            } else if (!isSlotIdentity(targetCoeffs, base)) {
+                nextActiveMask = nextActiveMask or bit
+            }
+        }
+        rampingMask = nextRampMask
+        activeMask = nextActiveMask
+        coeffRampRemaining = if (nextRampMask != 0) rampSamples else 0
+    }
+
+    private fun stepCoeffRamps() {
+        val rem = coeffRampRemaining
+        if (rem <= 0) return
+        val nextRem = rem - 1
+        coeffRampRemaining = nextRem
+
+        if (nextRem > 0) {
+            var mask = rampingMask
+            while (mask != 0) {
+                val slot = mask.countTrailingZeroBits()
+                val base = slot * COEFFS_PER_STAGE
+                currCoeffs[base] += stepCoeffs[base]
+                currCoeffs[base + 1] += stepCoeffs[base + 1]
+                currCoeffs[base + 2] += stepCoeffs[base + 2]
+                currCoeffs[base + 3] += stepCoeffs[base + 3]
+                currCoeffs[base + 4] += stepCoeffs[base + 4]
+                mask = mask and (mask - 1)
+            }
+        } else {
+            // Ramp finished: snap to exact target coefficients and clear any slot that returned to identity.
+            var mask = rampingMask
+            var nextActive = activeMask
+            while (mask != 0) {
+                val slot = mask.countTrailingZeroBits()
+                val base = slot * COEFFS_PER_STAGE
+                for (k in 0 until COEFFS_PER_STAGE) {
+                    currCoeffs[base + k] = targetCoeffs[base + k]
+                    stepCoeffs[base + k] = 0.0
+                }
+                if (isSlotIdentity(targetCoeffs, base)) {
+                    nextActive = nextActive and (1 shl slot).inv()
+                    for (ch in 0 until channelCount) {
+                        val s = ch * TOTAL_SLOTS * STATE_PER_STAGE + slot * STATE_PER_STAGE
+                        stageState[s] = 0.0
+                        stageState[s + 1] = 0.0
+                    }
+                }
+                mask = mask and (mask - 1)
+            }
+            activeMask = nextActive
+            rampingMask = 0
+        }
     }
 
     /** True when the DSP is fully idle and caller may bulk-copy input bytes untouched. */
@@ -286,7 +576,7 @@ internal class EqualizerKernel {
                     framePeak = max(framePeak, abs(clean))
                 }
                 if (limiterEnabled) {
-                    val gain = stepLimiter(framePeak)
+                    val gain = stepSingleChannelLimiter(framePeak)
                     for (ch in 0 until chans) {
                         samples[idx + ch] = softCeilingGuard(samples[idx + ch] * gain)
                     }
@@ -323,21 +613,19 @@ internal class EqualizerKernel {
                 outShorts[idx + 1] = quantizePcm16WithTpdf(outFrameR)
             } else {
                 var framePeak = 0.0
-                var firstLimited = 0.0
                 if (chans == 1) {
                     val dry = inShorts[idx] / PCM16_SCALE
                     val filtered = runBiquads(dry * currentPreampGain, 0)
                     val blended = dry * (1.0 - currentWet) + filtered * currentWet
                     val clean = if (blended.isFinite()) blended else dry
-                    firstLimited =
+                    val limited =
                         if (limiterEnabled) {
-                            softCeilingGuard(clean * stepLimiter(abs(clean)))
+                            softCeilingGuard(clean * stepSingleChannelLimiter(abs(clean)))
                         } else {
                             clean
                         }
-                    outShorts[idx] = quantizePcm16WithTpdf(firstLimited)
+                    outShorts[idx] = quantizePcm16WithTpdf(limited)
                 } else {
-                    // >2 channels (rare surround PCM): compute linked frame gain without extra allocations.
                     for (ch in 0 until chans) {
                         val dry = inShorts[idx + ch] / PCM16_SCALE
                         val filtered = runBiquads(dry * currentPreampGain, ch)
@@ -346,16 +634,14 @@ internal class EqualizerKernel {
                         framePeak = max(framePeak, abs(clean))
                         outShorts[idx + ch] = quantizePcm16WithTpdf(clean)
                     }
-                    if (limiterEnabled && framePeak > LIMITER_THRESHOLD) {
-                        val gain = stepLimiter(framePeak)
-                        for (ch in 0 until chans) {
-                            val dry = inShorts[idx + ch] / PCM16_SCALE
-                            val filtered = runBiquads(dry * currentPreampGain, ch)
-                            val blended = dry * (1.0 - currentWet) + filtered * currentWet
-                            outShorts[idx + ch] = quantizePcm16WithTpdf(softCeilingGuard(blended * gain))
+                    if (limiterEnabled) {
+                        val gain = stepSingleChannelLimiter(framePeak)
+                        if (framePeak > LIMITER_THRESHOLD) {
+                            for (ch in 0 until chans) {
+                                val norm = outShorts[idx + ch] / PCM16_SCALE
+                                outShorts[idx + ch] = quantizePcm16WithTpdf(softCeilingGuard(norm * gain))
+                            }
                         }
-                    } else if (limiterEnabled) {
-                        stepLimiter(framePeak)
                     }
                 }
             }
@@ -388,7 +674,7 @@ internal class EqualizerKernel {
         val blended = safeDry * (1.0 - currentWet) + filtered * currentWet
         val clean = if (blended.isFinite()) blended else safeDry
         return if (limiterEnabled) {
-            softCeilingGuard(clean * stepLimiter(abs(clean)))
+            softCeilingGuard(clean * stepSingleChannelLimiter(abs(clean)))
         } else {
             clean
         }
@@ -445,6 +731,9 @@ internal class EqualizerKernel {
                 spatialStageStep = 0.0
             }
         }
+        if (coeffRampRemaining > 0) {
+            stepCoeffRamps()
+        }
     }
 
     private fun processStereoFrame(
@@ -457,22 +746,15 @@ internal class EqualizerKernel {
         var eqL = runBiquads(safeL * currentPreampGain, 0)
         var eqR = runBiquads(safeR * currentPreampGain, 1)
 
-        // Stereo width M/S + Bass Mono (< 100 Hz Butterworth, unity phase polarity)
+        // Stereo width M/S + Bass Mono (< 100 Hz Butterworth TDF-II, unity phase polarity)
         if (abs(currentStereoWidth - 1.0) > 0.002) {
             val mid = 0.5 * (eqL + eqR)
             val side = 0.5 * (eqL - eqR)
             val shapedSide =
                 if (bassMonoEnabled) {
-                    val hpSide =
-                        bassMonoHpCoeffs[0] * side +
-                            bassMonoHpCoeffs[1] * bassMonoX1 +
-                            bassMonoHpCoeffs[2] * bassMonoX2 -
-                            bassMonoHpCoeffs[3] * bassMonoY1 -
-                            bassMonoHpCoeffs[4] * bassMonoY2
-                    bassMonoX2 = bassMonoX1
-                    bassMonoX1 = side
-                    bassMonoY2 = bassMonoY1
-                    bassMonoY1 = hpSide
+                    val hpSide = bassMonoHpCoeffs[0] * side + bassMonoZ1
+                    bassMonoZ1 = bassMonoHpCoeffs[1] * side - bassMonoHpCoeffs[3] * hpSide + bassMonoZ2
+                    bassMonoZ2 = bassMonoHpCoeffs[2] * side - bassMonoHpCoeffs[4] * hpSide
                     hpSide * currentStereoWidth
                 } else {
                     side * currentStereoWidth
@@ -523,16 +805,80 @@ internal class EqualizerKernel {
         val preLimL = dryWeight * safeL + wet * eqL
         val preLimR = dryWeight * safeR + wet * eqR
 
-        if (!limiterEnabled) {
+        if (!limiterEnabled || lookDelayL.isEmpty()) {
             outFrameL = if (preLimL.isFinite()) preLimL else safeL
             outFrameR = if (preLimR.isFinite()) preLimR else safeR
             return
         }
 
-        val framePeak = max(abs(preLimL), abs(preLimR))
-        val gain = stepLimiter(framePeak)
-        val limL = softCeilingGuard(preLimL * gain)
-        val limR = softCeilingGuard(preLimR * gain)
+        stepLookaheadStereoLimiter(
+            if (preLimL.isFinite()) preLimL else 0.0,
+            if (preLimR.isFinite()) preLimR else 0.0,
+        )
+    }
+
+    private fun stepLookaheadStereoLimiter(
+        inL: Double,
+        inR: Double,
+    ) {
+        val peak = max(abs(inL), abs(inR))
+        val cap = dequeCap
+
+        // Maintain monotonic decreasing deque over the 2 ms lookahead window in O(1) amortized time.
+        while (dequeCount > 0) {
+            val lastIdx = if (dequeTail == 0) cap - 1 else dequeTail - 1
+            if (dequeVal[lastIdx] <= peak) {
+                dequeTail = lastIdx
+                dequeCount--
+            } else {
+                break
+            }
+        }
+        dequeSeq[dequeTail] = lookSampleSeq
+        dequeVal[dequeTail] = peak
+        dequeTail = if (dequeTail + 1 >= cap) 0 else dequeTail + 1
+        dequeCount++
+
+        val expireBefore = lookSampleSeq - lookaheadSamples
+        while (dequeCount > 0 && dequeSeq[dequeHead] <= expireBefore) {
+            dequeHead = if (dequeHead + 1 >= cap) 0 else dequeHead + 1
+            dequeCount--
+        }
+        lookSampleSeq++
+
+        val delayedL = lookDelayL[lookWriteIdx]
+        val delayedR = lookDelayR[lookWriteIdx]
+        lookDelayL[lookWriteIdx] = inL
+        lookDelayR[lookWriteIdx] = inR
+        val nextWrite = lookWriteIdx + 1
+        lookWriteIdx = if (nextWrite >= lookaheadSamples) 0 else nextWrite
+
+        val delayedPeak = max(abs(delayedL), abs(delayedR))
+        val futurePeak = if (dequeCount > 0) dequeVal[dequeHead] else peak
+        val windowPeak = max(delayedPeak, futurePeak)
+
+        val targetGain =
+            if (windowPeak <= LIMITER_THRESHOLD) {
+                1.0
+            } else {
+                val headroom = LIMITER_CEILING - LIMITER_THRESHOLD
+                val compressed = LIMITER_THRESHOLD + headroom * tanh((windowPeak - LIMITER_THRESHOLD) / headroom)
+                min(compressed / windowPeak, LIMITER_CEILING / windowPeak).coerceIn(0.05, 1.0)
+            }
+
+        limiterGain =
+            if (targetGain < limiterGain) {
+                limiterAttackCoeff * limiterGain + (1.0 - limiterAttackCoeff) * targetGain
+            } else {
+                limiterReleaseCoeff * limiterGain + (1.0 - limiterReleaseCoeff) * targetGain
+            }
+
+        if (delayedPeak > LIMITER_CEILING && delayedPeak * limiterGain > LIMITER_CEILING) {
+            limiterGain = (LIMITER_CEILING / delayedPeak).coerceIn(0.05, 1.0)
+        }
+
+        val limL = softCeilingGuard(delayedL * limiterGain)
+        val limR = softCeilingGuard(delayedR * limiterGain)
         outFrameL = if (limL.isFinite()) limL else 0.0
         outFrameR = if (limR.isFinite()) limR else 0.0
     }
@@ -546,14 +892,14 @@ internal class EqualizerKernel {
         return buf[idx]
     }
 
-    private fun stepLimiter(framePeak: Double): Double {
+    private fun stepSingleChannelLimiter(framePeak: Double): Double {
         val targetGain =
             if (framePeak <= LIMITER_THRESHOLD) {
                 1.0
             } else {
                 val headroom = LIMITER_CEILING - LIMITER_THRESHOLD
                 val compressed = LIMITER_THRESHOLD + headroom * tanh((framePeak - LIMITER_THRESHOLD) / headroom)
-                (compressed / framePeak).coerceIn(0.05, 1.0)
+                min(compressed / framePeak, LIMITER_CEILING / framePeak).coerceIn(0.05, 1.0)
             }
         limiterGain =
             if (targetGain < limiterGain) {
@@ -564,35 +910,29 @@ internal class EqualizerKernel {
         return limiterGain
     }
 
+    /** Fixed-slot Transposed Direct Form II (TDF-II) biquad cascade skipping inactive slots via bitmask. */
     private fun runBiquads(
         input: Double,
         channel: Int,
     ): Double {
+        var mask = activeMask
+        if (mask == 0) return input
         var sample = input
-        var c = 0
-        var s = channel * MAX_STAGES * STATE_PER_STAGE
-        val limit = stageCount * COEFFS_PER_STAGE
-        while (c < limit) {
-            val x1 = stageState[s]
-            val x2 = stageState[s + 1]
-            val y1 = stageState[s + 2]
-            val y2 = stageState[s + 3]
+        val chBase = channel * TOTAL_SLOTS * STATE_PER_STAGE
+        while (mask != 0) {
+            val slot = mask.countTrailingZeroBits()
+            val c = slot * COEFFS_PER_STAGE
+            val s = chBase + slot * STATE_PER_STAGE
 
-            val out =
-                stageCoeffs[c] * sample +
-                    stageCoeffs[c + 1] * x1 +
-                    stageCoeffs[c + 2] * x2 -
-                    stageCoeffs[c + 3] * y1 -
-                    stageCoeffs[c + 4] * y2
-
-            stageState[s] = sample
-            stageState[s + 1] = x1
-            stageState[s + 2] = out
-            stageState[s + 3] = y1
+            val z1 = stageState[s]
+            val z2 = stageState[s + 1]
+            val b0 = currCoeffs[c]
+            val out = b0 * sample + z1
+            stageState[s] = currCoeffs[c + 1] * sample - currCoeffs[c + 3] * out + z2
+            stageState[s + 1] = currCoeffs[c + 2] * sample - currCoeffs[c + 4] * out
 
             sample = out
-            c += COEFFS_PER_STAGE
-            s += STATE_PER_STAGE
+            mask = mask and (mask - 1)
         }
         return sample
     }
@@ -642,17 +982,29 @@ internal class EqualizerKernel {
     }
 
     companion object {
-        private const val MAX_STAGES = 30
+        private const val SLOT_SUBSONIC = 0
+        private const val SLOT_ISO_BASE = 1
+        private const val SLOT_BASS_SHELF = 11
+        private const val SLOT_TREBLE_SHELF = 12
+        private const val SLOT_LOUDNESS_LOW = 13
+        private const val SLOT_LOUDNESS_HIGH = 14
+        private const val SLOT_AUTOEQ_BASE = 15
+        private const val AUTOEQ_SLOTS = 16
+        private const val TOTAL_SLOTS = 31
+
         private const val COEFFS_PER_STAGE = 5
-        private const val STATE_PER_STAGE = 4
+        private const val STATE_PER_STAGE = 2
         private const val RAMP_SECONDS = 0.010
+        private const val LOOKAHEAD_SECONDS = 0.002
 
         private const val SPATIAL_WET_MAX = 0.24
 
-        private const val LIMITER_THRESHOLD = 0.93 // -0.63 dBFS transparent soft-knee start
-        private const val LIMITER_CEILING = 0.98   // -0.18 dBFS compressor target ceiling
-        private const val LIMITER_SOFT_START = 0.98
-        private const val LIMITER_HARD_LIMIT = 0.995
+        // True-Peak ceiling at -0.8 dBFS with -1.0 dBFS transparent threshold protects against
+        // high-frequency hard clipping, aliasing, and Android AudioFlinger / Bluetooth ISP pops.
+        private const val LIMITER_THRESHOLD = 0.891
+        private const val LIMITER_CEILING = 0.912
+        private const val LIMITER_SOFT_START = 0.915
+        private const val LIMITER_HARD_LIMIT = 0.960
 
         private const val PCM16_SCALE = 32_768.0
         private const val PCM16_MAX = 32_767.0

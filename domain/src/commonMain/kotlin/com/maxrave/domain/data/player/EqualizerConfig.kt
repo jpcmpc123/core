@@ -167,8 +167,8 @@ data class EqualizerConfig(
             }
             PreampMode.AUTO_BALANCED -> {
                 val peak = computePeakResponseDb(this, sampleRate)
-                val target = if (peak > 1.0f) -((peak - 1.0f) * 0.35f) else 0f
-                target.coerceIn(-4.5f, 0f)
+                val target = if (peak > 0.5f) -((peak - 0.5f) * 0.58f) else 0f
+                target.coerceIn(-8.0f, 0f)
             }
         }
     }
@@ -332,16 +332,25 @@ fun computePeakResponseDb(
     config: EqualizerConfig,
     sampleRate: Double = 48_000.0,
 ): Float {
+    val enh = config.safeEnhancements
+    var spatialStereoExtraDb = 0.0
+    if (enh.stereoWidth > 1.005f) {
+        spatialStereoExtraDb += 20.0 * log10(0.5 * (1.0 + enh.stereoWidth.toDouble()))
+    }
+    if (enh.spatialStage > 0.01f) {
+        spatialStereoExtraDb += 20.0 * log10(1.0 + enh.spatialStage.toDouble() * 0.24 * 0.65)
+    }
+
     val stages = config.tonalBiquadStages()
-    if (stages.isEmpty()) return 0f
+    if (stages.isEmpty()) return spatialStereoExtraDb.toFloat()
 
     val fs = if (sampleRate.isFinite() && sampleRate >= 8_000.0) sampleRate else 48_000.0
     val coeffs = stages.mapNotNull { band -> computeNormalizedBiquad(band, fs) }
-    if (coeffs.isEmpty()) return 0f
+    if (coeffs.isEmpty()) return spatialStereoExtraDb.toFloat()
 
     val fMin = 20.0
     val fMax = minOf(20_000.0, fs * 0.45)
-    if (fMax <= fMin) return 0f
+    if (fMax <= fMin) return spatialStereoExtraDb.toFloat()
     val logRatio = ln(fMax / fMin)
 
     var maxDb = Float.NEGATIVE_INFINITY
@@ -365,12 +374,12 @@ fun computePeakResponseDb(
                 magSq *= (numRe * numRe + numIm * numIm) / denMagSq
             }
         }
-        val db = (10.0 * log10(magSq.coerceAtLeast(1e-12))).toFloat()
+        val db = (10.0 * log10(magSq.coerceAtLeast(1e-12)) + spatialStereoExtraDb).toFloat()
         if (db.isFinite() && db > maxDb) {
             maxDb = db
         }
     }
-    return if (maxDb.isFinite()) maxDb else 0f
+    return if (maxDb.isFinite()) maxDb else spatialStereoExtraDb.toFloat()
 }
 
 /** Computes normalized `[b0, b1, b2, a1, a2]` RBJ cookbook coefficients for [band] at [sampleRate]. */
@@ -406,8 +415,8 @@ fun computeNormalizedBiquad(
         }
 
         BiquadFilterKind.LOW_SHELF -> {
-            val slope = safe.q.toDouble().coerceIn(0.2, 2.0)
-            val alpha = sinW0 / 2.0 * sqrt((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0)
+            val safeQ = safe.q.toDouble().coerceIn(0.3, 1.2)
+            val alpha = sinW0 / (2.0 * safeQ)
             val twoSqrtAAlpha = 2.0 * sqrt(a) * alpha
             b0 = a * ((a + 1.0) - (a - 1.0) * cosW0 + twoSqrtAAlpha)
             b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cosW0)
@@ -418,8 +427,8 @@ fun computeNormalizedBiquad(
         }
 
         BiquadFilterKind.HIGH_SHELF -> {
-            val slope = safe.q.toDouble().coerceIn(0.2, 2.0)
-            val alpha = sinW0 / 2.0 * sqrt((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0)
+            val safeQ = safe.q.toDouble().coerceIn(0.3, 1.2)
+            val alpha = sinW0 / (2.0 * safeQ)
             val twoSqrtAAlpha = 2.0 * sqrt(a) * alpha
             b0 = a * ((a + 1.0) + (a - 1.0) * cosW0 + twoSqrtAAlpha)
             b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cosW0)

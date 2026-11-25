@@ -63,4 +63,37 @@ class EqualizerConfigTest {
         val speaker = AudioOutput(id = "spk", name = "Phone Speaker", kind = AudioOutputKind.DEVICE_SPEAKER, isActive = true)
         assertEquals("DEVICE_SPEAKER", audioOutputKeyFor(speaker))
     }
+
+    @Test
+    fun stereoWidthAndSpatialStageReserveHeadroomEvenWhenTrebleIsCut() {
+        val wideNegativeTreble =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = emptyList(),
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.AUTO_BALANCED,
+                        trebleBoostDb = -2f,
+                        stereoWidth = 1.35f,
+                        spatialStage = 0.35f,
+                        subsonicFilterEnabled = false,
+                    ),
+            )
+        val peak = computePeakResponseDb(wideNegativeTreble, 48_000.0)
+        assertTrue(peak > 1.2f, "Expected positive combined peak from stereoWidth + spatialStage (got $peak)")
+        val pre = wideNegativeTreble.effectivePreampDb(48_000.0)
+        assertTrue(pre < -0.3f, "Expected AUTO_BALANCED to allocate negative preamp for stereo/spatial headroom (got $pre)")
+    }
+
+    @Test
+    fun highShelfCoefficientsRemainFiniteWithoutResonantNanForAllValidQ() {
+        for (q in listOf(0.3f, 0.7071f, 1.0f, 1.41f, 2.0f)) {
+            val coeffs =
+                computeNormalizedBiquad(
+                    ParametricBand(BiquadFilterKind.HIGH_SHELF, 16_000f, 9f, q),
+                    48_000.0,
+                )
+            assertTrue(coeffs != null && coeffs.all { it.isFinite() }, "Expected valid finite HIGH_SHELF coeffs for q=$q")
+        }
+    }
 }

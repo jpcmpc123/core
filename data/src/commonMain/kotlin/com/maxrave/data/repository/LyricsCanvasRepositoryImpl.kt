@@ -92,6 +92,7 @@ internal class LyricsCanvasRepositoryImpl(
     private val amArtworkLock = Mutex()
     private val ytmOfficialCacheLock = Mutex()
     private val ytmOfficialCache = LinkedHashMap<String, ProviderFetchOutcome>(24)
+    private val ytmLyricsEndpointCache = LinkedHashMap<String, com.maxrave.kotlinytmusicscraper.models.BrowseEndpoint?>(32)
 
     private val lyricsResolver =
         LyricsResolver(
@@ -1305,8 +1306,28 @@ internal class LyricsCanvasRepositoryImpl(
         }
         val outcome =
             try {
-                val nextResult = youTube.next(WatchEndpoint(videoId = videoId)).getOrThrow()
-                val lyricsEndpoint = nextResult.lyricsEndpoint
+                val cachedEndpointEntry =
+                    ytmOfficialCacheLock.withLock {
+                        if (ytmLyricsEndpointCache.containsKey(cacheKey)) {
+                            true to ytmLyricsEndpointCache[cacheKey]
+                        } else {
+                            false to null
+                        }
+                    }
+                val lyricsEndpoint =
+                    if (cachedEndpointEntry.first) {
+                        cachedEndpointEntry.second
+                    } else {
+                        val nextResult = youTube.next(WatchEndpoint(videoId = videoId)).getOrThrow()
+                        val resolvedEndpoint = nextResult.lyricsEndpoint
+                        ytmOfficialCacheLock.withLock {
+                            if (ytmLyricsEndpointCache.size >= 32) {
+                                ytmLyricsEndpointCache.keys.firstOrNull()?.let(ytmLyricsEndpointCache::remove)
+                            }
+                            ytmLyricsEndpointCache[cacheKey] = resolvedEndpoint
+                        }
+                        resolvedEndpoint
+                    }
                 if (lyricsEndpoint == null) {
                     ProviderFetchOutcome.DefinitiveNotFound
                 } else {

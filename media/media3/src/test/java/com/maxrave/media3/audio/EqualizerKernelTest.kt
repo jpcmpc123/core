@@ -275,4 +275,102 @@ class EqualizerKernelTest {
         }
         assertTrue("Expected cross-coupled early reflections on Right channel (sum=$reflectedRight)", reflectedRight > 0.01)
     }
+
+    @Test
+    fun `treble boost and stereo width on sharp high-frequency transient stays below true-peak ceiling without clipping`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val config =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 2f, 4f, 4f),
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.AUTO_BALANCED,
+                        trebleBoostDb = 6f,
+                        stereoWidth = 1.35f,
+                        limiterEnabled = true,
+                        subsonicFilterEnabled = false,
+                    ),
+            )
+
+        val frames = 2_400
+        val buf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            // Sudden high-frequency transient step (9.5 kHz hi-hat + 1 kHz body) at -1 dBFS
+            val env = if (i in 120..480) 0.89 else 0.15
+            val l = env * (0.45 * sin(2.0 * PI * 1_000.0 * i / fs) + 0.55 * sin(2.0 * PI * 9_500.0 * i / fs))
+            val r = env * (0.45 * sin(2.0 * PI * 1_000.0 * i / fs) - 0.35 * sin(2.0 * PI * 9_500.0 * i / fs))
+            buf[i * 2] = l
+            buf[i * 2 + 1] = r
+        }
+
+        kernel.processNormalizedFramesInPlace(buf, frames, config)
+
+        var maxAbs = 0.0
+        for (s in buf) {
+            assertTrue("Expected finite sample under treble transient, got $s", s.isFinite())
+            maxAbs = max(maxAbs, abs(s))
+        }
+        assertTrue(
+            "Lookahead true-peak limiter must hold sharp treble transients strictly <= 0.925 (got $maxAbs)",
+            maxAbs <= 0.925,
+        )
+    }
+
+    @Test
+    fun `sweeping treble shelf across zero db keeps fixed slots and ramps coefficients without pops`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val negConfig =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, -2f, 0f),
+                enhancements = EqualizerEnhancements(trebleBoostDb = -2f, limiterEnabled = true),
+            )
+        val zeroConfig =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f),
+                enhancements = EqualizerEnhancements(trebleBoostDb = 0.5f, limiterEnabled = true),
+            )
+        val boostConfig =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 3f, 2f),
+                enhancements = EqualizerEnhancements(trebleBoostDb = 4f, limiterEnabled = true),
+            )
+
+        // Process continuous 1 kHz sine across 3 slider updates crossing 0 dB
+        val chunkFrames = 480
+        val full = DoubleArray(chunkFrames * 3 * 2)
+        for (c in 0 until 3) {
+            val cfg = when (c) {
+                0 -> negConfig
+                1 -> zeroConfig
+                else -> boostConfig
+            }
+            val sub = DoubleArray(chunkFrames * 2)
+            for (i in 0 until chunkFrames) {
+                val sampleIdx = c * chunkFrames + i
+                val v = 0.35 * sin(2.0 * PI * 1_000.0 * sampleIdx / fs)
+                sub[i * 2] = v
+                sub[i * 2 + 1] = v
+            }
+            kernel.processNormalizedFramesInPlace(sub, chunkFrames, cfg)
+            sub.copyInto(full, c * chunkFrames * 2)
+        }
+
+        // Ignore the initial 2 ms lookahead lead-in and verify no boundary click/step exceeds expected 1 kHz step
+        var maxStep = 0.0
+        for (i in 120 until chunkFrames * 3) {
+            val delta = abs(full[i * 2] - full[(i - 1) * 2])
+            maxStep = max(maxStep, delta)
+        }
+        assertTrue("Expected click-free coefficient ramp across 0 dB boundary (maxStep=$maxStep)", maxStep < 0.09)
+    }
 }

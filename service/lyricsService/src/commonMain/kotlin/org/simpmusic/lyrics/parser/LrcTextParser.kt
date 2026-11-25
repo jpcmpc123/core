@@ -11,7 +11,56 @@ private val LRC_LINE_TIME_LIKE_REGEX = Regex("""\[\d+:\d[\d:.]*\]""")
 private val LRC_LINE_TIME_REGEX = Regex("""\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]""")
 private val RICH_SYNC_LINE_REGEX = Regex("""^\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\](.+)$""")
 private val RICH_SYNC_WORD_TAG_REGEX = Regex("""<(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?>""")
-private val VOICE_MARKER_REGEX = Regex("""^v\d+:""")
+private val VOICE_MARKER_REGEX = Regex("""^\s*(?:v\d+|bg)\s*:\s*""", RegexOption.IGNORE_CASE)
+private val INLINE_HTML_TAG_REGEX = Regex("""</?(?:i|b|u|em|strong|span|br|font|ruby|rt|rp)(?:\s+[^>]*)?>""", RegexOption.IGNORE_CASE)
+private val INLINE_TIME_TAG_REGEX = Regex("""<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>|\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]""")
+private val MULTI_SPACE_REGEX = Regex("""\s+""")
+
+private fun isCjkIdeographOrKana(ch: Char): Boolean {
+    val code = ch.code
+    return code in 0x3040..0x30FF || // Hiragana + Katakana
+        code in 0x3400..0x4DBF || // CJK Ext A
+        code in 0x4E00..0x9FFF || // CJK Unified
+        code in 0xAC00..0xD7AF || // Hangul
+        code in 0xF900..0xFAFF
+}
+
+private fun stripTimeTagsSmart(text: String): String {
+    if (!INLINE_TIME_TAG_REGEX.containsMatchIn(text)) return text
+    val sb = StringBuilder(text.length)
+    var lastEnd = 0
+    for (m in INLINE_TIME_TAG_REGEX.findAll(text)) {
+        sb.append(text, lastEnd, m.range.first)
+        val prev = sb.lastOrNull()
+        val next = text.getOrNull(m.range.last + 1)
+        val needsSpace =
+            prev != null &&
+                next != null &&
+                !prev.isWhitespace() &&
+                !next.isWhitespace() &&
+                prev !in "-–—/([\"'“‘" &&
+                next !in ",.!?;:)]}\"'”’-–—" &&
+                !isCjkIdeographOrKana(prev) &&
+                !isCjkIdeographOrKana(next)
+        if (needsSpace) sb.append(' ')
+        lastEnd = m.range.last + 1
+    }
+    sb.append(text, lastEnd, text.length)
+    return sb.toString()
+}
+
+internal fun cleanInlineLyricText(raw: String): String {
+    if ('<' !in raw && '[' !in raw && ':' !in raw) return raw.trim()
+    val noTags =
+        raw
+            .replace(VOICE_MARKER_REGEX, "")
+            .replace(INLINE_HTML_TAG_REGEX, "")
+    val noTimes = stripTimeTagsSmart(noTags)
+    return noTimes
+        .replace(VOICE_MARKER_REGEX, "")
+        .replace(MULTI_SPACE_REGEX, " ")
+        .trim()
+}
 
 private fun parseFractionMs(fraction: String): Long =
     when (fraction.length) {
@@ -33,6 +82,7 @@ private fun MatchResult.parseLrcTimeMs(): Long? {
  * - Supports `[m:ss]`, `[mm:ss.x]`, `[mm:ss.xx]`, `[mm:ss.xxx]`, `[mmm:ss.xxx]`, and `[mm:ss:xx]`
  *   with proper sub-second scaling (`1 -> *100`, `2 -> *10`, `3 -> ms`).
  * - Supports multiple timestamps per line, `[offset:+/-ms]`, and empty timed lines (`♫`).
+ * - Strips inline rich-sync/LRC/voice/HTML tags so `LINE_SYNCED` output is always clean text.
  * - Ignores metadata ID tags and returns lines sorted ascending by timestamp.
  */
 fun parseLrc(data: String): Lyrics {
@@ -75,7 +125,12 @@ fun parseLrc(data: String): Lyrics {
         if (badTime || times.isEmpty()) continue
 
         val rest = trimmed.substring(pos)
-        val content = if (rest.isBlank()) "♫" else decodeHtmlEntities(rest.trimStart())
+        val content =
+            if (rest.isBlank()) {
+                "♫"
+            } else {
+                cleanInlineLyricText(decodeHtmlEntities(rest.trimStart())).ifEmpty { "♫" }
+            }
         times.forEach { rawMs ->
             parsed.add(rawMs to content)
         }
@@ -575,12 +630,18 @@ fun parseUnsyncedLyrics(data: String): Lyrics {
     val lines = data.lines()
     val linesLyrics = ArrayList<Lyrics.LyricsX.Line>(lines.size)
     lines.forEach { line ->
+        val cleaned =
+            if (line.isBlank()) {
+                ""
+            } else {
+                cleanInlineLyricText(decodeHtmlEntities(line))
+            }
         linesLyrics.add(
             Lyrics.LyricsX.Line(
                 endTimeMs = "0",
                 startTimeMs = "0",
                 syllables = listOf(),
-                words = line,
+                words = cleaned,
             ),
         )
     }
