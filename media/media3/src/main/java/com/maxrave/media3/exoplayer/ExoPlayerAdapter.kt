@@ -596,10 +596,35 @@ internal fun GenericPlaybackParameters.toMedia3PlaybackParameters(): PlaybackPar
 
 internal fun PlaybackParameters.toGenericPlaybackParameters(): GenericPlaybackParameters = GenericPlaybackParameters(speed, pitch)
 
+@OptIn(UnstableApi::class)
 fun Tracks.toGenericTracks(): GenericTracks {
     val genericGroups =
         groups.map { group ->
-            GenericTracks.GenericTrackGroup(trackCount = group.length)
+            var selectedAudioMimeType: String? = null
+            var selectedAudioCodecs: String? = null
+            var selectedAudioBitrate: Int? = null
+            var selectedAudioSampleRate: Int? = null
+            if (group.type == C.TRACK_TYPE_AUDIO && group.isSelected) {
+                for (index in 0 until group.length) {
+                    if (group.isTrackSelected(index)) {
+                        val trackFormat = group.getTrackFormat(index)
+                        selectedAudioMimeType = trackFormat.sampleMimeType ?: trackFormat.containerMimeType
+                        selectedAudioCodecs = trackFormat.codecs
+                        selectedAudioBitrate =
+                            trackFormat.averageBitrate.takeIf { it > 0 }
+                                ?: trackFormat.bitrate.takeIf { it > 0 }
+                        selectedAudioSampleRate = trackFormat.sampleRate.takeIf { it > 0 }
+                        break
+                    }
+                }
+            }
+            GenericTracks.GenericTrackGroup(
+                trackCount = group.length,
+                selectedAudioMimeType = selectedAudioMimeType,
+                selectedAudioCodecs = selectedAudioCodecs,
+                selectedAudioBitrate = selectedAudioBitrate,
+                selectedAudioSampleRate = selectedAudioSampleRate,
+            )
         }
     return GenericTracks(groups = genericGroups)
 }

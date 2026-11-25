@@ -542,6 +542,13 @@ internal class LocalDataSource(
 
     suspend fun deleteAllNewFormatsExcept(exceptVideoIds: List<String>) = databaseDao.deleteAllNewFormatsExcept(exceptVideoIds)
 
+    suspend fun expireAllNewFormats(expiredAt: LocalDateTime) = databaseDao.expireAllNewFormats(expiredAt)
+
+    suspend fun expireAllNewFormatsExcept(
+        exceptVideoIds: List<String>,
+        expiredAt: LocalDateTime,
+    ) = databaseDao.expireAllNewFormatsExcept(exceptVideoIds, expiredAt)
+
     suspend fun getNewFormat(videoId: String) = databaseDao.getNewFormat(videoId)
 
     suspend fun updateNewFormat(newFormatEntity: NewFormatEntity) = databaseDao.updateNewFormat(newFormatEntity)

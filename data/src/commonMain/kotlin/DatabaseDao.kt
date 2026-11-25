@@ -1448,6 +1448,15 @@ interface DatabaseDao {
     @Query("DELETE FROM new_format WHERE videoId NOT IN (:exceptVideoIds)")
     suspend fun deleteAllNewFormatsExcept(exceptVideoIds: List<String>): Int
 
+    @Query("UPDATE new_format SET expired_time = :expiredAt")
+    suspend fun expireAllNewFormats(expiredAt: LocalDateTime): Int
+
+    @Query("UPDATE new_format SET expired_time = :expiredAt WHERE videoId NOT IN (:exceptVideoIds)")
+    suspend fun expireAllNewFormatsExcept(
+        exceptVideoIds: List<String>,
+        expiredAt: LocalDateTime,
+    ): Int
+
     @Query("DELETE FROM lyrics WHERE videoId NOT IN (SELECT videoId FROM song)")
     suspend fun deleteStaleLyrics(): Int
 

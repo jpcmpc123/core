@@ -4,6 +4,7 @@ import com.maxrave.domain.data.entities.NewFormatEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.mediaService.SponsorSkipSegments
+import com.maxrave.domain.data.player.ActiveAudioTrackInfo
 import com.maxrave.domain.data.player.EqualizerConfig
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericCommandButton
@@ -12,8 +13,13 @@ import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.utils.isEndlessQueueId
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
+
+private val EMPTY_ACTIVE_AUDIO_TRACK_INFO: StateFlow<ActiveAudioTrackInfo?> =
+    MutableStateFlow<ActiveAudioTrackInfo?>(null).asStateFlow()
 
 /**
  * Handler interface for managing media playback service operations
@@ -31,6 +37,8 @@ interface MediaPlayerHandler {
     val sleepTimerState: StateFlow<SleepTimerState>
     val skipSegments: StateFlow<List<SponsorSkipSegments>?>
     val format: StateFlow<NewFormatEntity?>
+    val activeAudioTrackInfo: StateFlow<ActiveAudioTrackInfo?>
+        get() = EMPTY_ACTIVE_AUDIO_TRACK_INFO
     val currentSongIndex: StateFlow<Int>
     val castState: StateFlow<GenericCastState>
     val networkRestoredEvents: Flow<Unit>

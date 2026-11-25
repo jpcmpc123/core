@@ -762,9 +762,17 @@ internal class StreamRepositoryImpl(
                         }
                         // One line per resolved stream and never the URL: a googlevideo URL carries the
                         // listener's IP address.
+                        val bitrateKbpsTag = format?.bitrate?.takeIf { it > 0 }?.let { " ${(it + 500) / 1000}kbps" } ?: ""
+                        val drcTag = if (format?.isDrcAudio == true) ", drc=true" else ", drc=false"
+                        val loudnessTag =
+                            response.playerConfig
+                                ?.audioConfig
+                                ?.loudnessDb
+                                ?.let { ", loudness=${kotlin.math.round(it * 10.0) / 10.0}dB" }
+                                ?: ""
                         Logger.i(
                             "Stream",
-                            "$videoId: ${data.third}, itag ${format?.itag} ${format?.mimeType?.substringBefore(';')}" +
+                            "$videoId: ${data.third}, itag ${format?.itag} ${format?.mimeType?.substringBefore(';')}$bitrateKbpsTag$drcTag$loudnessTag" +
                                 (if (resolvedSourceId != videoId) " [atv=$resolvedSourceId]" else "") +
                                 (if (muxed) ", HLS" else "") +
                                 ", expires in ${response.streamingData?.expiresInSeconds}s",
@@ -984,13 +992,18 @@ internal class StreamRepositoryImpl(
 
     override suspend fun invalidateAllFormats() {
         youTube.clearExtractorTrust()
+        val expiredAt = now().plusSeconds(-1)
         withContext(Dispatchers.IO) {
             formatStateMutex.withLock {
-                formatCache.value = emptyMap()
+                formatCache.update { current ->
+                    current.mapValues { (_, pair) ->
+                        pair.first to pair.second.copy(expiredTime = expiredAt)
+                    }
+                }
             }
             formatDbMutex.withLock {
-                val deleted = localDataSource.deleteAllNewFormats()
-                Logger.d("Stream", "Invalidated all stored formats ($deleted rows)")
+                val expired = localDataSource.expireAllNewFormats(expiredAt)
+                Logger.d("Stream", "Expired all stored format URLs ($expired rows, metadata preserved)")
             }
         }
     }
@@ -1000,15 +1013,18 @@ internal class StreamRepositoryImpl(
             invalidateAllFormats()
             return
         }
+        val expiredAt = now().plusSeconds(-1)
         withContext(Dispatchers.IO) {
             formatStateMutex.withLock {
                 formatCache.update { current ->
-                    current.filterKeys { it in exceptVideoIds }
+                    current.mapValues { (key, pair) ->
+                        if (key in exceptVideoIds) pair else pair.first to pair.second.copy(expiredTime = expiredAt)
+                    }
                 }
             }
             formatDbMutex.withLock {
-                val deleted = localDataSource.deleteAllNewFormatsExcept(exceptVideoIds.toList())
-                Logger.d("Stream", "Invalidated stored formats except $exceptVideoIds ($deleted rows)")
+                val expired = localDataSource.expireAllNewFormatsExcept(exceptVideoIds.toList(), expiredAt)
+                Logger.d("Stream", "Expired stored format URLs except $exceptVideoIds ($expired rows, metadata preserved)")
             }
         }
     }

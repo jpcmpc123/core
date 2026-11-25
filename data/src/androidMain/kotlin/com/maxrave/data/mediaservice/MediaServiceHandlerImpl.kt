@@ -36,6 +36,7 @@ import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.mediaService.SponsorSkipSegments
 import com.maxrave.domain.data.model.searchResult.songs.Artist
 import com.maxrave.domain.data.model.streams.YouTubeWatchEndpoint
+import com.maxrave.domain.data.player.ActiveAudioTrackInfo
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.DelayEffect
 import com.maxrave.domain.data.player.EightDDirection
@@ -333,6 +334,9 @@ internal class MediaServiceHandlerImpl(
     // SponsorBlock skip segments
     private val _skipSegments: MutableStateFlow<List<SponsorSkipSegments>?> = MutableStateFlow<List<SponsorSkipSegments>?>(null)
     override val skipSegments: StateFlow<List<SponsorSkipSegments>?> = _skipSegments.asStateFlow()
+
+    private val _activeAudioTrackInfo = MutableStateFlow<ActiveAudioTrackInfo?>(null)
+    override val activeAudioTrackInfo: StateFlow<ActiveAudioTrackInfo?> = _activeAudioTrackInfo.asStateFlow()
 
     // SponsorBlock's ticked categories, kept current by a collector in init; null while SponsorBlock is
     // off or not loaded yet. The per-tick skip check reads this instead of asking DataStore on every progress tick (one
@@ -3254,6 +3258,9 @@ internal class MediaServiceHandlerImpl(
         if (mediaItem?.mediaId != _nowPlaying.value?.mediaId) {
             _nowPlaying.value = mediaItem
         }
+        if (mediaItem?.mediaId != _activeAudioTrackInfo.value?.mediaId) {
+            _activeAudioTrackInfo.value = null
+        }
         if (mediaItem?.mediaId != nowPlayingState.value.mediaItem.mediaId) {
             Logger.w(TAG, "onMediaItemTransition: ${mediaItem?.mediaId}")
             if (mediaItem != null) {
@@ -3350,6 +3357,26 @@ internal class MediaServiceHandlerImpl(
 
     override fun onTracksChanged(tracks: GenericTracks) {
         Logger.d(TAG, "onTracksChanged: ${tracks.groups.size}")
+        val selectedAudio =
+            tracks.groups.firstOrNull {
+                it.selectedAudioMimeType != null ||
+                    it.selectedAudioCodecs != null ||
+                    it.selectedAudioBitrate != null ||
+                    it.selectedAudioSampleRate != null
+            }
+        val currentId = runCatching { player.currentMediaItem?.mediaId }.getOrNull() ?: _nowPlaying.value?.mediaId
+        _activeAudioTrackInfo.value =
+            if (selectedAudio != null && !currentId.isNullOrEmpty()) {
+                ActiveAudioTrackInfo(
+                    mediaId = currentId,
+                    mimeType = selectedAudio.selectedAudioMimeType,
+                    codecs = selectedAudio.selectedAudioCodecs,
+                    bitrate = selectedAudio.selectedAudioBitrate,
+                    sampleRate = selectedAudio.selectedAudioSampleRate,
+                )
+            } else {
+                null
+            }
     }
 
     // Automatic recovery from a failed stream. The player's data source resolves the stream URL
