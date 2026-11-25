@@ -67,6 +67,8 @@ import com.maxrave.kotlinytmusicscraper.models.response.SimpMusicChartResponse
 import com.maxrave.kotlinytmusicscraper.models.response.TidalSearchResponse
 import com.maxrave.kotlinytmusicscraper.models.response.TidalOAuthResponse
 import com.maxrave.kotlinytmusicscraper.models.response.RemoteConfig
+import com.maxrave.kotlinytmusicscraper.models.response.YouTubeMusicOfficialLyrics
+import com.maxrave.kotlinytmusicscraper.models.response.parseAndroidMusicOfficialLyrics
 import com.maxrave.kotlinytmusicscraper.models.response.toLikeStatus
 import com.maxrave.kotlinytmusicscraper.models.response.toListAccountInfo
 import com.maxrave.kotlinytmusicscraper.models.simpmusic.FdroidResponse
@@ -2982,6 +2984,59 @@ class YouTube {
                 ?.runs
                 ?.firstOrNull()
                 ?.text
+        }
+
+    /**
+     * Fetches official YouTube Music lyrics (Musixmatch / LyricFind).
+     * When the session has login cookies, queries [ANDROID_MUSIC] first to retrieve
+     * `timedLyricsData` cue ranges (`LINE_SYNCED`), falling back cleanly to [WEB_REMIX] plain text.
+     */
+    suspend fun officialLyrics(endpoint: BrowseEndpoint): Result<YouTubeMusicOfficialLyrics?> =
+        try {
+            if (!ytMusic.cookie.isNullOrBlank()) {
+                val androidTimed =
+                    try {
+                        val rawJson =
+                            ytMusic
+                                .browse(ANDROID_MUSIC, endpoint.browseId, endpoint.params, setLogin = true)
+                                .bodyAsText()
+                        parseAndroidMusicOfficialLyrics(rawJson)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        Logger.w(TAG, "ANDROID_MUSIC timed lyrics fallback to WEB_REMIX: ${e.message}")
+                        null
+                    }
+                if (androidTimed != null) {
+                    return Result.success(androidTimed)
+                }
+            }
+            val response = ytMusic.browse(WEB_REMIX, endpoint.browseId, endpoint.params).body<BrowseResponse>()
+            val shelf =
+                response.contents
+                    ?.sectionListRenderer
+                    ?.contents
+                    ?.firstOrNull()
+                    ?.musicDescriptionShelfRenderer
+            val plainText =
+                shelf
+                    ?.description
+                    ?.runs
+                    ?.firstOrNull()
+                    ?.text
+                    ?.takeIf { it.isNotBlank() }
+            val sourceMessage =
+                shelf
+                    ?.footer
+                    ?.runs
+                    ?.firstOrNull()
+                    ?.text
+                    ?.takeIf { it.isNotBlank() }
+            Result.success(plainText?.let { YouTubeMusicOfficialLyrics.Plain(text = it, sourceMessage = sourceMessage) })
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
 
     suspend fun queue(

@@ -724,6 +724,8 @@ interface DataStoreManager {
         const val YOUTUBE = "youtube"
         const val YTM_OFFICIAL = "ytm_official"
         const val LRCLIB = "lrclib"
+        const val UNISON = "unison"
+        const val NETEASE = "netease"
         const val BETTER_LYRICS = "better_lyrics"
 
         const val FDROID = "fdroid"

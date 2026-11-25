@@ -57,6 +57,8 @@ class LyricsResolverTest {
         assertEquals(
             listOf(
                 LyricsSource.LRCLIB,
+                LyricsSource.UNISON,
+                LyricsSource.NETEASE,
                 LyricsSource.BETTER_LYRICS,
                 LyricsSource.SIMPMUSIC,
                 LyricsSource.YTM_OFFICIAL,
@@ -66,8 +68,23 @@ class LyricsResolverTest {
         )
         assertEquals(
             listOf(
+                LyricsSource.YTM_OFFICIAL,
+                LyricsSource.LRCLIB,
+                LyricsSource.UNISON,
+                LyricsSource.NETEASE,
+                LyricsSource.SPOTIFY,
+                LyricsSource.BETTER_LYRICS,
+                LyricsSource.SIMPMUSIC,
+                LyricsSource.YOUTUBE,
+            ),
+            LyricsResolver.orderedSources(LyricsSource.LRCLIB, allowSpotify = true, preferYtmOfficialFirst = true),
+        )
+        assertEquals(
+            listOf(
                 LyricsSource.BETTER_LYRICS,
                 LyricsSource.LRCLIB,
+                LyricsSource.UNISON,
+                LyricsSource.NETEASE,
                 LyricsSource.SPOTIFY,
                 LyricsSource.SIMPMUSIC,
                 LyricsSource.YTM_OFFICIAL,
@@ -76,6 +93,63 @@ class LyricsResolverTest {
             LyricsResolver.orderedSources(LyricsSource.BETTER_LYRICS, allowSpotify = true),
         )
     }
+
+    @Test
+    fun ytmOfficialFirstDeliversTimedLinesImmediatelyThenUpgradesToMatchingUnisonWithAttribution() =
+        runBlocking {
+            val attr =
+                LyricsAttribution(
+                    providerLabel = "Unison",
+                    songUrl = "https://unison.betterlyrics.org/song/vid1",
+                    contributorName = "curator42",
+                    contributorUrl = "https://unison.betterlyrics.org/curator/key42",
+                )
+            val ytmLineSynced =
+                Lyrics(
+                    lines =
+                        listOf(
+                            Line("3000", "1000", words = "Hello dark world"),
+                            Line("6000", "3500", words = "Second line shines"),
+                        ),
+                    syncType = "LINE_SYNCED",
+                )
+            val unisonRich =
+                Lyrics(
+                    lines =
+                        listOf(
+                            Line("3000", "1000", words = "<00:01.00>Hello <00:01.50>dark <00:02.00>world"),
+                            Line("6000", "3500", words = "<00:03.50>Second <00:04.00>line <00:04.50>shines"),
+                        ),
+                    syncType = "RICH_SYNCED",
+                )
+            val resolver =
+                LyricsResolver(
+                    readCache = { null },
+                    fetchSource = { source, _ ->
+                        when (source) {
+                            LyricsSource.YTM_OFFICIAL -> ProviderFetchOutcome.Success(ytmLineSynced)
+                            LyricsSource.UNISON -> {
+                                delay(25L)
+                                ProviderFetchOutcome.Success(unisonRich, attribution = attr)
+                            }
+                            else -> ProviderFetchOutcome.DefinitiveNotFound
+                        }
+                    },
+                    providerTimeoutMs = 500L,
+                    hedgeDelayMs = 200L,
+                )
+
+            val found =
+                withTimeout(2_000L) {
+                    resolver
+                        .resolve(
+                            request(preferred = LyricsSource.LRCLIB).copy(preferYtmOfficialFirst = true),
+                        ).toList()
+                }.filterIsInstance<LyricsResolutionEvent.Found>()
+
+            assertEquals(listOf(LyricsSource.YTM_OFFICIAL, LyricsSource.UNISON), found.map { it.resolution.source })
+            assertEquals(attr, found.last().resolution.attribution)
+        }
 
     @Test
     fun richSyncedPrimaryShortCircuitsWithoutQueryingFallbackProviders() =

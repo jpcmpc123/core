@@ -113,7 +113,7 @@ class LyricsResolver(
                 return@channelFlow
             }
 
-            val sources = orderedSources(request.preferredSource, request.allowSpotify)
+            val sources = orderedSources(request.preferredSource, request.allowSpotify, request.preferYtmOfficialFirst)
             if (sources.isEmpty()) {
                 if (currentBestLyrics == null) {
                     send(LyricsResolutionEvent.Exhausted(request.videoId, definitiveNotFound = true))
@@ -407,6 +407,7 @@ class LyricsResolver(
                                             fromCache = false,
                                             youtubeTranslatedLyrics = outcome.translatedLyrics,
                                             simpMusicNotFoundObserved = simpMusicNotFoundObserved,
+                                            attribution = outcome.attribution,
                                         )
                                     pendingBlindLevel = candidateLevel
                                     pendingBlindOverflow = candidateOverflow
@@ -447,6 +448,7 @@ class LyricsResolver(
                                                 fromCache = false,
                                                 youtubeTranslatedLyrics = outcome.translatedLyrics,
                                                 simpMusicNotFoundObserved = simpMusicNotFoundObserved,
+                                                attribution = outcome.attribution,
                                             ),
                                         level = candidateLevel,
                                         overflow = candidateOverflow,
@@ -532,23 +534,28 @@ class LyricsResolver(
 
     companion object {
         const val DEFAULT_PROVIDER_TIMEOUT_MS = 8_000L
-        const val DEFAULT_HEDGE_DELAY_MS = 2_500L
+        const val DEFAULT_HEDGE_DELAY_MS = 1_800L
 
         fun orderedSources(
             preferred: LyricsSource,
             allowSpotify: Boolean,
+            preferYtmOfficialFirst: Boolean = false,
         ): List<LyricsSource> {
             val baseOrder =
                 listOf(
                     LyricsSource.LRCLIB,
-                    LyricsSource.BETTER_LYRICS,
+                    LyricsSource.UNISON,
+                    LyricsSource.NETEASE,
                     LyricsSource.SPOTIFY,
+                    LyricsSource.BETTER_LYRICS,
                     LyricsSource.SIMPMUSIC,
                     LyricsSource.YTM_OFFICIAL,
                     LyricsSource.YOUTUBE,
                 )
             return buildList {
-                if (preferred != LyricsSource.OFFLINE &&
+                if (preferYtmOfficialFirst && preferred == LyricsSource.LRCLIB) {
+                    add(LyricsSource.YTM_OFFICIAL)
+                } else if (preferred != LyricsSource.OFFLINE &&
                     preferred != LyricsSource.LETRAS &&
                     (preferred != LyricsSource.SPOTIFY || allowSpotify)
                 ) {

@@ -2,6 +2,7 @@ package org.simpmusic.lyrics
 
 import com.maxrave.domain.data.model.metadata.Lyrics
 import com.maxrave.domain.lyrics.LyricsIdentityGuard
+import com.maxrave.domain.lyrics.LyricsInstrumentalDetector
 import com.maxrave.domain.lyrics.LyricsMetadataMatcher
 import com.maxrave.ktorext.curl.CurlLogger
 import com.maxrave.ktorext.crypto.Hmac
@@ -13,6 +14,7 @@ import io.ktor.client.statement.bodyAsText
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
 import org.simpmusic.lyrics.am.AMAlbumResource
 import org.simpmusic.lyrics.am.AMSongWithAlbum
 import org.simpmusic.lyrics.am.parseAMHlsVariants
@@ -25,14 +27,29 @@ import org.simpmusic.lyrics.models.response.BaseResponse
 import org.simpmusic.lyrics.models.response.BetterLyricsResponse
 import org.simpmusic.lyrics.models.response.LrclibObject
 import org.simpmusic.lyrics.models.response.LyricsResponse
+import org.simpmusic.lyrics.models.response.NetEaseLyricResponse
+import org.simpmusic.lyrics.models.response.NetEaseSearchResponse
+import org.simpmusic.lyrics.models.response.NetEaseSong
 import org.simpmusic.lyrics.models.response.TranslatedLyricsResponse
+import org.simpmusic.lyrics.models.response.UnisonApiEnvelope
+import org.simpmusic.lyrics.models.response.UnisonLyricsData
 import org.simpmusic.lyrics.parser.extractLrcEmbeddedMetadata
 import org.simpmusic.lyrics.parser.extractTtmlEmbeddedMetadata
 import org.simpmusic.lyrics.parser.parseLrclibLyrics
+import org.simpmusic.lyrics.parser.parseNetEaseYrcLyrics
+import org.simpmusic.lyrics.parser.parseRichSyncLyrics
+import org.simpmusic.lyrics.parser.parseSyncedLyrics
+import org.simpmusic.lyrics.parser.parseTtmlLyrics
+import org.simpmusic.lyrics.parser.parseUnsyncedLyrics
 import kotlin.math.abs
 
 private const val TAG = "SimpMusicLyricsClient"
 private const val MAX_DEDUPE_CACHE_ENTRIES = 256
+private val CLIENT_TOLERANT_JSON =
+    Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
 
 sealed interface LrclibSearchResult {
     data class Found(
@@ -42,6 +59,28 @@ sealed interface LrclibSearchResult {
     data object ConfirmedInstrumental : LrclibSearchResult
 
     data object NotFound : LrclibSearchResult
+}
+
+sealed interface NetEaseSearchResult {
+    data class Found(
+        val lyrics: org.simpmusic.lyrics.domain.Lyrics,
+    ) : NetEaseSearchResult
+
+    data object ConfirmedInstrumental : NetEaseSearchResult
+
+    data object NotFound : NetEaseSearchResult
+}
+
+sealed interface UnisonSearchResult {
+    data class Found(
+        val lyrics: org.simpmusic.lyrics.domain.Lyrics,
+        val videoId: String,
+        val submitterDisplayName: String? = null,
+        val submitterKeyId: String? = null,
+        val requiresVerification: Boolean = false,
+    ) : UnisonSearchResult
+
+    data object NotFound : UnisonSearchResult
 }
 
 /** An error the SimpMusic Lyrics API answered with; [code] 404 means nobody has added that song yet. */
@@ -445,6 +484,142 @@ class SimpMusicLyricsClient(
         null
     }
 
+    suspend fun fetchUnisonLyricsDetailed(
+        videoId: String,
+        q_track: String,
+        q_artist: String,
+        duration: Int?,
+    ): Result<UnisonSearchResult> =
+        suspendRunCatching {
+            val validDuration = duration?.takeIf { it > 0 }
+            if (videoId.isNotBlank()) {
+                val byVideo = lyricsService.getUnisonLyricsByVideoId(videoId)
+                when (byVideo.status.value) {
+                    200 -> {
+                        val envelope = CLIENT_TOLERANT_JSON.decodeFromString<UnisonApiEnvelope>(byVideo.bodyAsText())
+                        val data = envelope.data
+                        if (envelope.success && data != null) {
+                            val parsed =
+                                parseUnisonPayload(
+                                    data = data,
+                                    expectedTrack = q_track,
+                                    expectedArtist = q_artist,
+                                    durationSeconds = validDuration,
+                                    matchedByVideoId = true,
+                                    requestedVideoId = videoId,
+                                )
+                            if (parsed is UnisonSearchResult.Found) {
+                                return@suspendRunCatching parsed
+                            }
+                        }
+                    }
+                    404, 204 -> Unit
+                    else -> throw SimpMusicLyricsApiException(byVideo.status.value, "Unison failed: ${byVideo.status.value}")
+                }
+            }
+
+            val candidates = LyricsQueryNormalizer.buildQueryCandidates(q_track, q_artist)
+            for ((track, artist) in candidates.take(2)) {
+                if (track.isBlank() || artist.isBlank()) continue
+                val byMeta = lyricsService.searchUnisonLyrics(track, artist, validDuration)
+                when (byMeta.status.value) {
+                    200 -> {
+                        val envelope = CLIENT_TOLERANT_JSON.decodeFromString<UnisonApiEnvelope>(byMeta.bodyAsText())
+                        val data = envelope.data
+                        if (envelope.success && data != null) {
+                            val parsed =
+                                parseUnisonPayload(
+                                    data = data,
+                                    expectedTrack = q_track,
+                                    expectedArtist = q_artist,
+                                    durationSeconds = validDuration,
+                                    matchedByVideoId = false,
+                                    requestedVideoId = videoId,
+                                )
+                            if (parsed is UnisonSearchResult.Found) {
+                                return@suspendRunCatching parsed
+                            }
+                        }
+                    }
+                    404, 204 -> Unit
+                    else -> throw SimpMusicLyricsApiException(byMeta.status.value, "Unison search failed: ${byMeta.status.value}")
+                }
+            }
+            UnisonSearchResult.NotFound
+        }
+
+    suspend fun searchNetEaseLyricsDetailed(
+        q_track: String,
+        q_artist: String,
+        duration: Int?,
+    ): Result<NetEaseSearchResult> =
+        suspendRunCatching {
+            if (LyricsInstrumentalDetector.isExplicitlyInstrumentalTitle(q_track)) {
+                return@suspendRunCatching NetEaseSearchResult.NotFound
+            }
+            val validDuration = duration?.takeIf { it > 0 }
+            val candidates = LyricsQueryNormalizer.buildQueryCandidates(q_track, q_artist)
+            val rankedPool = LinkedHashMap<Long, Pair<NetEaseSong, Boolean>>(4)
+
+            for ((track, artist) in candidates.take(2)) {
+                val query = "$track $artist".trim()
+                if (query.isBlank()) continue
+                val searchRes = lyricsService.searchNetEaseSongs(query = query, limit = 8)
+                if (searchRes.status.value !in 200..299) {
+                    if (searchRes.status.value == 404) continue
+                    throw SimpMusicLyricsApiException(searchRes.status.value, "NetEase search failed: ${searchRes.status.value}")
+                }
+                val parsedSearch =
+                    CLIENT_TOLERANT_JSON.decodeFromString<NetEaseSearchResponse>(searchRes.bodyAsText())
+                val songs = parsedSearch.result?.songs.orEmpty()
+                val matched =
+                    rankNetEaseCandidates(
+                        songs = songs,
+                        expectedTrack = q_track,
+                        expectedArtist = q_artist,
+                        durationSeconds = validDuration,
+                    )
+                for ((song, allowSynced) in matched) {
+                    val prev = rankedPool[song.id]
+                    if (prev == null || (allowSynced && !prev.second)) {
+                        rankedPool[song.id] = song to allowSynced
+                    }
+                }
+                if (rankedPool.values.any { it.second }) break
+            }
+
+            if (rankedPool.isEmpty()) {
+                return@suspendRunCatching NetEaseSearchResult.NotFound
+            }
+
+            var sawConfirmedInstrumental = false
+            for ((song, allowSynced) in rankedPool.values.take(2)) {
+                val lyricRes = lyricsService.getNetEaseLyrics(song.id)
+                if (lyricRes.status.value !in 200..299) continue
+                val lyricPayload =
+                    CLIENT_TOLERANT_JSON.decodeFromString<NetEaseLyricResponse>(lyricRes.bodyAsText())
+                if (lyricPayload.nolyric == true && lyricPayload.yrc?.lyric.isNullOrBlank() && lyricPayload.lrc?.lyric.isNullOrBlank()) {
+                    val durDiff =
+                        validDuration?.let { exp ->
+                            val candSec = ((song.duration + 500L) / 1000L).toInt()
+                            abs(candSec - exp)
+                        }
+                    if (durDiff == null || durDiff <= 5) {
+                        sawConfirmedInstrumental = true
+                    }
+                    continue
+                }
+                val parsed = parseNetEaseLyricPayload(lyricPayload, allowSynced = allowSynced) ?: continue
+                return@suspendRunCatching NetEaseSearchResult.Found(parsed)
+            }
+
+            if (sawConfirmedInstrumental) {
+                NetEaseSearchResult.ConfirmedInstrumental
+            } else {
+                NetEaseSearchResult.NotFound
+            }
+        }
+
     suspend fun searchAMArtist(
         name: String,
         limit: Int = 5,
@@ -774,4 +949,161 @@ internal fun selectLrclibLyricsRecord(
                 chosen
             }
         }
+}
+
+private val RICH_TAG_DETECT_REGEX = Regex("""<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>""")
+private const val NETEASE_SYNCED_DURATION_TOLERANCE_SECONDS = 5
+private const val NETEASE_PLAIN_DURATION_TOLERANCE_SECONDS = 10
+
+internal fun parseUnisonPayload(
+    data: UnisonLyricsData,
+    expectedTrack: String,
+    expectedArtist: String,
+    durationSeconds: Int?,
+    matchedByVideoId: Boolean,
+    requestedVideoId: String,
+): UnisonSearchResult {
+    if (data.hidden) return UnisonSearchResult.NotFound
+    if (data.variant != null && !data.variant.equals("primary", ignoreCase = true)) {
+        return UnisonSearchResult.NotFound
+    }
+    if (data.lyrics.isBlank()) return UnisonSearchResult.NotFound
+
+    if (!matchedByVideoId || data.matchedBy != null) {
+        if (LyricsInstrumentalDetector.isExplicitlyInstrumentalTitle(data.song)) {
+            return UnisonSearchResult.NotFound
+        }
+        if (expectedTrack.isNotBlank() && data.song.isNotBlank() &&
+            !LyricsMetadataMatcher.titlesMatch(expectedTrack, data.song)
+        ) {
+            return UnisonSearchResult.NotFound
+        }
+        if (expectedArtist.isNotBlank() && data.artist.isNotBlank() &&
+            !LyricsMetadataMatcher.artistsMatch(expectedArtist, data.artist, expectedTrack)
+        ) {
+            return UnisonSearchResult.NotFound
+        }
+        if (!LyricsMetadataMatcher.editionsCompatibleForSync(
+                expectedTitle = expectedTrack,
+                candidateTitle = data.song,
+                candidateAlbum = data.album,
+                durationDiffSeconds = null,
+            )
+        ) {
+            return UnisonSearchResult.NotFound
+        }
+    }
+
+    val parsedLyrics =
+        when (data.format.trim().lowercase()) {
+            "ttml" -> parseTtmlLyrics(data.lyrics)
+            "lrc" ->
+                if (RICH_TAG_DETECT_REGEX.containsMatchIn(data.lyrics)) {
+                    parseRichSyncLyrics(data.lyrics)
+                } else {
+                    parseSyncedLyrics(data.lyrics)
+                }
+            else -> parseUnsyncedLyrics(data.lyrics)
+        }
+
+    val lines = parsedLyrics.lyrics?.lines
+    if (lines.isNullOrEmpty() || lines.all { it.words.isBlank() }) {
+        return UnisonSearchResult.NotFound
+    }
+
+    val requiresVerification =
+        data.confidence.equals("low", ignoreCase = true) ||
+            data.matchedBy == "linked_video" ||
+            (!matchedByVideoId && data.matchedBy != "isrc")
+
+    val resolvedVideoId = data.videoId.ifBlank { requestedVideoId }
+    return UnisonSearchResult.Found(
+        lyrics = parsedLyrics,
+        videoId = resolvedVideoId,
+        submitterDisplayName = data.submitter?.displayName?.takeIf { it.isNotBlank() },
+        submitterKeyId = data.submitter?.keyId?.takeIf { it.isNotBlank() },
+        requiresVerification = requiresVerification,
+    )
+}
+
+internal fun rankNetEaseCandidates(
+    songs: List<NetEaseSong>,
+    expectedTrack: String,
+    expectedArtist: String,
+    durationSeconds: Int?,
+): List<Pair<NetEaseSong, Boolean>> {
+    val validDuration = durationSeconds?.takeIf { it > 0 }
+    val scored = ArrayList<Triple<NetEaseSong, Boolean, Int>>(songs.size)
+
+    for (song in songs) {
+        if (LyricsInstrumentalDetector.isExplicitlyInstrumentalTitle(song.name) ||
+            song.name.contains("伴奏") ||
+            song.name.contains("纯音乐") ||
+            song.name.contains("純音樂")
+        ) {
+            continue
+        }
+        val titleOk =
+            LyricsMetadataMatcher.titlesMatch(expectedTrack, song.name) ||
+                song.alias.any { LyricsMetadataMatcher.titlesMatch(expectedTrack, it) }
+        if (!titleOk) continue
+
+        val artistJoined = song.artists.joinToString(", ") { it.name }
+        if (expectedArtist.isNotBlank() && artistJoined.isNotBlank() &&
+            !LyricsMetadataMatcher.artistsMatch(expectedArtist, artistJoined, expectedTrack)
+        ) {
+            continue
+        }
+
+        val candDurationSec = ((song.duration + 500L) / 1000L).toInt().takeIf { it > 0 }
+        val durDiff =
+            if (validDuration != null && candDurationSec != null) {
+                abs(candDurationSec - validDuration)
+            } else {
+                null
+            }
+        if (durDiff != null && durDiff > NETEASE_PLAIN_DURATION_TOLERANCE_SECONDS) {
+            continue
+        }
+
+        val editionSyncedOk =
+            LyricsMetadataMatcher.editionsCompatibleForSync(
+                expectedTitle = expectedTrack,
+                candidateTitle = song.name,
+                candidateAlbum = song.album?.name,
+                durationDiffSeconds = durDiff,
+            )
+        val allowSynced = editionSyncedOk && (durDiff == null || durDiff <= NETEASE_SYNCED_DURATION_TOLERANCE_SECONDS)
+        val diffScore = durDiff ?: 0
+        scored.add(Triple(song, allowSynced, diffScore))
+    }
+
+    return scored
+        .sortedWith(
+            compareBy<Triple<NetEaseSong, Boolean, Int>>(
+                { !it.second },
+                { it.third },
+            ),
+        ).map { it.first to it.second }
+}
+
+internal fun parseNetEaseLyricPayload(
+    payload: NetEaseLyricResponse,
+    allowSynced: Boolean,
+): org.simpmusic.lyrics.domain.Lyrics? {
+    if (!allowSynced) return null
+    val rawYrc = payload.yrc?.lyric?.takeIf { it.isNotBlank() }
+    if (rawYrc != null) {
+        val parsedYrc = parseNetEaseYrcLyrics(rawYrc)
+        if (!parsedYrc.lyrics?.lines.isNullOrEmpty()) {
+            return parsedYrc
+        }
+    }
+    val rawLrc = payload.lrc?.lyric?.takeIf { it.isNotBlank() } ?: return null
+    val parsedLrc = parseSyncedLyrics(rawLrc)
+    if (!parsedLrc.lyrics?.lines.isNullOrEmpty()) {
+        return parsedLrc
+    }
+    val parsedUnsynced = parseUnsyncedLyrics(rawLrc)
+    return if (!parsedUnsynced.lyrics?.lines.isNullOrEmpty()) parsedUnsynced else null
 }

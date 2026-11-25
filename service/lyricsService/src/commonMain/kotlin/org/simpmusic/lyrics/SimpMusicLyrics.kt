@@ -8,6 +8,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.ProxyConfig
 import io.ktor.client.plugins.HttpSend
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.timeout
 import io.ktor.client.plugins.cache.HttpCache
 import io.ktor.client.plugins.compression.ContentEncoding
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
@@ -226,6 +227,70 @@ class SimpMusicLyrics {
             parameter("d", it)
         }
     }
+
+    suspend fun getUnisonLyricsByVideoId(videoId: String) =
+        httpClient.get("https://unison.betterlyrics.org/lyrics") {
+            header(HttpHeaders.Accept, "application/json")
+            header(HttpHeaders.UserAgent, "Muzix/1.0")
+            timeout {
+                requestTimeoutMillis = 5_000L
+            }
+            parameter("v", videoId)
+        }
+
+    suspend fun searchUnisonLyrics(
+        song: String,
+        artist: String,
+        durationSeconds: Int?,
+    ) = httpClient.get("https://unison.betterlyrics.org/lyrics") {
+        header(HttpHeaders.Accept, "application/json")
+        header(HttpHeaders.UserAgent, "Muzix/1.0")
+        timeout {
+            requestTimeoutMillis = 5_000L
+        }
+        parameter("song", song)
+        parameter("artist", artist)
+        durationSeconds?.let {
+            parameter("duration", it)
+        }
+    }
+
+    suspend fun searchNetEaseSongs(
+        query: String,
+        limit: Int = 8,
+    ) = httpClient.get("https://music.163.com/api/search/get") {
+        header(HttpHeaders.Accept, "application/json")
+        header("Referer", "https://music.163.com/")
+        header("Origin", "https://music.163.com")
+        header(
+            HttpHeaders.UserAgent,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        timeout {
+            requestTimeoutMillis = 5_000L
+        }
+        parameter("s", query)
+        parameter("type", 1)
+        parameter("limit", limit)
+    }
+
+    suspend fun getNetEaseLyrics(songId: Long) =
+        httpClient.get("https://music.163.com/api/song/lyric") {
+            header(HttpHeaders.Accept, "application/json")
+            header("Referer", "https://music.163.com/")
+            header("Origin", "https://music.163.com")
+            header(
+                HttpHeaders.UserAgent,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+            timeout {
+                requestTimeoutMillis = 5_000L
+            }
+            parameter("id", songId)
+            parameter("lv", -1)
+            parameter("yv", -1)
+            parameter("tv", -1)
+        }
 
     suspend fun searchAMArtist(
         name: String,

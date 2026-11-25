@@ -8,17 +8,26 @@ enum class LyricsSource {
     YTM_OFFICIAL,
     SPOTIFY,
     LRCLIB,
+    UNISON,
+    NETEASE,
     BETTER_LYRICS,
     LETRAS,
     OFFLINE,
     ;
 
     fun isCatalogVerified(): Boolean =
-        this == LRCLIB || this == SPOTIFY || this == LETRAS || this == YTM_OFFICIAL
+        this == LRCLIB || this == SPOTIFY || this == LETRAS || this == YTM_OFFICIAL || this == NETEASE
 
     fun isBlindMetadataSource(): Boolean =
         this == BETTER_LYRICS
 }
+
+data class LyricsAttribution(
+    val providerLabel: String,
+    val songUrl: String? = null,
+    val contributorName: String? = null,
+    val contributorUrl: String? = null,
+)
 
 data class LyricsLookupRequest(
     val videoId: String,
@@ -31,6 +40,7 @@ data class LyricsLookupRequest(
     val allowUpgradeScan: Boolean = true,
     val userProtectedSignatures: Set<Int> = emptySet(),
     val revalidateStaleCache: Boolean = false,
+    val preferYtmOfficialFirst: Boolean = false,
 )
 
 data class LyricsResolution(
@@ -41,6 +51,7 @@ data class LyricsResolution(
     val youtubeTranslatedLyrics: Lyrics? = null,
     val simpMusicNotFoundObserved: Boolean = false,
     val isUserProtected: Boolean = false,
+    val attribution: LyricsAttribution? = null,
 )
 
 sealed interface LyricsResolutionEvent {
@@ -61,6 +72,7 @@ sealed interface ProviderFetchOutcome {
         val lyrics: Lyrics,
         val translatedLyrics: Lyrics? = null,
         val requiresVerification: Boolean = false,
+        val attribution: LyricsAttribution? = null,
     ) : ProviderFetchOutcome
 
     data object DefinitiveNotFound : ProviderFetchOutcome

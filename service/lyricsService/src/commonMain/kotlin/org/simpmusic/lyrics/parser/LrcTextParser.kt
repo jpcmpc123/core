@@ -199,6 +199,106 @@ fun parseRichSyncLyrics(data: String): Lyrics {
     )
 }
 
+private val NETEASE_YRC_LINE_REGEX = Regex("""^\[(\d+),(\d+)\](.+)$""")
+private val NETEASE_YRC_WORD_REGEX = Regex("""\((\d+),(\d+),(\d+)\)([^(]*)""")
+
+/**
+ * Parses NetEase Cloud Music word-level YRC lyrics (`[lineStartMs,lineDurMs](wordStartMs,wordDurMs,0)word`).
+ * - Skips metadata JSON header lines (`{"t":...}`).
+ * - Preserves word spacing in Latin scripts while keeping individual CJK/Kana syllable timings.
+ */
+fun parseNetEaseYrcLyrics(data: String): Lyrics {
+    if (data.isBlank()) {
+        return Lyrics(lyrics = Lyrics.LyricsX(lines = emptyList(), syncType = "LINE_SYNCED"))
+    }
+    val parsedLines = ArrayList<Lyrics.LyricsX.Line>()
+    var wordTimedLineCount = 0
+    var multiWordLineCount = 0
+
+    for (rawLine in data.lineSequence()) {
+        val trimmed = rawLine.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("{")) continue
+        val lineMatch = NETEASE_YRC_LINE_REGEX.matchEntire(trimmed) ?: continue
+        val lineStartMs = lineMatch.groupValues[1].toLongOrNull() ?: continue
+        val lineDurMs = lineMatch.groupValues[2].toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+        val body = lineMatch.groupValues[3]
+
+        val wordMatches = NETEASE_YRC_WORD_REGEX.findAll(body).toList()
+        if (wordMatches.isEmpty()) {
+            val plain = decodeHtmlEntities(body).trim()
+            if (plain.isNotEmpty()) {
+                parsedLines.add(
+                    Lyrics.LyricsX.Line(
+                        startTimeMs = lineStartMs.toString(),
+                        endTimeMs = (lineStartMs + lineDurMs).toString(),
+                        syllables = listOf(),
+                        words = plain,
+                    ),
+                )
+            }
+            continue
+        }
+
+        val tokens = ArrayList<Pair<Long, StringBuilder>>(wordMatches.size)
+        var prevEndedWithSpace = false
+        for (wm in wordMatches) {
+            val wordStartMs = wm.groupValues[1].toLongOrNull() ?: lineStartMs
+            val rawSlice = decodeHtmlEntities(wm.groupValues[4])
+            val trimmedSlice = rawSlice.trim()
+            if (trimmedSlice.isEmpty()) {
+                if (rawSlice.any { it.isWhitespace() }) prevEndedWithSpace = true
+                continue
+            }
+            val startsWithSpace = rawSlice.first().isWhitespace()
+            val firstChar = trimmedSlice.first()
+            val prevLastChar = tokens.lastOrNull()?.second?.lastOrNull()
+            val bothAsciiWord =
+                prevLastChar != null &&
+                    firstChar.code < 0x0250 &&
+                    prevLastChar.code < 0x0250 &&
+                    (firstChar.isLetterOrDigit() || firstChar == '\'' || firstChar == '’') &&
+                    (prevLastChar.isLetterOrDigit() || prevLastChar == '\'' || prevLastChar == '’')
+
+            val shouldMergeIntoPrevious =
+                tokens.isNotEmpty() && !prevEndedWithSpace && !startsWithSpace && bothAsciiWord
+            if (shouldMergeIntoPrevious) {
+                tokens.last().second.append(trimmedSlice)
+            } else {
+                tokens.add(wordStartMs to StringBuilder(trimmedSlice))
+            }
+            prevEndedWithSpace = rawSlice.last().isWhitespace()
+        }
+
+        if (tokens.isEmpty()) continue
+        wordTimedLineCount++
+        if (tokens.size >= 2) {
+            multiWordLineCount++
+        }
+        val lineWords =
+            tokens.joinToString(" ") { (ms, sb) ->
+                "<${formatMsToLrc(ms)}>$sb"
+            }
+        parsedLines.add(
+            Lyrics.LyricsX.Line(
+                startTimeMs = lineStartMs.toString(),
+                endTimeMs = (lineStartMs + lineDurMs).toString(),
+                syllables = listOf(),
+                words = lineWords,
+            ),
+        )
+    }
+
+    val sorted = parsedLines.sortedBy { it.startTimeMs.toLongOrNull() ?: 0L }
+    val isRichSynced = multiWordLineCount >= 1 && wordTimedLineCount >= 2
+    return Lyrics(
+        lyrics =
+            Lyrics.LyricsX(
+                lines = sorted,
+                syncType = if (isRichSynced) "RICH_SYNCED" else "LINE_SYNCED",
+            ),
+    )
+}
+
 
 private val TTML_P_OPEN_REGEX = Regex("""<p(?=\s|>)([^>]*)>""", RegexOption.IGNORE_CASE)
 private val TTML_P_CLOSE_REGEX = Regex("""</p\s*>""", RegexOption.IGNORE_CASE)

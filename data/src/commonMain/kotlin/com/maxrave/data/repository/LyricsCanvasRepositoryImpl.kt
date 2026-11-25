@@ -12,9 +12,11 @@ import com.maxrave.domain.data.model.browse.artist.ArtistEditorial
 import com.maxrave.domain.data.model.browse.artist.ArtistLogo
 import com.maxrave.domain.data.model.browse.artist.ArtistMotion
 import com.maxrave.domain.data.model.canvas.CanvasResult
+import com.maxrave.domain.data.model.metadata.Line
 import com.maxrave.domain.data.model.metadata.Lyrics
 import com.maxrave.domain.data.model.metadata.SimpMusicLyrics
 import com.maxrave.domain.extension.now
+import com.maxrave.domain.lyrics.LyricsAttribution
 import com.maxrave.domain.lyrics.LyricsContentQualityGuard
 import com.maxrave.domain.lyrics.LyricsHeaderSanitizer
 import com.maxrave.domain.lyrics.LyricsIdentityGuard
@@ -37,6 +39,7 @@ import com.maxrave.domain.utils.toSyncedLrcString
 import com.maxrave.domain.utils.toSyncedLyrics
 import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.kotlinytmusicscraper.models.WatchEndpoint
+import com.maxrave.kotlinytmusicscraper.models.response.YouTubeMusicOfficialLyrics
 import com.maxrave.logger.Logger
 import com.maxrave.spotify.Spotify
 import com.maxrave.spotify.model.response.spotify.search.SpotifySearchResponse
@@ -53,8 +56,10 @@ import kotlinx.coroutines.withContext
 import org.simpmusic.aiservice.AiClient
 import org.simpmusic.lyrics.LrclibSearchResult
 import org.simpmusic.lyrics.LyricsQueryNormalizer
+import org.simpmusic.lyrics.NetEaseSearchResult
 import org.simpmusic.lyrics.SimpMusicLyricsApiException
 import org.simpmusic.lyrics.SimpMusicLyricsClient
+import org.simpmusic.lyrics.UnisonSearchResult
 import org.simpmusic.lyrics.am.AMAlbumResource
 import org.simpmusic.lyrics.am.AMArtwork
 import org.simpmusic.lyrics.am.AMEditorialVideo
@@ -1127,7 +1132,99 @@ internal class LyricsCanvasRepositoryImpl(
                     )
             }
 
-            LyricsSource.YTM_OFFICIAL -> fetchYtmOfficialLyricsOutcome(request.videoId)
+            LyricsSource.UNISON ->
+                simpMusicLyrics
+                    .fetchUnisonLyricsDetailed(
+                        videoId = request.videoId,
+                        q_track = request.title,
+                        q_artist = request.artist,
+                        duration = request.durationSeconds,
+                    ).fold(
+                        onSuccess = { outcome ->
+                            when (outcome) {
+                                is UnisonSearchResult.NotFound -> ProviderFetchOutcome.DefinitiveNotFound
+                                is UnisonSearchResult.Found -> {
+                                    val sanitized =
+                                        LyricsHeaderSanitizer.sanitize(
+                                            lyrics = outcome.lyrics.toLyrics(),
+                                            songTitle = request.title,
+                                            artistName = request.artist,
+                                        )
+                                    if (LyricsQuality.level(sanitized) > LyricsQuality.LEVEL_INVALID &&
+                                        !LyricsIdentityGuard.contradictsTrack(sanitized, request.title, request.artist) &&
+                                        !LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(sanitized, request.durationSeconds)
+                                    ) {
+                                        val attribution =
+                                            LyricsAttribution(
+                                                providerLabel = "Unison",
+                                                songUrl = "https://unison.betterlyrics.org/song/${outcome.videoId}",
+                                                contributorName = outcome.submitterDisplayName,
+                                                contributorUrl =
+                                                    outcome.submitterKeyId?.let {
+                                                        "https://unison.betterlyrics.org/curator/$it"
+                                                    },
+                                            )
+                                        ProviderFetchOutcome.Success(
+                                            lyrics = sanitized,
+                                            requiresVerification = outcome.requiresVerification,
+                                            attribution = attribution,
+                                        )
+                                    } else {
+                                        ProviderFetchOutcome.DefinitiveNotFound
+                                    }
+                                }
+                            }
+                        },
+                        onFailure = { error ->
+                            val code = (error as? SimpMusicLyricsApiException)?.code
+                            if (code == 404 || code == 400) {
+                                ProviderFetchOutcome.DefinitiveNotFound
+                            } else {
+                                ProviderFetchOutcome.TransientFailure(error.message)
+                            }
+                        },
+                    )
+
+            LyricsSource.NETEASE ->
+                simpMusicLyrics
+                    .searchNetEaseLyricsDetailed(
+                        q_track = request.title,
+                        q_artist = request.artist,
+                        duration = request.durationSeconds,
+                    ).fold(
+                        onSuccess = { outcome ->
+                            when (outcome) {
+                                is NetEaseSearchResult.ConfirmedInstrumental -> ProviderFetchOutcome.ConfirmedInstrumental
+                                is NetEaseSearchResult.NotFound -> ProviderFetchOutcome.DefinitiveNotFound
+                                is NetEaseSearchResult.Found -> {
+                                    val sanitized =
+                                        LyricsHeaderSanitizer.sanitize(
+                                            lyrics = outcome.lyrics.toLyrics(),
+                                            songTitle = request.title,
+                                            artistName = request.artist,
+                                        )
+                                    if (LyricsQuality.level(sanitized) > LyricsQuality.LEVEL_INVALID &&
+                                        !LyricsIdentityGuard.contradictsTrack(sanitized, request.title, request.artist) &&
+                                        !LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(sanitized, request.durationSeconds)
+                                    ) {
+                                        ProviderFetchOutcome.Success(sanitized)
+                                    } else {
+                                        ProviderFetchOutcome.DefinitiveNotFound
+                                    }
+                                }
+                            }
+                        },
+                        onFailure = { error ->
+                            val code = (error as? SimpMusicLyricsApiException)?.code
+                            if (code == 404) {
+                                ProviderFetchOutcome.DefinitiveNotFound
+                            } else {
+                                ProviderFetchOutcome.TransientFailure(error.message)
+                            }
+                        },
+                    )
+
+            LyricsSource.YTM_OFFICIAL -> fetchYtmOfficialLyricsOutcome(request)
 
             LyricsSource.YOUTUBE -> {
                 val preferLang = dataStoreManager.youtubeSubtitleLanguage.first()
@@ -1198,10 +1295,13 @@ internal class LyricsCanvasRepositoryImpl(
             }
         }
 
-    private suspend fun fetchYtmOfficialLyricsOutcome(videoId: String): ProviderFetchOutcome {
+    private suspend fun fetchYtmOfficialLyricsOutcome(request: LyricsLookupRequest): ProviderFetchOutcome {
+        val videoId = request.videoId
         if (videoId.isBlank()) return ProviderFetchOutcome.DefinitiveNotFound
+        val sessionTag = if (youTube.cookie.isNullOrBlank()) 0 else 1
+        val cacheKey = "$videoId:$sessionTag"
         ytmOfficialCacheLock.withLock {
-            ytmOfficialCache[videoId]?.let { return it }
+            ytmOfficialCache[cacheKey]?.let { return it }
         }
         val outcome =
             try {
@@ -1210,15 +1310,59 @@ internal class LyricsCanvasRepositoryImpl(
                 if (lyricsEndpoint == null) {
                     ProviderFetchOutcome.DefinitiveNotFound
                 } else {
-                    val rawText = youTube.lyrics(lyricsEndpoint).getOrThrow()
-                    if (rawText.isNullOrBlank()) {
-                        ProviderFetchOutcome.DefinitiveNotFound
-                    } else {
-                        val parsed = parseUnsyncedLyrics(rawText).toLyrics()
-                        if (LyricsQuality.level(parsed) > LyricsQuality.LEVEL_INVALID) {
-                            ProviderFetchOutcome.Success(parsed)
-                        } else {
-                            ProviderFetchOutcome.DefinitiveNotFound
+                    when (val official = youTube.officialLyrics(lyricsEndpoint).getOrThrow()) {
+                        null -> ProviderFetchOutcome.DefinitiveNotFound
+                        is YouTubeMusicOfficialLyrics.Timed -> {
+                            val rawSynced =
+                                Lyrics(
+                                    error = false,
+                                    lines =
+                                        official.lines.map { timedLine ->
+                                            Line(
+                                                endTimeMs = timedLine.endTimeMs.toString(),
+                                                startTimeMs = timedLine.startTimeMs.toString(),
+                                                syllables = emptyList(),
+                                                words = timedLine.text,
+                                            )
+                                        },
+                                    syncType = "LINE_SYNCED",
+                                )
+                            val sanitized =
+                                LyricsHeaderSanitizer.sanitize(
+                                    lyrics = rawSynced,
+                                    songTitle = request.title,
+                                    artistName = request.artist,
+                                )
+                            val finalLyrics =
+                                if (LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(sanitized, request.durationSeconds)) {
+                                    sanitized.copy(
+                                        syncType = "UNSYNCED",
+                                        lines =
+                                            sanitized.lines?.map { line ->
+                                                line.copy(startTimeMs = "0", endTimeMs = "0")
+                                            },
+                                    )
+                                } else {
+                                    sanitized
+                                }
+                            if (LyricsQuality.level(finalLyrics) > LyricsQuality.LEVEL_INVALID) {
+                                ProviderFetchOutcome.Success(finalLyrics)
+                            } else {
+                                ProviderFetchOutcome.DefinitiveNotFound
+                            }
+                        }
+                        is YouTubeMusicOfficialLyrics.Plain -> {
+                            val parsed =
+                                LyricsHeaderSanitizer.sanitize(
+                                    lyrics = parseUnsyncedLyrics(official.text).toLyrics(),
+                                    songTitle = request.title,
+                                    artistName = request.artist,
+                                )
+                            if (LyricsQuality.level(parsed) > LyricsQuality.LEVEL_INVALID) {
+                                ProviderFetchOutcome.Success(parsed)
+                            } else {
+                                ProviderFetchOutcome.DefinitiveNotFound
+                            }
                         }
                     }
                 }
@@ -1233,7 +1377,7 @@ internal class LyricsCanvasRepositoryImpl(
                 if (ytmOfficialCache.size >= 24) {
                     ytmOfficialCache.keys.firstOrNull()?.let(ytmOfficialCache::remove)
                 }
-                ytmOfficialCache[videoId] = outcome
+                ytmOfficialCache[cacheKey] = outcome
             }
         }
         return outcome
