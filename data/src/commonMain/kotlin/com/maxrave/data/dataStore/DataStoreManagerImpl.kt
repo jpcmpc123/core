@@ -489,7 +489,7 @@ internal class DataStoreManagerImpl(
 
     override val lyricsProvider =
         settingsDataStore.data.map { preferences ->
-            preferences[LYRICS_PROVIDER] ?: SIMPMUSIC
+            preferences[LYRICS_PROVIDER] ?: DataStoreManager.BETTER_LYRICS
         }
 
     override suspend fun setLyricsProvider(provider: String) {

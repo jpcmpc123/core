@@ -55,15 +55,22 @@ class LyricsResolverTest {
     @Test
     fun orderedSourcesIncludesAllEnabledProvidersWithPreferredFirst() {
         assertEquals(
-            listOf(LyricsSource.LRCLIB, LyricsSource.SIMPMUSIC, LyricsSource.BETTER_LYRICS, LyricsSource.YOUTUBE),
+            listOf(
+                LyricsSource.LRCLIB,
+                LyricsSource.BETTER_LYRICS,
+                LyricsSource.SIMPMUSIC,
+                LyricsSource.YTM_OFFICIAL,
+                LyricsSource.YOUTUBE,
+            ),
             LyricsResolver.orderedSources(LyricsSource.LRCLIB, allowSpotify = false),
         )
         assertEquals(
             listOf(
                 LyricsSource.BETTER_LYRICS,
-                LyricsSource.SIMPMUSIC,
-                LyricsSource.SPOTIFY,
                 LyricsSource.LRCLIB,
+                LyricsSource.SPOTIFY,
+                LyricsSource.SIMPMUSIC,
+                LyricsSource.YTM_OFFICIAL,
                 LyricsSource.YOUTUBE,
             ),
             LyricsResolver.orderedSources(LyricsSource.BETTER_LYRICS, allowSpotify = true),
@@ -725,5 +732,117 @@ class LyricsResolverTest {
 
             assertEquals(listOf(LyricsSource.SIMPMUSIC, LyricsSource.LRCLIB), events.map { it.resolution.source })
             assertEquals("E por falar em saudade onde anda você", events.last().resolution.lyrics.lines?.first()?.words)
+        }
+
+    @Test
+    fun ytmOfficialJudgeBlocksWrongUnverifiedSimpMusicAndServesCleanStaticLyrics() =
+        runBlocking {
+            val wrongSimpMusic =
+                Lyrics(
+                    error = false,
+                    syncType = "LINE_SYNCED",
+                    lines =
+                        listOf(
+                            Line("1000", "5000", words = "Totally unrelated lyrics from another artist"),
+                            Line("5000", "10000", words = "Wrong song lines uploaded on community db"),
+                        ),
+                )
+            val officialYtm =
+                Lyrics(
+                    error = false,
+                    syncType = "UNSYNCED",
+                    lines =
+                        listOf(
+                            Line("0", "0", words = "Valei-me Deus é o fim do nosso amor"),
+                            Line("0", "0", words = "Perdoa por favor eu sei que o erro aconteceu"),
+                            Line("0", "0", words = "Mas não sei o que fez tudo mudar de vez"),
+                        ),
+                )
+            val resolver =
+                LyricsResolver(
+                    readCache = { null },
+                    fetchSource = { source, _ ->
+                        when (source) {
+                            LyricsSource.SIMPMUSIC ->
+                                ProviderFetchOutcome.Success(wrongSimpMusic, requiresVerification = true)
+                            LyricsSource.YTM_OFFICIAL -> {
+                                delay(25L)
+                                ProviderFetchOutcome.Success(officialYtm)
+                            }
+                            else -> ProviderFetchOutcome.DefinitiveNotFound
+                        }
+                    },
+                    providerTimeoutMs = 500L,
+                    hedgeDelayMs = 10L,
+                )
+
+            val events =
+                withTimeout(2_000L) {
+                    resolver
+                        .resolve(
+                            request(preferred = LyricsSource.BETTER_LYRICS).copy(
+                                title = "Flor De Lis (Ao Vivo)",
+                                artist = "Emílio Santiago, Alcione",
+                                durationSeconds = 169,
+                            ),
+                        ).toList()
+                }.filterIsInstance<LyricsResolutionEvent.Found>()
+
+            val found = events.single()
+            assertEquals(LyricsSource.YTM_OFFICIAL, found.resolution.source)
+            assertEquals("UNSYNCED", found.resolution.lyrics.syncType)
+        }
+
+    @Test
+    fun revalidateStaleCacheReplacesPreUpgradeOutOfSyncCacheWithYtmOfficialStatic() =
+        runBlocking {
+            val staleCachedStudioLrc =
+                Lyrics(
+                    error = false,
+                    syncType = "LINE_SYNCED",
+                    lines =
+                        listOf(
+                            Line("1000", "5000", words = "Stale studio synced line one"),
+                            Line("5000", "9000", words = "Stale studio synced line two"),
+                        ),
+                )
+            val cleanYtmOfficial =
+                Lyrics(
+                    error = false,
+                    syncType = "UNSYNCED",
+                    lines =
+                        listOf(
+                            Line("0", "0", words = "Valei-me Deus é o fim do nosso amor"),
+                            Line("0", "0", words = "Perdoa por favor eu sei que o erro aconteceu"),
+                        ),
+                )
+            val resolver =
+                LyricsResolver(
+                    readCache = { staleCachedStudioLrc },
+                    fetchSource = { source, _ ->
+                        when (source) {
+                            LyricsSource.YTM_OFFICIAL -> ProviderFetchOutcome.Success(cleanYtmOfficial)
+                            else -> ProviderFetchOutcome.DefinitiveNotFound
+                        }
+                    },
+                    providerTimeoutMs = 500L,
+                    hedgeDelayMs = 10L,
+                )
+
+            val events =
+                withTimeout(2_000L) {
+                    resolver
+                        .resolve(
+                            request(preferred = LyricsSource.BETTER_LYRICS).copy(
+                                title = "Flor De Lis (Ao Vivo)",
+                                artist = "Emílio Santiago",
+                                durationSeconds = 169,
+                                revalidateStaleCache = true,
+                            ),
+                        ).toList()
+                }.filterIsInstance<LyricsResolutionEvent.Found>()
+
+            assertEquals(listOf(LyricsSource.OFFLINE, LyricsSource.YTM_OFFICIAL), events.map { it.resolution.source })
+            assertEquals("UNSYNCED", events.last().resolution.lyrics.syncType)
         }
 }

@@ -12,11 +12,74 @@ private val MATCHER_TOPIC_REGEX = Regex("""\s*[-–—]\s*topic\s*$""", RegexOpt
 private val MATCHER_MULTI_SPACE_REGEX = Regex("""\s+""")
 private val ARTIST_SPLIT_REGEX = Regex("""(?:\s*[,&•/;]\s*|\s+(?:feat\.?|ft\.?|featuring|and|e|x)\s+)""", RegexOption.IGNORE_CASE)
 
+private val EDITION_GROUP_REGEX = Regex("""[\(\[（［]([^\)\]）］]+)[\)\]）］]""")
+private val EDITION_AFTER_DASH_REGEX = Regex("""\s[-–—]\s(.+)$""")
+private val EDITION_LIVE_REGEX =
+    Regex("""\b(?:ao\s+vivo|en\s+vivo|live|concert|unplugged|ac[uú]stico\s+mtv|mtv\s+unplugged)\b|ライブ|コンサート""", RegexOption.IGNORE_CASE)
+private val EDITION_ACOUSTIC_REGEX =
+    Regex("""\b(?:ac[uú]stico|acoustic|stripped|piano\s+version)\b|アコースティック""", RegexOption.IGNORE_CASE)
+private val EDITION_REMIX_REGEX =
+    Regex("""\b(?:remix|rework|dub|club\s+mix|vip\s+mix)\b""", RegexOption.IGNORE_CASE)
+private val EDITION_SPEED_REGEX =
+    Regex("""\b(?:sped\s*up|slowed|reverb|nightcore|8d)\b""", RegexOption.IGNORE_CASE)
+private val EDITION_EXTENDED_REGEX =
+    Regex("""\b(?:extended|long\s+version|radio\s+edit|club\s+edit)\b""", RegexOption.IGNORE_CASE)
+private val EDITION_STANDALONE_LIVE_REGEX =
+    Regex("""(?:^|[\s\-–—])(?:ao\s+vivo|en\s+vivo|sped\s*up|slowed(?:\s*\+\s*reverb)?)\s*$""", RegexOption.IGNORE_CASE)
+
+enum class TrackEditionTag {
+    LIVE,
+    ACOUSTIC,
+    REMIX,
+    SPEED,
+    EXTENDED,
+}
+
 /**
- * Conservative track title, artist, and duration matching shared across lyrics providers
- * (LRCLIB, Spotify, SimpMusic) so an instrumental track never receives another artist's song.
+ * Conservative track title, artist, edition, and duration matching shared across lyrics providers
+ * (LRCLIB, Spotify, BetterLyrics, SimpMusic) so an instrumental or live track never receives
+ * another artist's or studio cut's synced lyrics.
  */
 object LyricsMetadataMatcher {
+    fun extractEditionTags(
+        title: String?,
+        album: String? = null,
+    ): Set<TrackEditionTag> {
+        val tags = LinkedHashSet<TrackEditionTag>(2)
+        fun scanSegment(segment: String) {
+            if (EDITION_LIVE_REGEX.containsMatchIn(segment)) tags.add(TrackEditionTag.LIVE)
+            if (EDITION_ACOUSTIC_REGEX.containsMatchIn(segment)) tags.add(TrackEditionTag.ACOUSTIC)
+            if (EDITION_REMIX_REGEX.containsMatchIn(segment)) tags.add(TrackEditionTag.REMIX)
+            if (EDITION_SPEED_REGEX.containsMatchIn(segment)) tags.add(TrackEditionTag.SPEED)
+            if (EDITION_EXTENDED_REGEX.containsMatchIn(segment)) tags.add(TrackEditionTag.EXTENDED)
+        }
+        if (!title.isNullOrBlank()) {
+            EDITION_GROUP_REGEX.findAll(title).forEach { scanSegment(it.groupValues[1]) }
+            EDITION_AFTER_DASH_REGEX.find(title)?.let { scanSegment(it.groupValues[1]) }
+            EDITION_STANDALONE_LIVE_REGEX.find(title)?.let { scanSegment(it.value) }
+        }
+        if (!album.isNullOrBlank()) {
+            if (EDITION_LIVE_REGEX.containsMatchIn(album)) tags.add(TrackEditionTag.LIVE)
+            if (EDITION_ACOUSTIC_REGEX.containsMatchIn(album)) tags.add(TrackEditionTag.ACOUSTIC)
+        }
+        return tags
+    }
+
+    /**
+     * Ensures synced lyrics come from a compatible recording edition (e.g. `(Ao Vivo)` does not
+     * receive studio-timed LRC/TTML, and a studio track does not receive `Remix`/`Slowed`/`Live` LRC).
+     */
+    fun editionsCompatibleForSync(
+        expectedTitle: String?,
+        candidateTitle: String?,
+        candidateAlbum: String? = null,
+    ): Boolean {
+        if (expectedTitle.isNullOrBlank() || candidateTitle.isNullOrBlank()) return true
+        val expectedEditions = extractEditionTags(expectedTitle, album = null)
+        val candidateEditions = extractEditionTags(candidateTitle, album = candidateAlbum)
+        return expectedEditions == candidateEditions
+    }
+
     fun titlesMatch(
         expectedTitle: String?,
         candidateTitle: String?,

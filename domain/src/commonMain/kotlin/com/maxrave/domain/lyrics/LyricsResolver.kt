@@ -41,11 +41,14 @@ class LyricsResolver(
 
             var verifiedBestLyrics: Lyrics? = null
             var letrasJudgeChecked = false
+            var ytmOfficialJudgeChecked = false
             var cachedLetrasOutcome: ProviderFetchOutcome? = null
+            var cachedYtmOfficialOutcome: ProviderFetchOutcome? = null
             var pendingBlindCandidate: LyricsResolution? = null
             var pendingBlindLevel = LyricsQuality.LEVEL_INVALID
             var pendingBlindOverflow = false
-            val finishedSources = HashSet<LyricsSource>(6)
+            var onlineAcceptedAny = false
+            val finishedSources = HashSet<LyricsSource>(8)
 
             val titleInstrumental = LyricsInstrumentalDetector.isExplicitlyInstrumentalTitle(request.title)
             if (request.preferCache) {
@@ -66,7 +69,10 @@ class LyricsResolver(
                     }
                     val cachedContradicts =
                         !isUserProtected &&
-                            LyricsIdentityGuard.contradictsTrack(cached, request.title, request.artist)
+                            (
+                                LyricsIdentityGuard.contradictsTrack(cached, request.title, request.artist) ||
+                                    LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(cached, request.durationSeconds)
+                            )
                     if (cachedContradicts) {
                         cacheInvalidated = true
                     } else {
@@ -88,7 +94,9 @@ class LyricsResolver(
                                 ),
                             ),
                         )
-                        if (isUserProtected || (!cachedOverflow && (cachedLevel >= LyricsQuality.LEVEL_RICH_SYNCED || !request.allowUpgradeScan))) {
+                        if (isUserProtected ||
+                            (!cachedOverflow && !request.revalidateStaleCache && (cachedLevel >= LyricsQuality.LEVEL_RICH_SYNCED || !request.allowUpgradeScan))
+                        ) {
                             return@channelFlow
                         }
                     }
@@ -128,6 +136,7 @@ class LyricsResolver(
                 overflow: Boolean,
                 isFromCache: Boolean = false,
             ) {
+                if (!isFromCache) onlineAcceptedAny = true
                 currentBestLyrics = resolution.lyrics
                 currentBestLevel = level
                 currentBestOverflow = overflow
@@ -136,61 +145,105 @@ class LyricsResolver(
                 send(LyricsResolutionEvent.Found(resolution))
             }
 
-            suspend fun ensureLetrasJudgeChecked() {
-                if (letrasJudgeChecked) return
-                letrasJudgeChecked = true
-                val outcome =
-                    try {
-                        withTimeoutOrNull(providerTimeoutMs) {
-                            fetchSource(LyricsSource.LETRAS, request)
-                        } ?: ProviderFetchOutcome.TransientFailure("Timeout after ${providerTimeoutMs}ms")
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (t: Throwable) {
-                        ProviderFetchOutcome.TransientFailure(t.message)
+            suspend fun ensureFallbackJudgesChecked() {
+                if (!ytmOfficialJudgeChecked) {
+                    ytmOfficialJudgeChecked = true
+                    if (LyricsSource.YTM_OFFICIAL !in finishedSources) {
+                        val ytmOutcome =
+                            try {
+                                withTimeoutOrNull(providerTimeoutMs) {
+                                    fetchSource(LyricsSource.YTM_OFFICIAL, request)
+                                } ?: ProviderFetchOutcome.TransientFailure("Timeout after ${providerTimeoutMs}ms")
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (t: Throwable) {
+                                ProviderFetchOutcome.TransientFailure(t.message)
+                            }
+                        cachedYtmOfficialOutcome = ytmOutcome
+                        finishedSources.add(LyricsSource.YTM_OFFICIAL)
+                        if (ytmOutcome is ProviderFetchOutcome.Success &&
+                            LyricsQuality.level(ytmOutcome.lyrics) > LyricsQuality.LEVEL_INVALID &&
+                            !LyricsIdentityGuard.contradictsTrack(ytmOutcome.lyrics, request.title, request.artist) &&
+                            verifiedBestLyrics == null
+                        ) {
+                            verifiedBestLyrics = ytmOutcome.lyrics
+                        }
                     }
-                cachedLetrasOutcome = outcome
-                if (outcome is ProviderFetchOutcome.Success &&
-                    LyricsQuality.level(outcome.lyrics) > LyricsQuality.LEVEL_INVALID &&
-                    !LyricsIdentityGuard.contradictsTrack(outcome.lyrics, request.title, request.artist) &&
-                    verifiedBestLyrics == null
-                ) {
-                    verifiedBestLyrics = outcome.lyrics
                 }
+                if (verifiedBestLyrics == null && !letrasJudgeChecked) {
+                    letrasJudgeChecked = true
+                    if (LyricsSource.LETRAS !in finishedSources) {
+                        val outcome =
+                            try {
+                                withTimeoutOrNull(providerTimeoutMs) {
+                                    fetchSource(LyricsSource.LETRAS, request)
+                                } ?: ProviderFetchOutcome.TransientFailure("Timeout after ${providerTimeoutMs}ms")
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (t: Throwable) {
+                                ProviderFetchOutcome.TransientFailure(t.message)
+                            }
+                        cachedLetrasOutcome = outcome
+                        finishedSources.add(LyricsSource.LETRAS)
+                        if (outcome is ProviderFetchOutcome.Success &&
+                            LyricsQuality.level(outcome.lyrics) > LyricsQuality.LEVEL_INVALID &&
+                            !LyricsIdentityGuard.contradictsTrack(outcome.lyrics, request.title, request.artist) &&
+                            verifiedBestLyrics == null
+                        ) {
+                            verifiedBestLyrics = outcome.lyrics
+                        }
+                    }
+                }
+            }
+
+            fun bestFallbackJudgeResolution(): Pair<LyricsSource, Lyrics>? {
+                val ytmOutcome = cachedYtmOfficialOutcome
+                if (ytmOutcome is ProviderFetchOutcome.Success &&
+                    LyricsQuality.level(ytmOutcome.lyrics) > LyricsQuality.LEVEL_INVALID &&
+                    !LyricsIdentityGuard.contradictsTrack(ytmOutcome.lyrics, request.title, request.artist)
+                ) {
+                    return LyricsSource.YTM_OFFICIAL to ytmOutcome.lyrics
+                }
+                val letrasOutcome = cachedLetrasOutcome
+                if (letrasOutcome is ProviderFetchOutcome.Success &&
+                    LyricsQuality.level(letrasOutcome.lyrics) > LyricsQuality.LEVEL_INVALID &&
+                    !LyricsIdentityGuard.contradictsTrack(letrasOutcome.lyrics, request.title, request.artist)
+                ) {
+                    return LyricsSource.LETRAS to letrasOutcome.lyrics
+                }
+                return null
             }
 
             suspend fun tryFlushPendingBlindCandidate() {
                 val pending = pendingBlindCandidate ?: return
                 if (verifiedBestLyrics == null && hasPendingVerificationSource()) return
-                if (verifiedBestLyrics == null && !letrasJudgeChecked) {
-                    ensureLetrasJudgeChecked()
+                if (verifiedBestLyrics == null && (!ytmOfficialJudgeChecked || !letrasJudgeChecked)) {
+                    ensureFallbackJudgesChecked()
                 }
                 if (!canAcceptBlindCandidate(pending.lyrics)) {
                     pendingBlindCandidate = null
                     pendingBlindLevel = LyricsQuality.LEVEL_INVALID
                     pendingBlindOverflow = false
-                    // If Letras served as the verification judge and exposed a conflict, emit Letras
-                    // immediately when no valid lyrics are currently shown (or an unverified source conflicts).
-                    val letrasOutcome = cachedLetrasOutcome
-                    val verified = verifiedBestLyrics
-                    if (letrasOutcome is ProviderFetchOutcome.Success && verified != null) {
+                    val fallbackPair = bestFallbackJudgeResolution()
+                    if (fallbackPair != null) {
+                        val (judgeSource, judgeLyrics) = fallbackPair
                         val activeSource = currentBestSource
                         val currentConflicts =
                             currentBestLyrics != null &&
                                 activeSource != null &&
                                 !activeSource.isCatalogVerified() &&
-                                LyricsIdentityGuard.checkTextualConsensus(verified, currentBestLyrics) == TextualConsensus.CONFLICT
-                        if (currentBestLyrics == null || currentConflicts) {
+                                LyricsIdentityGuard.checkTextualConsensus(judgeLyrics, currentBestLyrics) == TextualConsensus.CONFLICT
+                        if (currentBestLyrics == null || currentConflicts || (currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny)) {
                             emitCandidate(
                                 resolution =
                                     LyricsResolution(
                                         videoId = request.videoId,
-                                        lyrics = verified,
-                                        source = LyricsSource.LETRAS,
+                                        lyrics = judgeLyrics,
+                                        source = judgeSource,
                                         fromCache = false,
                                         simpMusicNotFoundObserved = simpMusicNotFoundObserved,
                                     ),
-                                level = LyricsQuality.level(verified),
+                                level = LyricsQuality.level(judgeLyrics),
                                 overflow = false,
                             )
                         }
@@ -198,8 +251,10 @@ class LyricsResolver(
                     return
                 }
 
+                val isStaleMigrationReplace = currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny
                 val isBetterThanCurrent =
-                    pendingBlindLevel > currentBestLevel ||
+                    isStaleMigrationReplace ||
+                        pendingBlindLevel > currentBestLevel ||
                         (currentBestLyrics != null && pendingBlindLevel == currentBestLevel && currentBestOverflow && !pendingBlindOverflow) ||
                         currentBestLyrics == null
                 if (isBetterThanCurrent) {
@@ -266,6 +321,13 @@ class LyricsResolver(
                 val (source, outcome) = completionChannel.receive()
                 handled++
                 finishedSources.add(source)
+                if (source == LyricsSource.YTM_OFFICIAL) {
+                    ytmOfficialJudgeChecked = true
+                    cachedYtmOfficialOutcome = outcome
+                } else if (source == LyricsSource.LETRAS) {
+                    letrasJudgeChecked = true
+                    cachedLetrasOutcome = outcome
+                }
 
                 when (outcome) {
                     is ProviderFetchOutcome.ConfirmedInstrumental -> {
@@ -297,24 +359,30 @@ class LyricsResolver(
                                 expectedTitle = request.title,
                                 expectedArtist = request.artist,
                             )
+                        val brokenTiming =
+                            LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(
+                                lyrics = outcome.lyrics,
+                                durationSeconds = request.durationSeconds,
+                            )
+                        val needsConsensus = source.isBlindMetadataSource() || outcome.requiresVerification
                         val conflictsWithVerified =
                             !source.isCatalogVerified() &&
-                                !source.isBlindMetadataSource() &&
+                                !needsConsensus &&
                                 verifiedBestLyrics != null &&
                                 LyricsIdentityGuard.checkTextualConsensus(verifiedBestLyrics, outcome.lyrics) == TextualConsensus.CONFLICT
-                        if (candidateLevel > LyricsQuality.LEVEL_INVALID && !contradicts && !conflictsWithVerified) {
+                        if (candidateLevel > LyricsQuality.LEVEL_INVALID && !contradicts && !brokenTiming && !conflictsWithVerified) {
                             val candidateOverflow =
                                 LyricsQuality.hasSyncedTimestampOverflow(outcome.lyrics, request.durationSeconds)
                             if (source.isCatalogVerified() && verifiedBestLyrics == null) {
                                 verifiedBestLyrics = outcome.lyrics
                             }
 
-                            if (source.isBlindMetadataSource() &&
+                            if (needsConsensus &&
                                 verifiedBestLyrics == null &&
-                                (hasPendingVerificationSource() || !letrasJudgeChecked)
+                                (hasPendingVerificationSource() || !ytmOfficialJudgeChecked || !letrasJudgeChecked)
                             ) {
-                                // Defer blind provider emission until catalog-verified sources (or Letras judge)
-                                // confirm the lyrics belong to the same song (or exhaust).
+                                // Defer blind/unverified provider emission until catalog-verified sources
+                                // (or YTM_OFFICIAL / Letras judges) confirm the lyrics belong to the same song.
                                 val shouldHold =
                                     pendingBlindCandidate == null ||
                                         candidateLevel > pendingBlindLevel ||
@@ -332,8 +400,13 @@ class LyricsResolver(
                                     pendingBlindLevel = candidateLevel
                                     pendingBlindOverflow = candidateOverflow
                                 }
-                            } else if (!source.isBlindMetadataSource() || canAcceptBlindCandidate(outcome.lyrics)) {
+                            } else if (!needsConsensus || canAcceptBlindCandidate(outcome.lyrics)) {
                                 val signature = LyricsQuality.contentSignature(outcome.lyrics)
+                                val isStaleMigrationReplace =
+                                    currentFromCache &&
+                                        request.revalidateStaleCache &&
+                                        !onlineAcceptedAny &&
+                                        (!candidateOverflow || currentBestOverflow)
                                 val isSameTierCacheRefresh =
                                     currentFromCache &&
                                         source == request.preferredSource &&
@@ -353,7 +426,7 @@ class LyricsResolver(
                                         activeSource != null &&
                                         !activeSource.isCatalogVerified() &&
                                         LyricsIdentityGuard.checkTextualConsensus(outcome.lyrics, currentBestLyrics) == TextualConsensus.CONFLICT
-                                if (isUpgrade || isTimingFix || isSameTierCacheRefresh || isIdentityCorrection) {
+                                if (isUpgrade || isTimingFix || isSameTierCacheRefresh || isIdentityCorrection || isStaleMigrationReplace) {
                                     emitCandidate(
                                         resolution =
                                             LyricsResolution(
@@ -370,7 +443,7 @@ class LyricsResolver(
                                 }
                             }
                         } else {
-                            // Unusable or contradictory payload treated as missing so fallback continues cleanly.
+                            // Unusable, broken-timed, or contradictory payload treated as missing so fallback continues cleanly.
                             if (source == LyricsSource.SIMPMUSIC) simpMusicNotFoundObserved = true
                         }
                     }
@@ -378,7 +451,10 @@ class LyricsResolver(
 
                 tryFlushPendingBlindCandidate()
 
-                if (currentBestLevel >= LyricsQuality.LEVEL_RICH_SYNCED && !currentBestOverflow) {
+                if (currentBestLevel >= LyricsQuality.LEVEL_RICH_SYNCED &&
+                    !currentBestOverflow &&
+                    (!currentFromCache || !request.revalidateStaleCache || onlineAcceptedAny)
+                ) {
                     hedgeJob?.cancel()
                     primaryJob.cancel()
                     launchedOtherJobs.forEach { it.cancel() }
@@ -386,11 +462,12 @@ class LyricsResolver(
                 }
 
                 // If primary finished (with not-found, < RICH_SYNCED, or overflowing timestamps),
-                // or a blind candidate needs verification, or we have no lyrics yet: launch others immediately.
-                if (source == primary || currentBestLyrics == null || pendingBlindCandidate != null) {
+                // or a blind/unverified candidate needs verification, or we have no lyrics yet: launch others immediately.
+                if (source == primary || currentBestLyrics == null || pendingBlindCandidate != null || (currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny)) {
                     val allowMoreSources =
                         currentBestLyrics == null ||
                             request.allowUpgradeScan ||
+                            request.revalidateStaleCache ||
                             currentBestOverflow ||
                             (pendingBlindCandidate != null && hasPendingVerificationSource())
                     if (allowMoreSources) {
@@ -406,31 +483,28 @@ class LyricsResolver(
 
             tryFlushPendingBlindCandidate()
 
-            // Static lyrics fallback (Letras.mus.br): only queried after all synced providers
-            // returned no lyrics and the track was NOT confirmed instrumental.
-            if (currentBestLyrics == null) {
-                if (!letrasJudgeChecked) {
-                    ensureLetrasJudgeChecked()
+            // Official static lyrics fallback (YouTube Music Musixmatch/LyricFind -> Letras.mus.br):
+            // queried when no online synced provider matched cleanly (including Live/Remix tracks
+            // where stale cache must be superseded by accurate unsynced lyrics).
+            if (currentBestLyrics == null || (currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny)) {
+                if (!ytmOfficialJudgeChecked || !letrasJudgeChecked) {
+                    ensureFallbackJudgesChecked()
                 }
-                val letrasOutcome = cachedLetrasOutcome
-                if (letrasOutcome is ProviderFetchOutcome.Success) {
-                    val candidateLevel = LyricsQuality.level(letrasOutcome.lyrics)
-                    if (candidateLevel > LyricsQuality.LEVEL_INVALID &&
-                        !LyricsIdentityGuard.contradictsTrack(letrasOutcome.lyrics, request.title, request.artist)
-                    ) {
-                        emitCandidate(
-                            resolution =
-                                LyricsResolution(
-                                    videoId = request.videoId,
-                                    lyrics = letrasOutcome.lyrics,
-                                    source = LyricsSource.LETRAS,
-                                    fromCache = false,
-                                    simpMusicNotFoundObserved = simpMusicNotFoundObserved,
-                                ),
-                            level = candidateLevel,
-                            overflow = false,
-                        )
-                    }
+                val fallbackPair = bestFallbackJudgeResolution()
+                if (fallbackPair != null) {
+                    val (judgeSource, judgeLyrics) = fallbackPair
+                    emitCandidate(
+                        resolution =
+                            LyricsResolution(
+                                videoId = request.videoId,
+                                lyrics = judgeLyrics,
+                                source = judgeSource,
+                                fromCache = false,
+                                simpMusicNotFoundObserved = simpMusicNotFoundObserved,
+                            ),
+                        level = LyricsQuality.level(judgeLyrics),
+                        overflow = false,
+                    )
                 }
             }
 
@@ -455,10 +529,11 @@ class LyricsResolver(
         ): List<LyricsSource> {
             val baseOrder =
                 listOf(
-                    LyricsSource.SIMPMUSIC,
                     LyricsSource.BETTER_LYRICS,
-                    LyricsSource.SPOTIFY,
                     LyricsSource.LRCLIB,
+                    LyricsSource.SPOTIFY,
+                    LyricsSource.SIMPMUSIC,
+                    LyricsSource.YTM_OFFICIAL,
                     LyricsSource.YOUTUBE,
                 )
             return buildList {

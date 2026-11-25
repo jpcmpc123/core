@@ -5,6 +5,7 @@ import com.maxrave.domain.data.model.metadata.Lyrics
 enum class LyricsSource {
     SIMPMUSIC,
     YOUTUBE,
+    YTM_OFFICIAL,
     SPOTIFY,
     LRCLIB,
     BETTER_LYRICS,
@@ -13,7 +14,7 @@ enum class LyricsSource {
     ;
 
     fun isCatalogVerified(): Boolean =
-        this == LRCLIB || this == SPOTIFY || this == LETRAS
+        this == LRCLIB || this == SPOTIFY || this == LETRAS || this == YTM_OFFICIAL
 
     fun isBlindMetadataSource(): Boolean =
         this == BETTER_LYRICS
@@ -29,6 +30,7 @@ data class LyricsLookupRequest(
     val preferCache: Boolean = true,
     val allowUpgradeScan: Boolean = true,
     val userProtectedSignatures: Set<Int> = emptySet(),
+    val revalidateStaleCache: Boolean = false,
 )
 
 data class LyricsResolution(
@@ -58,6 +60,7 @@ sealed interface ProviderFetchOutcome {
     data class Success(
         val lyrics: Lyrics,
         val translatedLyrics: Lyrics? = null,
+        val requiresVerification: Boolean = false,
     ) : ProviderFetchOutcome
 
     data object DefinitiveNotFound : ProviderFetchOutcome

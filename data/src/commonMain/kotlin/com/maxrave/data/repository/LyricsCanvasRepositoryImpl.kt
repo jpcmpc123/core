@@ -16,6 +16,7 @@ import com.maxrave.domain.data.model.metadata.Lyrics
 import com.maxrave.domain.data.model.metadata.SimpMusicLyrics
 import com.maxrave.domain.extension.now
 import com.maxrave.domain.lyrics.LyricsContentQualityGuard
+import com.maxrave.domain.lyrics.LyricsHeaderSanitizer
 import com.maxrave.domain.lyrics.LyricsIdentityGuard
 import com.maxrave.domain.lyrics.LyricsLookupRequest
 import com.maxrave.domain.lyrics.LyricsMetadataMatcher
@@ -35,6 +36,7 @@ import com.maxrave.domain.utils.toRichSyncLrcString
 import com.maxrave.domain.utils.toSyncedLrcString
 import com.maxrave.domain.utils.toSyncedLyrics
 import com.maxrave.kotlinytmusicscraper.YouTube
+import com.maxrave.kotlinytmusicscraper.models.WatchEndpoint
 import com.maxrave.logger.Logger
 import com.maxrave.spotify.Spotify
 import com.maxrave.spotify.model.response.spotify.search.SpotifySearchResponse
@@ -64,6 +66,7 @@ import org.simpmusic.lyrics.models.request.TranslatedLyricsBody
 import org.simpmusic.lyrics.models.response.LyricsResponse
 import org.simpmusic.lyrics.parser.extractLrcEmbeddedMetadata
 import org.simpmusic.lyrics.parser.parseTtmlLyrics
+import org.simpmusic.lyrics.parser.parseUnsyncedLyrics
 import kotlin.math.abs
 import kotlin.time.Clock
 import kotlin.time.ExperimentalTime
@@ -82,6 +85,8 @@ internal class LyricsCanvasRepositoryImpl(
      */
     private val amArtworkInFlight = mutableSetOf<String>()
     private val amArtworkLock = Mutex()
+    private val ytmOfficialCacheLock = Mutex()
+    private val ytmOfficialCache = LinkedHashMap<String, ProviderFetchOutcome>(24)
 
     private val lyricsResolver =
         LyricsResolver(
@@ -1040,15 +1045,18 @@ internal class LyricsCanvasRepositoryImpl(
             LyricsSource.SIMPMUSIC ->
                 simpMusicLyrics.getLyrics(request.videoId).fold(
                     onSuccess = { lyrics ->
-                        val appLyrics =
-                            pickBestSimpMusicLyrics(
+                        val picked =
+                            pickBestSimpMusicCandidate(
                                 candidates = lyrics,
                                 expectedTitle = request.title,
                                 expectedArtist = request.artist,
                                 expectedDurationSeconds = request.durationSeconds,
                             )
-                        if (appLyrics != null) {
-                            ProviderFetchOutcome.Success(appLyrics)
+                        if (picked != null) {
+                            ProviderFetchOutcome.Success(
+                                lyrics = picked.lyrics,
+                                requiresVerification = picked.requiresVerification,
+                            )
                         } else {
                             ProviderFetchOutcome.DefinitiveNotFound
                         }
@@ -1100,7 +1108,8 @@ internal class LyricsCanvasRepositoryImpl(
                             if (ttml.isNullOrBlank()) return ProviderFetchOutcome.DefinitiveNotFound
                             val lyrics = parseTtmlLyrics(ttml).toLyrics()
                             if (LyricsQuality.level(lyrics) > LyricsQuality.LEVEL_INVALID &&
-                                !LyricsIdentityGuard.contradictsTrack(lyrics, request.title, request.artist)
+                                !LyricsIdentityGuard.contradictsTrack(lyrics, request.title, request.artist) &&
+                                !LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(lyrics, request.durationSeconds)
                             ) {
                                 ProviderFetchOutcome.Success(lyrics)
                             } else {
@@ -1116,6 +1125,8 @@ internal class LyricsCanvasRepositoryImpl(
                         },
                     )
             }
+
+            LyricsSource.YTM_OFFICIAL -> fetchYtmOfficialLyricsOutcome(request.videoId)
 
             LyricsSource.YOUTUBE -> {
                 val preferLang = dataStoreManager.youtubeSubtitleLanguage.first()
@@ -1185,6 +1196,47 @@ internal class LyricsCanvasRepositoryImpl(
                 lastOutcome
             }
         }
+
+    private suspend fun fetchYtmOfficialLyricsOutcome(videoId: String): ProviderFetchOutcome {
+        if (videoId.isBlank()) return ProviderFetchOutcome.DefinitiveNotFound
+        ytmOfficialCacheLock.withLock {
+            ytmOfficialCache[videoId]?.let { return it }
+        }
+        val outcome =
+            try {
+                val nextResult = youTube.next(WatchEndpoint(videoId = videoId)).getOrThrow()
+                val lyricsEndpoint = nextResult.lyricsEndpoint
+                if (lyricsEndpoint == null) {
+                    ProviderFetchOutcome.DefinitiveNotFound
+                } else {
+                    val rawText = youTube.lyrics(lyricsEndpoint).getOrThrow()
+                    if (rawText.isNullOrBlank()) {
+                        ProviderFetchOutcome.DefinitiveNotFound
+                    } else {
+                        val parsed = parseUnsyncedLyrics(rawText).toLyrics()
+                        if (LyricsQuality.level(parsed) > LyricsQuality.LEVEL_INVALID) {
+                            ProviderFetchOutcome.Success(parsed)
+                        } else {
+                            ProviderFetchOutcome.DefinitiveNotFound
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (error: Throwable) {
+                ProviderFetchOutcome.TransientFailure(error.message)
+            }
+
+        if (outcome !is ProviderFetchOutcome.TransientFailure) {
+            ytmOfficialCacheLock.withLock {
+                if (ytmOfficialCache.size >= 24) {
+                    ytmOfficialCache.keys.firstOrNull()?.let(ytmOfficialCache::remove)
+                }
+                ytmOfficialCache[videoId] = outcome
+            }
+        }
+        return outcome
+    }
 
     private suspend fun fetchSpotifyLyricsOutcome(
         dataStoreManager: DataStoreManager,
@@ -1515,7 +1567,12 @@ private fun AMEditorialVideo.preferredRendition(): AMMotionVideo? =
 
 private const val SPOTIFY_DURATION_TOLERANCE_SECONDS = 2
 private const val SPOTIFY_LYRICS_DURATION_TOLERANCE_SECONDS = 5
-private const val SIMPMUSIC_DURATION_TOLERANCE_SECONDS = 15
+private const val SIMPMUSIC_DURATION_TOLERANCE_SECONDS = 5
+
+internal data class PickedSimpMusicLyrics(
+    val lyrics: Lyrics,
+    val requiresVerification: Boolean,
+)
 
 internal fun pickSpotifyTrack(
     items: List<SpotifySearchResponse.Data.Search.TracksV2.Items>?,
@@ -1571,8 +1628,21 @@ internal fun pickBestSimpMusicLyrics(
     expectedTitle: String? = null,
     expectedArtist: String? = null,
     expectedDurationSeconds: Int? = null,
-): Lyrics? {
-    var bestLyrics: Lyrics? = null
+): Lyrics? =
+    pickBestSimpMusicCandidate(
+        candidates = candidates,
+        expectedTitle = expectedTitle,
+        expectedArtist = expectedArtist,
+        expectedDurationSeconds = expectedDurationSeconds,
+    )?.lyrics
+
+internal fun pickBestSimpMusicCandidate(
+    candidates: List<LyricsResponse>,
+    expectedTitle: String? = null,
+    expectedArtist: String? = null,
+    expectedDurationSeconds: Int? = null,
+): PickedSimpMusicLyrics? {
+    var bestPicked: PickedSimpMusicLyrics? = null
     var bestLevel = LyricsQuality.LEVEL_INVALID
     var bestOverflow = true
     var bestVote = Int.MIN_VALUE
@@ -1610,11 +1680,27 @@ internal fun pickBestSimpMusicLyrics(
         if (LyricsIdentityGuard.contradictsTrack(rawMapped, expectedTitle, expectedArtist)) continue
         val level = LyricsQuality.level(rawMapped)
         if (level <= LyricsQuality.LEVEL_INVALID) continue
+        val isSyncedCandidate = level >= LyricsQuality.LEVEL_LINE_SYNCED
+        if (isSyncedCandidate &&
+            !LyricsMetadataMatcher.editionsCompatibleForSync(
+                expectedTitle = expectedTitle,
+                candidateTitle = candidate.songTitle.takeIf { it.isNotBlank() } ?: embeddedMeta.title,
+                candidateAlbum = candidate.albumName.takeIf { it.isNotBlank() },
+            )
+        ) {
+            continue
+        }
+        if (LyricsContentQualityGuard.hasInvalidOrMismatchedSyncedTiming(rawMapped, validExpectedDur)) continue
+
         val mapped =
             LyricsContentQualityGuard
                 .stripAsrSoundCueLines(rawMapped)
                 .copy(simpMusicLyrics = SimpMusicLyrics(id = candidate.id, vote = candidate.vote))
         val overflow = LyricsQuality.hasSyncedTimestampOverflow(mapped, validExpectedDur)
+        val requiresVerification =
+            candidate.vote <= 0 ||
+                candidate.songTitle.isBlank() ||
+                candidate.artistName.isBlank()
         val isBetter =
             level > bestLevel ||
                 (level == bestLevel && bestOverflow && !overflow) ||
@@ -1623,8 +1709,8 @@ internal fun pickBestSimpMusicLyrics(
             bestLevel = level
             bestOverflow = overflow
             bestVote = candidate.vote
-            bestLyrics = mapped
+            bestPicked = PickedSimpMusicLyrics(lyrics = mapped, requiresVerification = requiresVerification)
         }
     }
-    return bestLyrics
+    return bestPicked
 }

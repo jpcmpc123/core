@@ -279,7 +279,14 @@ class SimpMusicLyricsClient(
                             return@suspendRunCatching LrclibSearchResult.ConfirmedInstrumental
                         }
                         if (metaOk && !exact.instrumental) {
-                            if (exact.hasWordSync || !exact.syncedLyrics.isNullOrBlank()) {
+                            val exactTitle = exact.trackName?.takeIf { it.isNotBlank() } ?: exact.name
+                            val editionOkForSync =
+                                LyricsMetadataMatcher.editionsCompatibleForSync(
+                                    expectedTitle = q_track,
+                                    candidateTitle = exactTitle,
+                                    candidateAlbum = exact.albumName,
+                                )
+                            if (editionOkForSync && (exact.hasWordSync || !exact.syncedLyrics.isNullOrBlank())) {
                                 val overflowMs = lrclibSyncedOverflowMs(exact, validDuration)
                                 val truncated = isLrclibSyncedLikelyTruncated(exact, validDuration)
                                 if (overflowMs == 0L && !truncated) {
@@ -314,9 +321,18 @@ class SimpMusicLyricsClient(
                                 expectedArtist = q_artist,
                             )
                         if (best != null) {
-                            val bestHasSync = best.hasWordSync || !best.syncedLyrics.isNullOrBlank()
+                            val bestTitle = best.trackName?.takeIf { it.isNotBlank() } ?: best.name
+                            val bestEditionOk =
+                                LyricsMetadataMatcher.editionsCompatibleForSync(
+                                    expectedTitle = q_track,
+                                    candidateTitle = bestTitle,
+                                    candidateAlbum = best.albumName,
+                                )
+                            val bestHasSync = bestEditionOk && (best.hasWordSync || !best.syncedLyrics.isNullOrBlank())
                             if (!bestHasSync) {
-                                parseLrclibLyrics(best)?.let { return@suspendRunCatching LrclibSearchResult.Found(it) }
+                                if (!best.plainLyrics.isNullOrBlank() && plainFallbackRecord == null) {
+                                    plainFallbackRecord = best
+                                }
                             } else {
                                 val overflowMs = lrclibSyncedOverflowMs(best, validDuration)
                                 val truncated = isLrclibSyncedLikelyTruncated(best, validDuration)
@@ -351,7 +367,18 @@ class SimpMusicLyricsClient(
                 } else {
                     null
                 }
-            (bestDeferred ?: plainFallbackRecord)
+            val chosen = bestDeferred ?: plainFallbackRecord
+            val chosenTitle = chosen?.trackName?.takeIf { it.isNotBlank() } ?: chosen?.name
+            val chosenSyncOk =
+                chosen != null &&
+                    LyricsMetadataMatcher.editionsCompatibleForSync(q_track, chosenTitle, chosen.albumName)
+            val normalizedChosen =
+                if (chosen != null && !chosenSyncOk && !chosen.plainLyrics.isNullOrBlank()) {
+                    chosen.copy(syncedLyrics = null, hasWordSync = false)
+                } else {
+                    chosen
+                }
+            normalizedChosen
                 ?.let { parseLrclibLyrics(it) }
                 ?.let { LrclibSearchResult.Found(it) }
                 ?: LrclibSearchResult.NotFound
@@ -384,13 +411,18 @@ class SimpMusicLyricsClient(
                                 expectedTitle = q_track,
                                 expectedArtist = q_artist,
                             )
+                        val editionOk =
+                            LyricsMetadataMatcher.editionsCompatibleForSync(
+                                expectedTitle = q_track,
+                                candidateTitle = ttmlMeta.title,
+                            )
                         val durationOk =
                             LyricsMetadataMatcher.durationsMatch(
                                 expectedSeconds = validDuration,
                                 candidateSeconds = ttmlMeta.durationSeconds,
-                                toleranceSeconds = 20,
+                                toleranceSeconds = 6,
                             )
-                        if (!tagsContradict && durationOk) {
+                        if (!tagsContradict && editionOk && durationOk) {
                             return@suspendRunCatching ttml
                         }
                     }
@@ -666,6 +698,10 @@ internal fun isLrclibSyncedLikelyTruncated(
     return maxSungStartMs > 0L && maxSungStartMs < (validDuration * 1_000L * LRCLIB_TRUNCATED_COVERAGE_THRESHOLD).toLong()
 }
 
+private const val LRCLIB_SYNCED_DURATION_TOLERANCE_SECONDS = 5
+private const val LRCLIB_TIGHT_JITTER_SECONDS = 2
+private const val LRCLIB_PLAIN_DURATION_TOLERANCE_SECONDS = 10
+
 internal fun selectLrclibLyricsRecord(
     records: List<LrclibObject>,
     duration: Int?,
@@ -679,25 +715,51 @@ internal fun selectLrclibLyricsRecord(
                 (!candidate.syncedLyrics.isNullOrBlank() || !candidate.plainLyrics.isNullOrBlank()) &&
                 lrclibMetadataMatches(candidate, expectedTrack, expectedArtist)
         }
-    val candidates =
-        if (validDuration != null) {
-            usable.filter { abs(it.duration.toInt() - validDuration) <= 10 }
-        } else {
-            usable
-        }
-    if (candidates.isEmpty()) return null
+    if (usable.isEmpty()) return null
 
-    val syncedCandidates = candidates.filter { it.hasWordSync || !it.syncedLyrics.isNullOrBlank() }
+    val syncedCandidates =
+        usable.filter { candidate ->
+            val hasSync = candidate.hasWordSync || !candidate.syncedLyrics.isNullOrBlank()
+            if (!hasSync) return@filter false
+            val durOk =
+                validDuration == null ||
+                    abs(candidate.duration.toInt() - validDuration) <= LRCLIB_SYNCED_DURATION_TOLERANCE_SECONDS
+            if (!durOk) return@filter false
+            val candTitle = candidate.trackName?.takeIf { it.isNotBlank() } ?: candidate.name
+            LyricsMetadataMatcher.editionsCompatibleForSync(
+                expectedTitle = expectedTrack,
+                candidateTitle = candTitle,
+                candidateAlbum = candidate.albumName,
+            )
+        }
     if (syncedCandidates.isNotEmpty()) {
         return syncedCandidates.minWith(
             compareBy<LrclibObject>(
                 { lrclibSyncedOverflowMs(it, validDuration) > 0L },
                 { isLrclibSyncedLikelyTruncated(it, validDuration) },
+                { if (validDuration != null) abs(it.duration.toInt() - validDuration) > LRCLIB_TIGHT_JITTER_SECONDS else false },
                 { !it.hasWordSync },
+                { if (validDuration != null) abs(it.duration.toInt() - validDuration) else 0 },
                 { lrclibSyncedOverflowMs(it, validDuration) },
                 { -analyzeLrclibTiming(it, validDuration).maxSungStartMs },
             ),
         )
     }
-    return candidates.firstOrNull { !it.plainLyrics.isNullOrBlank() }
+
+    val plainPool =
+        if (validDuration != null) {
+            usable.filter { abs(it.duration.toInt() - validDuration) <= LRCLIB_PLAIN_DURATION_TOLERANCE_SECONDS }
+        } else {
+            usable
+        }
+    return plainPool
+        .filter { !it.plainLyrics.isNullOrBlank() }
+        .minByOrNull { if (validDuration != null) abs(it.duration.toInt() - validDuration) else 0 }
+        ?.let { chosen ->
+            if (chosen.hasWordSync || !chosen.syncedLyrics.isNullOrBlank()) {
+                chosen.copy(syncedLyrics = null, hasWordSync = false)
+            } else {
+                chosen
+            }
+        }
 }

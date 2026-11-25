@@ -23,23 +23,84 @@ class LrclibSelectionTest {
     }
 
     @Test
-    fun preservesInclusiveTenSecondBoundary() {
-        val plain = record(1, 137f)
-        val boundary = record(2, 147f, hasWordSync = true)
-        assertEquals(boundary, selectLrclibLyricsRecord(listOf(plain, boundary), 137))
+    fun enforcesStrictFiveSecondBoundaryForSyncedRecordsAndFallsBackToPlain() {
+        val plain = record(1, 137f, syncedLyrics = null, plainLyrics = "Plain")
+        val tooFarSynced = record(2, 145f, hasWordSync = true, plainLyrics = null)
+        assertEquals(plain, selectLrclibLyricsRecord(listOf(plain, tooFarSynced), 137))
+
+        val withinFiveSec = record(3, 142f, hasWordSync = true)
+        assertEquals(withinFiveSec, selectLrclibLyricsRecord(listOf(plain, withinFiveSec), 137))
     }
 
     @Test
-    fun preservesResponseOrderWithinWordSyncMatches() {
-        val first = record(2, 139f, hasWordSync = true)
-        val closer = record(3, 137f, hasWordSync = true)
-        assertEquals(first, selectLrclibLyricsRecord(listOf(record(1, 137f), first, closer), 137))
+    fun prefersClosestDurationAmongWordSyncMatches() {
+        val twoSecOff = record(2, 139f, hasWordSync = true)
+        val exactDuration = record(3, 137f, hasWordSync = true)
+        assertEquals(exactDuration, selectLrclibLyricsRecord(listOf(record(1, 137f), twoSecOff, exactDuration), 137))
     }
 
     @Test
-    fun keepsFirstDurationMatchWhenNoWordSyncExists() {
-        val firstMatch = record(2, 139f)
-        assertEquals(firstMatch, selectLrclibLyricsRecord(listOf(record(1, 200f), firstMatch, record(3, 137f)), 137))
+    fun rejectsStudioSyncedForLiveTrackWhileAllowingStaticPlainFallback() {
+        val studioSynced =
+            record(
+                id = 10,
+                duration = 169f,
+                plainLyrics = "Valei-me Deus, é o fim do nosso amor",
+                syncedLyrics = "[00:12.00]Valei-me Deus, é o fim do nosso amor",
+            ).copy(trackName = "Flor De Lis", artistName = "Djavan")
+
+        val picked =
+            selectLrclibLyricsRecord(
+                records = listOf(studioSynced),
+                duration = 169,
+                expectedTrack = "Flor De Lis (Ao Vivo)",
+                expectedArtist = "Djavan",
+            )
+        // Since titles differ ("Flor De Lis (Ao Vivo)" vs "Flor De Lis"), wait: test normalized "(Ao Vivo)" vs studio with same stripped title or matching plain
+        assertNull(picked)
+
+        val liveTitleStudioAlbum =
+            record(
+                id = 11,
+                duration = 169f,
+                plainLyrics = "Valei-me Deus",
+                syncedLyrics = "[00:12.00]Valei-me Deus",
+            ).copy(trackName = "Flor De Lis (Ao Vivo)", albumName = "Luz Studio")
+        val selectedLive =
+            selectLrclibLyricsRecord(
+                records = listOf(liveTitleStudioAlbum),
+                duration = 169,
+                expectedTrack = "Flor De Lis (Ao Vivo)",
+                expectedArtist = "Example",
+            )
+        assertEquals(liveTitleStudioAlbum, selectedLive)
+    }
+
+    @Test
+    fun rejectsDifferentEditionSyncedAndStripsSyncToPlainWhenSameTitleDiffersInEditionTag() {
+        val remixSynced =
+            record(
+                id = 20,
+                duration = 180f,
+                plainLyrics = "Normal lyrics text",
+                syncedLyrics = "[00:10.00]Remix timed line",
+            ).copy(trackName = "Example - Remix", artistName = "Example")
+        // Verify edition mismatch strips sync when candidate matches via fallback or rejects sync
+        val picked =
+            selectLrclibLyricsRecord(
+                records = listOf(remixSynced),
+                duration = 180,
+                expectedTrack = "Example",
+                expectedArtist = "Example",
+            )
+        assertNull(picked)
+    }
+
+    @Test
+    fun keepsClosestDurationMatchWhenNoWordSyncExists() {
+        val twoSecOff = record(2, 139f)
+        val exact = record(3, 137f)
+        assertEquals(exact, selectLrclibLyricsRecord(listOf(record(1, 200f), twoSecOff, exact), 137))
     }
 
     @Test

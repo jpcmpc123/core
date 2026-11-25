@@ -86,19 +86,76 @@ class SimpMusicLyricsSelectionTest {
         )
     }
 
+    @Test
+    fun rejectsSyncOutsideFiveSecondToleranceAndMismatchedLiveEditionAndFlagsUnvotedForVerification() {
+        val tooFar =
+            candidate(
+                id = "far-12s",
+                vote = 10,
+                durationSeconds = 192,
+                syncedLyrics = "[00:05.00]Line\n[00:10.00]Two",
+            )
+        val liveWrongEdition =
+            candidate(
+                id = "studio-for-live",
+                vote = 10,
+                songTitle = "Flor De Lis",
+                albumName = "Luz Studio",
+                durationSeconds = 180,
+                syncedLyrics = "[00:05.00]Valei-me Deus\n[00:10.00]E o fim",
+            )
+        assertNull(
+            pickBestSimpMusicCandidate(
+                candidates = listOf(tooFar),
+                expectedTitle = "Song",
+                expectedArtist = "Artist",
+                expectedDurationSeconds = 180,
+            ),
+        )
+        assertNull(
+            pickBestSimpMusicCandidate(
+                candidates = listOf(liveWrongEdition),
+                expectedTitle = "Flor De Lis (Ao Vivo)",
+                expectedArtist = "Artist",
+                expectedDurationSeconds = 180,
+            ),
+        )
+
+        val unvoted =
+            candidate(
+                id = "zero-vote",
+                vote = 0,
+                durationSeconds = 182,
+                syncedLyrics = "[00:05.00]Matching line one\n[00:10.00]Matching line two",
+            )
+        val picked =
+            assertNotNull(
+                pickBestSimpMusicCandidate(
+                    candidates = listOf(unvoted),
+                    expectedTitle = "Song",
+                    expectedArtist = "Artist",
+                    expectedDurationSeconds = 180,
+                ),
+            )
+        kotlin.test.assertTrue(picked.requiresVerification)
+    }
+
     private fun candidate(
         id: String,
         vote: Int,
         richSyncLyrics: String? = null,
         syncedLyrics: String? = null,
         plainLyric: String = "",
+        songTitle: String = "Song",
+        albumName: String = "Album",
+        durationSeconds: Int = 180,
     ) = LyricsResponse(
         id = id,
         videoId = "vid1",
-        songTitle = "Song",
+        songTitle = songTitle,
         artistName = "Artist",
-        albumName = "Album",
-        durationSeconds = 180,
+        albumName = albumName,
+        durationSeconds = durationSeconds,
         plainLyric = plainLyric,
         syncedLyrics = syncedLyrics,
         richSyncLyrics = richSyncLyrics,

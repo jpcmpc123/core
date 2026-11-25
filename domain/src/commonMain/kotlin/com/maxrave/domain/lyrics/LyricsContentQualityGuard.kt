@@ -211,6 +211,50 @@ object LyricsContentQualityGuard {
         return lyrics.copy(lines = filtered)
     }
 
+    /**
+     * Detects clearly broken or wrong-cut synced timing:
+     * - all sung lines collapsed at <= 0ms;
+     * - severe overshoot (> trackDuration + 8s);
+     * - severe truncation (< 35% of track duration on tracks >= 90s when lines >= 5);
+     * - multiple severe non-monotonic backward jumps (> 5s).
+     */
+    fun hasInvalidOrMismatchedSyncedTiming(
+        lyrics: Lyrics?,
+        durationSeconds: Int?,
+    ): Boolean {
+        val lines = lyrics?.lines ?: return false
+        if (lyrics.syncType != "LINE_SYNCED" && lyrics.syncType != "RICH_SYNCED") return false
+        if (lines.isEmpty()) return false
+
+        var prevTs = -1L
+        var severeBackwardJumps = 0
+        var maxSungMs = 0L
+        var sungLineCount = 0
+
+        for (line in lines) {
+            val plain = stripRichTags(line.words)
+            val ts = line.startTimeMs.toLongOrNull() ?: continue
+            if (plain.isNotEmpty() && plain != "♫" && plain != "♪") {
+                sungLineCount++
+                if (ts > maxSungMs) maxSungMs = ts
+                if (prevTs >= 0L && ts + 5_000L < prevTs) {
+                    severeBackwardJumps++
+                }
+                prevTs = ts
+            }
+        }
+        if (sungLineCount >= 2 && maxSungMs <= 0L) return true
+        if (severeBackwardJumps > 2) return true
+
+        val validDuration = durationSeconds?.takeIf { it > 0 } ?: return false
+        val durationMs = validDuration * 1_000L
+        if (maxSungMs > durationMs + 8_000L) return true
+        if (validDuration >= 90 && sungLineCount >= 5 && maxSungMs < (durationMs * 0.35).toLong()) {
+            return true
+        }
+        return false
+    }
+
     private fun isTinyOrFragmentLine(plainLine: String): Boolean {
         val tokens = NON_WORD_SPLIT_REGEX.split(plainLine).filter { it.isNotEmpty() }
         if (tokens.isEmpty()) return true

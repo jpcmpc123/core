@@ -20,66 +20,154 @@ private val FEAT_TAIL_REGEX = Regex("""\s+(?:feat\.?|ft\.?|featuring)\s+.*$""", 
 private val TITLE_ARTIST_SEPARATORS = listOf(" - ", " – ", " — ", " － ", " | ", " / ", " ／ ", " • ", " : ", " ： ")
 private val PAREN_GROUP_REGEX = Regex("""[\(\[（［]([^\)\]）］]+)[\)\]）］]""")
 private val ARTIST_SPLIT_CHARS_REGEX = Regex("""[,&•/／・、;]""")
+private const val INTRO_CREDIT_MAX_TIME_MS = 3_500L
+private const val INTRO_CREDIT_MIN_VOCAL_GAP_MS = 7_000L
+
 private val EXPLICIT_CREDIT_PREFIXES =
     listOf(
         "lyrics by:",
         "lyrics by ",
         "lyric by:",
         "lyric by ",
+        "lyricist:",
+        "lyricist ",
+        "songwriter:",
+        "songwriter ",
         "written by:",
         "written by ",
         "composed by:",
         "composed by ",
+        "composer:",
+        "composer ",
         "produced by:",
         "produced by ",
+        "producer:",
+        "producer ",
         "arranged by:",
         "arranged by ",
+        "arranger:",
+        "arranger ",
+        "performed by:",
+        "performed by ",
+        "vocals by:",
+        "vocals by ",
+        "words by:",
+        "words by ",
+        "music by:",
+        "music by ",
         "synced by:",
         "synced by ",
         "lrc by:",
         "lrc by ",
+        "source:",
+        "fonte:",
         "letra:",
         "letra por:",
         "letra por ",
+        "letra e música:",
+        "letra e musica:",
         "composição:",
         "composicao:",
         "compositor:",
+        "intérprete:",
+        "interprete:",
+        "produção:",
+        "producao:",
         "tradução por:",
         "traducao por:",
         "title:",
         "artist:",
         "album:",
         "作词",
+        "作詞",
+        "作詩",
+        "補作詞",
+        "訳詞",
         "作曲",
+        "補作曲",
         "编曲",
+        "編曲",
         "制作",
+        "製作",
+        "演唱",
+        "演奏",
+        "収録",
         "歌词",
+        "歌詞",
         "词：",
         "词:",
+        "詞：",
+        "詞:",
+        "詞/",
+        "詞／",
         "曲：",
         "曲:",
+        "曲/",
+        "曲／",
+        "歌：",
+        "歌:",
+        "唄：",
+        "唄:",
     )
+
+private val DESCRIPTION_CREDIT_LINE_REGEX =
+    Regex(
+        """^\s*(?:composer\s+lyricist|lyricist|composer|writer|author|arranger|producer|letra|composi[çc][ãa]o|compositor|作詞|作詩|作曲|編曲)\s*[:：]\s*(.+)$""",
+        RegexOption.IGNORE_CASE,
+    )
+private val CREDIT_NAME_SPLIT_REGEX = Regex("""[,/&•／・、;]|\band\b|\be\b""", RegexOption.IGNORE_CASE)
+private val LATIN_PERSON_NAME_REGEX =
+    Regex("""^[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'-]+(?:\s+[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'-]+){1,2}$""")
 
 /**
  * Strips leading/trailing metadata header lines (e.g. `Manic Pixie Dream Girl - EASHA` at 00:00,
  * bilingual headers like `少女A (Young Girl A) - 椎名もた (ぽわぽわP) / 鏡音鈴 (鏡音リン)`,
- * consecutive `Title` / `Artist` header pairs, or `Lyrics by:` / `Written by:` credits) that
- * community LRC/RichSync providers sometimes embed as timed lines.
+ * consecutive `Title` / `Artist` header pairs, or `Lyrics by:` / `作詞:` / `三浦徳子` credits)
+ * that community LRC/RichSync providers sometimes embed as timed lines.
  *
  * Designed to run off the Main thread in `Dispatchers.Default` and be strictly conservative so real
  * sung choruses that happen to contain the song title are never removed.
  */
 object LyricsHeaderSanitizer {
+    /**
+     * Extracts individual songwriter / lyricist / composer names from YouTube Music's
+     * auto-generated track description (`Composer Lyricist: ...`, `Lyricist: ...`, etc.).
+     */
+    fun extractCreditNamesFromDescription(description: String?): Set<String> {
+        if (description.isNullOrBlank()) return emptySet()
+        val names = LinkedHashSet<String>(4)
+        for (rawLine in description.lineSequence()) {
+            val match = DESCRIPTION_CREDIT_LINE_REGEX.matchEntire(rawLine.trim()) ?: continue
+            val payload = match.groupValues[1].trim()
+            if (payload.isEmpty()) continue
+            normalizeComparable(payload).takeIf { it.length >= 2 }?.let(names::add)
+            CREDIT_NAME_SPLIT_REGEX.split(payload).forEach { part ->
+                val cleaned = normalizeComparable(part)
+                if (cleaned.length >= 2) {
+                    names.add(cleaned)
+                }
+            }
+        }
+        return names
+    }
+
     fun sanitize(
         lyrics: Lyrics,
         songTitle: String?,
         artistName: String?,
+        extraCreditNames: Set<String> = emptySet(),
     ): Lyrics {
         val originalLines = lyrics.lines
         if (originalLines.isNullOrEmpty() || originalLines.size <= 1) return lyrics
 
         val titleVariants = extractTitleVariants(songTitle.orEmpty())
         val primaryArtists = splitArtists(artistName.orEmpty())
+        val normalizedCredits =
+            extraCreditNames
+                .asSequence()
+                .map(::normalizeComparable)
+                .filter { it.length >= 2 }
+                .toSet()
         val isUnsynced = lyrics.syncType != "LINE_SYNCED" && lyrics.syncType != "RICH_SYNCED"
 
         val dropIndices = HashSet<Int>(4)
@@ -87,6 +175,13 @@ object LyricsHeaderSanitizer {
             originalLines.map { line ->
                 stripRichSyncTags(line.words)
             }
+        val lineFrequency =
+            plainTexts
+                .asSequence()
+                .map(::normalizeComparable)
+                .filter { it.isNotEmpty() }
+                .groupingBy { it }
+                .eachCount()
 
         // 1. Consecutive [Title, Artist] or [Artist, Title] pair at the very start (<= 5s).
         if (titleVariants.isNotEmpty() && primaryArtists.isNotEmpty() && originalLines.size >= 3) {
@@ -104,7 +199,7 @@ object LyricsHeaderSanitizer {
             }
         }
 
-        // 2. Combined "Title - Artist" / "Artist - Title" or explicit credits near the start.
+        // 2. Combined "Title - Artist", explicit credits, or known songwriter credits near the start.
         val headLimit = minOf(originalLines.size - 1, CREDIT_HEAD_SCAN_LIMIT)
         for (i in 0 until headLimit) {
             if (i in dropIndices) continue
@@ -117,6 +212,14 @@ object LyricsHeaderSanitizer {
                 continue
             }
 
+            if (normalizedCredits.isNotEmpty() &&
+                (isUnsynced || startMs <= HEADER_TITLE_ARTIST_MAX_TIME_MS) &&
+                matchesKnownCredit(plain, normalizedCredits)
+            ) {
+                dropIndices.add(i)
+                continue
+            }
+
             if (i < HEAD_SCAN_LIMIT &&
                 (isUnsynced || startMs <= HEADER_TITLE_ARTIST_MAX_TIME_MS) &&
                 titleVariants.isNotEmpty() &&
@@ -124,10 +227,26 @@ object LyricsHeaderSanitizer {
                 isTitleArtistHeaderLine(plain, titleVariants, primaryArtists)
             ) {
                 dropIndices.add(i)
+                continue
+            }
+
+            if (!isUnsynced &&
+                i <= 1 &&
+                startMs <= INTRO_CREDIT_MAX_TIME_MS &&
+                looksLikeStandaloneIntroCredit(
+                    plain = plain,
+                    startMs = startMs,
+                    originalLines = originalLines,
+                    plainTexts = plainTexts,
+                    lineIndex = i,
+                    occurrenceCount = lineFrequency[normalizeComparable(plain)] ?: 1,
+                )
+            ) {
+                dropIndices.add(i)
             }
         }
 
-        // 3. Explicit technical credits in the trailing 2 lines (e.g. "Synced by X").
+        // 3. Explicit technical credits in the trailing 2 lines (e.g. "Synced by X", "Source: Musixmatch").
         val tailStart = (originalLines.size - CREDIT_TAIL_SCAN_LIMIT).coerceAtLeast(headLimit)
         for (i in tailStart until originalLines.size) {
             if (isExplicitCreditLine(plainTexts[i])) {
@@ -235,6 +354,60 @@ object LyricsHeaderSanitizer {
         val lower = plainLine.trim().lowercase()
         if (lower.isEmpty()) return false
         return EXPLICIT_CREDIT_PREFIXES.any { prefix -> lower.startsWith(prefix) }
+    }
+
+    private fun matchesKnownCredit(
+        plainLine: String,
+        normalizedCredits: Set<String>,
+    ): Boolean {
+        val whole = normalizeComparable(plainLine)
+        if (whole.isNotEmpty() && whole in normalizedCredits) return true
+        val parts = CREDIT_NAME_SPLIT_REGEX.split(normalizeFullwidth(plainLine))
+        if (parts.size > 1) {
+            val nonEmptyParts = parts.map(::normalizeComparable).filter { it.isNotEmpty() }
+            if (nonEmptyParts.isNotEmpty() && nonEmptyParts.all { it in normalizedCredits }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun looksLikeStandaloneIntroCredit(
+        plain: String,
+        startMs: Long,
+        originalLines: List<Line>,
+        plainTexts: List<String>,
+        lineIndex: Int,
+        occurrenceCount: Int,
+    ): Boolean {
+        if (occurrenceCount > 1) return false
+        val trimmed = plain.trim()
+        if (trimmed.length !in 2..20) return false
+        if (trimmed.any { it == '!' || it == '?' || it == '！' || it == '？' || it == ',' || it == '、' || it == '。' || it == '…' }) {
+            return false
+        }
+
+        // Find the first actual vocal line after this intro credit.
+        var nextVocalMs: Long? = null
+        for (j in (lineIndex + 1) until originalLines.size) {
+            val nextPlain = plainTexts[j]
+            if (nextPlain.isEmpty() || nextPlain == "♫" || nextPlain == "♪") continue
+            val ts = originalLines[j].startTimeMs.toLongOrNull() ?: continue
+            nextVocalMs = ts
+            break
+        }
+        val gapMs = (nextVocalMs ?: return false) - startMs
+        if (gapMs < INTRO_CREDIT_MIN_VOCAL_GAP_MS) return false
+
+        // Shape A: Pure CJK Kanji/Hanzi personal name (2..5 ideographs, zero kana/digits), e.g. `三浦徳子`.
+        val noSpace = trimmed.filterNot { it.isWhitespace() }
+        val isPureKanjiName =
+            noSpace.length in 2..5 &&
+                noSpace.all { ch -> ch.code in 0x4E00..0x9FFF }
+        if (isPureKanjiName) return true
+
+        // Shape B: Clean 2..3-word Title-Cased Latin personal name at 00:00..00:03.5 with long intro gap.
+        return LATIN_PERSON_NAME_REGEX.matches(trimmed)
     }
 
     private fun extractTitleVariants(rawTitle: String): Set<String> {

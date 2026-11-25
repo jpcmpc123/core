@@ -206,10 +206,13 @@ private val TTML_SPAN_TAG_REGEX = Regex("""<(/?)span(?=\s|>|/)([^>]*)>""", Regex
 private val TTML_BEGIN_ATTR_REGEX = Regex("""\bbegin\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 private val TTML_END_ATTR_REGEX = Regex("""\bend\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 private val TTML_IGNORED_ROLE_REGEX =
-    Regex("""\b(?:ttm:)?role\s*=\s*["']\s*(?:x-translation|x-roman)\s*["']""", RegexOption.IGNORE_CASE)
+    Regex(
+        """\b(?:(?:ttm:)?role\s*=\s*["']\s*(?:x-translation|x-roman|x-credit|credit|x-meta|x-header|x-lyricist|x-composer|x-songwriter)\s*["']|itunes:songPart\s*=\s*["']\s*credit\s*["'])""",
+        RegexOption.IGNORE_CASE,
+    )
 private val TTML_IGNORED_SPAN_REGEX =
     Regex(
-        """<span\b[^>]*\b(?:ttm:)?role\s*=\s*["']\s*(?:x-translation|x-roman)\s*["'][^>]*>[\s\S]*?</span\s*>""",
+        """<span\b[^>]*\b(?:ttm:)?role\s*=\s*["']\s*(?:x-translation|x-roman|x-credit|credit|x-meta|x-header|x-lyricist|x-composer|x-songwriter)\s*["'][^>]*>[\s\S]*?</span\s*>""",
         RegexOption.IGNORE_CASE,
     )
 private val TTML_BR_TAG_REGEX = Regex("""<br\s*/?>""", RegexOption.IGNORE_CASE)
