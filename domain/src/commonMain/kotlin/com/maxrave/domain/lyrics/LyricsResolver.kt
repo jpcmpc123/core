@@ -225,6 +225,29 @@ class LyricsResolver(
                 return null
             }
 
+            var pendingUnsyncedCandidate: LyricsResolution? = null
+            var pendingUnsyncedFromVerified = false
+
+            fun hasPendingSyncedSource(): Boolean =
+                sources.any { candidateSource ->
+                    candidateSource != LyricsSource.YTM_OFFICIAL &&
+                        candidateSource != LyricsSource.YOUTUBE &&
+                        candidateSource !in finishedSources
+                }
+
+            fun recordPendingUnsynced(
+                resolution: LyricsResolution,
+                fromVerified: Boolean,
+            ) {
+                if (pendingUnsyncedCandidate == null ||
+                    (fromVerified && !pendingUnsyncedFromVerified) ||
+                    resolution.source == LyricsSource.YTM_OFFICIAL
+                ) {
+                    pendingUnsyncedCandidate = resolution
+                    pendingUnsyncedFromVerified = fromVerified
+                }
+            }
+
             suspend fun tryFlushPendingBlindCandidate() {
                 val pending = pendingBlindCandidate ?: return
                 if (verifiedBestLyrics == null && hasPendingVerificationSource()) return
@@ -259,6 +282,17 @@ class LyricsResolver(
                             )
                         }
                     }
+                    return
+                }
+
+                if (pendingBlindLevel == LyricsQuality.LEVEL_UNSYNCED && hasPendingSyncedSource()) {
+                    recordPendingUnsynced(
+                        resolution = pending.copy(simpMusicNotFoundObserved = simpMusicNotFoundObserved),
+                        fromVerified = pending.source.isCatalogVerified(),
+                    )
+                    pendingBlindCandidate = null
+                    pendingBlindLevel = LyricsQuality.LEVEL_INVALID
+                    pendingBlindOverflow = false
                     return
                 }
 
@@ -413,33 +447,8 @@ class LyricsResolver(
                                     pendingBlindOverflow = candidateOverflow
                                 }
                             } else if (!needsConsensus || canAcceptBlindCandidate(outcome.lyrics)) {
-                                val signature = LyricsQuality.contentSignature(outcome.lyrics)
-                                val isStaleMigrationReplace =
-                                    currentFromCache &&
-                                        request.revalidateStaleCache &&
-                                        !onlineAcceptedAny &&
-                                        (!candidateOverflow || currentBestOverflow)
-                                val isSameTierCacheRefresh =
-                                    currentFromCache &&
-                                        source == request.preferredSource &&
-                                        candidateLevel == currentBestLevel &&
-                                        signature != cachedSignature &&
-                                        (!candidateOverflow || currentBestOverflow)
-                                val isTimingFix =
-                                    currentBestLyrics != null &&
-                                        candidateLevel == currentBestLevel &&
-                                        currentBestOverflow &&
-                                        !candidateOverflow
-                                val isUpgrade = candidateLevel > currentBestLevel
-                                val activeSource = currentBestSource
-                                val isIdentityCorrection =
-                                    source.isCatalogVerified() &&
-                                        currentBestLyrics != null &&
-                                        activeSource != null &&
-                                        !activeSource.isCatalogVerified() &&
-                                        LyricsIdentityGuard.checkTextualConsensus(outcome.lyrics, currentBestLyrics) == TextualConsensus.CONFLICT
-                                if (isUpgrade || isTimingFix || isSameTierCacheRefresh || isIdentityCorrection || isStaleMigrationReplace) {
-                                    emitCandidate(
+                                if (candidateLevel == LyricsQuality.LEVEL_UNSYNCED && hasPendingSyncedSource()) {
+                                    recordPendingUnsynced(
                                         resolution =
                                             LyricsResolution(
                                                 videoId = request.videoId,
@@ -450,9 +459,50 @@ class LyricsResolver(
                                                 simpMusicNotFoundObserved = simpMusicNotFoundObserved,
                                                 attribution = outcome.attribution,
                                             ),
-                                        level = candidateLevel,
-                                        overflow = candidateOverflow,
+                                        fromVerified = source.isCatalogVerified(),
                                     )
+                                } else {
+                                    val signature = LyricsQuality.contentSignature(outcome.lyrics)
+                                    val isStaleMigrationReplace =
+                                        currentFromCache &&
+                                            request.revalidateStaleCache &&
+                                            !onlineAcceptedAny &&
+                                            (!candidateOverflow || currentBestOverflow)
+                                    val isSameTierCacheRefresh =
+                                        currentFromCache &&
+                                            source == request.preferredSource &&
+                                            candidateLevel == currentBestLevel &&
+                                            signature != cachedSignature &&
+                                            (!candidateOverflow || currentBestOverflow)
+                                    val isTimingFix =
+                                        currentBestLyrics != null &&
+                                            candidateLevel == currentBestLevel &&
+                                            currentBestOverflow &&
+                                            !candidateOverflow
+                                    val isUpgrade = candidateLevel > currentBestLevel
+                                    val activeSource = currentBestSource
+                                    val isIdentityCorrection =
+                                        source.isCatalogVerified() &&
+                                            currentBestLyrics != null &&
+                                            activeSource != null &&
+                                            !activeSource.isCatalogVerified() &&
+                                            LyricsIdentityGuard.checkTextualConsensus(outcome.lyrics, currentBestLyrics) == TextualConsensus.CONFLICT
+                                    if (isUpgrade || isTimingFix || isSameTierCacheRefresh || isIdentityCorrection || isStaleMigrationReplace) {
+                                        emitCandidate(
+                                            resolution =
+                                                LyricsResolution(
+                                                    videoId = request.videoId,
+                                                    lyrics = outcome.lyrics,
+                                                    source = source,
+                                                    fromCache = false,
+                                                    youtubeTranslatedLyrics = outcome.translatedLyrics,
+                                                    simpMusicNotFoundObserved = simpMusicNotFoundObserved,
+                                                    attribution = outcome.attribution,
+                                                ),
+                                            level = candidateLevel,
+                                            overflow = candidateOverflow,
+                                        )
+                                    }
                                 }
                             }
                         } else {
@@ -475,14 +525,20 @@ class LyricsResolver(
                 }
 
                 // If primary finished (with not-found, < RICH_SYNCED, or overflowing timestamps),
-                // or a blind/unverified candidate needs verification, or we have no lyrics yet: launch others immediately.
-                if (source == primary || currentBestLyrics == null || pendingBlindCandidate != null || (currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny)) {
+                // or a blind/unverified candidate needs verification, or we have no synced lyrics yet: launch others immediately.
+                if (source == primary ||
+                    currentBestLyrics == null ||
+                    pendingBlindCandidate != null ||
+                    pendingUnsyncedCandidate != null ||
+                    (currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny)
+                ) {
                     val allowMoreSources =
                         currentBestLyrics == null ||
                             request.allowUpgradeScan ||
                             request.revalidateStaleCache ||
                             currentBestOverflow ||
-                            (pendingBlindCandidate != null && hasPendingVerificationSource())
+                            (pendingBlindCandidate != null && hasPendingVerificationSource()) ||
+                            (pendingUnsyncedCandidate != null && hasPendingSyncedSource())
                     if (allowMoreSources) {
                         hedgeJob?.cancel()
                         ensureOthersLaunched()
@@ -496,8 +552,8 @@ class LyricsResolver(
 
             tryFlushPendingBlindCandidate()
 
-            // Official static lyrics fallback (YouTube Music Musixmatch/LyricFind -> Letras.mus.br):
-            // queried when no online synced provider matched cleanly (including Live/Remix tracks
+            // Official static lyrics fallback (YouTube Music Musixmatch/LyricFind -> held online UNSYNCED -> Letras.mus.br):
+            // queried/flushed only when no online synced provider matched cleanly (including Live/Remix tracks
             // where stale cache must be superseded by accurate unsynced lyrics).
             if (currentBestLyrics == null || (currentFromCache && request.revalidateStaleCache && !onlineAcceptedAny)) {
                 if (!ytmOfficialJudgeChecked || !letrasJudgeChecked) {
@@ -518,6 +574,15 @@ class LyricsResolver(
                         level = LyricsQuality.level(judgeLyrics),
                         overflow = false,
                     )
+                } else {
+                    val heldUnsynced = pendingUnsyncedCandidate
+                    if (heldUnsynced != null) {
+                        emitCandidate(
+                            resolution = heldUnsynced.copy(simpMusicNotFoundObserved = simpMusicNotFoundObserved),
+                            level = LyricsQuality.level(heldUnsynced.lyrics),
+                            overflow = false,
+                        )
+                    }
                 }
             }
 

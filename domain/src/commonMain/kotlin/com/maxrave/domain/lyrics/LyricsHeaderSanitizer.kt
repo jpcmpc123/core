@@ -24,6 +24,8 @@ private const val INTRO_CREDIT_MAX_TIME_MS = 15_000L
 private const val INTRO_CREDIT_MIN_VOCAL_GAP_MS = 5_000L
 private const val REF_STRIP_MAX_INTRO_TIME_MS = 25_000L
 private const val REF_STRIP_MAX_LEADING_LINES = 3
+private val NON_SUNG_SECTION_MARKERS =
+    setOf("intro", "instrumental", "interlude", "outro", "verse", "chorus", "bridge", "solo")
 
 private val EXPLICIT_CREDIT_PREFIXES =
     listOf(
@@ -126,8 +128,6 @@ private val DESCRIPTION_CREDIT_LINE_REGEX =
         RegexOption.IGNORE_CASE,
     )
 private val CREDIT_NAME_SPLIT_REGEX = Regex("""[,/&•／・、;]|\band\b|\be\b""", RegexOption.IGNORE_CASE)
-private val LATIN_PERSON_NAME_REGEX =
-    Regex("""^[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'-]+(?:\s+[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'-]+){1,2}$""")
 
 /**
  * Strips leading/trailing metadata header lines (e.g. `Manic Pixie Dream Girl - EASHA` at 00:00,
@@ -299,6 +299,12 @@ object LyricsHeaderSanitizer {
                 .toList()
         if (refNormalized.isEmpty()) return candidate
         val refFirst = refNormalized.first()
+
+        val candFirst = normalizeComparable(stripRichSyncTags(candLines[0].words))
+        if (candFirst.length >= 2 && linesMatchClosely(candFirst, refFirst)) {
+            return candidate
+        }
+
         val refWholeText = refNormalized.joinToString("")
 
         val isUnsynced = candidate.syncType != "LINE_SYNCED" && candidate.syncType != "RICH_SYNCED"
@@ -315,12 +321,15 @@ object LyricsHeaderSanitizer {
         }
         if (matchedAnchorIndex <= 0) return candidate
 
-        // Ensure every line before matchedAnchorIndex is genuinely an intro line absent from reference.
+        // Ensure every line before matchedAnchorIndex is genuinely an intro credit/metadata line
+        // absent from reference — never strip real sung/spoken opening verses (e.g. "(You're wrong)"
+        // or "When you first left me...") just because a reference sheet omitted an ad-lib or censored words.
         for (i in 0 until matchedAnchorIndex) {
             val startMs = candLines[i].startTimeMs.toLongOrNull() ?: 0L
             if (!isUnsynced && startMs > REF_STRIP_MAX_INTRO_TIME_MS) return candidate
             val plain = stripRichSyncTags(candLines[i].words)
             if (plain.isEmpty() || plain == "♫" || plain == "♪") continue
+            if (!isPlausibleNonSungIntroMetadata(plain)) return candidate
             val norm = normalizeComparable(plain)
             if (norm.length >= 2 && norm in refWholeText) {
                 return candidate
@@ -328,6 +337,37 @@ object LyricsHeaderSanitizer {
         }
 
         return candidate.copy(lines = candLines.subList(matchedAnchorIndex, candLines.size))
+    }
+
+    private fun isPlausibleNonSungIntroMetadata(plain: String): Boolean {
+        val trimmed = plain.trim()
+        if (trimmed.isEmpty()) return true
+        if (isExplicitCreditLine(trimmed)) return true
+        if (isPureKanjiPersonalName(trimmed)) return true
+
+        val normalized = normalizeFullwidth(trimmed)
+        if ((normalized.startsWith("[") && normalized.endsWith("]")) ||
+            (normalized.startsWith("(") && normalized.endsWith(")"))
+        ) {
+            val inner = normalized.substring(1, normalized.length - 1).trim().lowercase()
+            return inner in NON_SUNG_SECTION_MARKERS || isExplicitCreditLine(inner)
+        }
+
+        val hasMetadataSeparator =
+            TITLE_ARTIST_SEPARATORS.any { it in normalized } ||
+                " | " in normalized ||
+                ": " in normalized ||
+                "：" in normalized
+        return hasMetadataSeparator &&
+            normalized.length <= 80 &&
+            !normalized.contains('\'') &&
+            !normalized.contains('’')
+    }
+
+    private fun isPureKanjiPersonalName(trimmed: String): Boolean {
+        val noSpace = trimmed.filterNot { it.isWhitespace() }
+        return noSpace.length in 2..5 &&
+            noSpace.all { ch -> ch.code in 0x4E00..0x9FFF }
     }
 
     private fun linesMatchClosely(
@@ -479,14 +519,9 @@ object LyricsHeaderSanitizer {
         if (gapMs < INTRO_CREDIT_MIN_VOCAL_GAP_MS) return false
 
         // Shape A: Pure CJK Kanji/Hanzi personal name (2..5 ideographs, zero kana/digits), e.g. `三浦徳子`.
-        val noSpace = trimmed.filterNot { it.isWhitespace() }
-        val isPureKanjiName =
-            noSpace.length in 2..5 &&
-                noSpace.all { ch -> ch.code in 0x4E00..0x9FFF }
-        if (isPureKanjiName) return true
-
-        // Shape B: Clean 2..3-word Title-Cased Latin personal name at 00:00..00:03.5 with long intro gap.
-        return LATIN_PERSON_NAME_REGEX.matches(trimmed)
+        // Latin credit names are still caught reliably via explicit credit prefixes, Title-Artist pairs,
+        // and track description credits (`extraCreditNames`) without risking false positives on sung phrases.
+        return isPureKanjiPersonalName(trimmed)
     }
 
     private fun extractTitleVariants(rawTitle: String): Set<String> {

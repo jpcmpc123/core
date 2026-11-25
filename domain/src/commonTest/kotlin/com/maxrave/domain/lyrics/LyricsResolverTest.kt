@@ -178,7 +178,7 @@ class LyricsResolverTest {
         }
 
     @Test
-    fun unsyncedPrimaryShowsImmediatelyThenUpgradesToSyncedAndRichSynced() =
+    fun unsyncedPrimaryWaitsForPendingSyncedProvidersSoTimedLyricsStartSynced() =
         runBlocking {
             val resolver =
                 LyricsResolver(
@@ -207,10 +207,66 @@ class LyricsResolverTest {
                 }.filterIsInstance<LyricsResolutionEvent.Found>()
 
             assertEquals(
-                listOf(LyricsSource.SIMPMUSIC, LyricsSource.LRCLIB, LyricsSource.BETTER_LYRICS),
+                listOf(LyricsSource.LRCLIB, LyricsSource.BETTER_LYRICS),
                 events.map { it.resolution.source },
             )
             assertEquals("RICH_SYNCED", events.last().resolution.lyrics.syncType)
+        }
+
+    @Test
+    fun ytmOfficialFirstUnsyncedDoesNotFlashBeforeSyncedProviderResolves() =
+        runBlocking {
+            val resolver =
+                LyricsResolver(
+                    readCache = { null },
+                    fetchSource = { source, _ ->
+                        when (source) {
+                            LyricsSource.YTM_OFFICIAL -> ProviderFetchOutcome.Success(unsynced("Official static text"))
+                            LyricsSource.LRCLIB -> {
+                                delay(25L)
+                                ProviderFetchOutcome.Success(lineSynced("Official static text"))
+                            }
+                            else -> ProviderFetchOutcome.DefinitiveNotFound
+                        }
+                    },
+                    providerTimeoutMs = 500L,
+                    hedgeDelayMs = 300L,
+                )
+
+            val events =
+                withTimeout(2_000L) {
+                    resolver
+                        .resolve(request(preferred = LyricsSource.LRCLIB).copy(preferYtmOfficialFirst = true))
+                        .toList()
+                }.filterIsInstance<LyricsResolutionEvent.Found>()
+
+            assertEquals(listOf(LyricsSource.LRCLIB), events.map { it.resolution.source })
+            assertEquals("LINE_SYNCED", events.single().resolution.lyrics.syncType)
+        }
+
+    @Test
+    fun unsyncedCandidateEmitsCleanlyWhenAllSyncedProvidersHaveNoLyrics() =
+        runBlocking {
+            val resolver =
+                LyricsResolver(
+                    readCache = { null },
+                    fetchSource = { source, _ ->
+                        when (source) {
+                            LyricsSource.SIMPMUSIC -> ProviderFetchOutcome.Success(unsynced("Only static lyrics"))
+                            else -> ProviderFetchOutcome.DefinitiveNotFound
+                        }
+                    },
+                    providerTimeoutMs = 500L,
+                    hedgeDelayMs = 50L,
+                )
+
+            val events =
+                withTimeout(2_000L) {
+                    resolver.resolve(request()).toList()
+                }.filterIsInstance<LyricsResolutionEvent.Found>()
+
+            assertEquals(listOf(LyricsSource.SIMPMUSIC), events.map { it.resolution.source })
+            assertEquals("UNSYNCED", events.single().resolution.lyrics.syncType)
         }
 
     @Test

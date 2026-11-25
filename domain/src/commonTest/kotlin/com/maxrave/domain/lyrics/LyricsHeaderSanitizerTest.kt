@@ -274,6 +274,87 @@ class LyricsHeaderSanitizerTest {
         assertEquals("16260", refStripped.lines?.first()?.startTimeMs)
     }
 
+    @Test
+    fun preservesOpeningAdlibAndFirstVerseWhenReferenceSheetOmitsLineZero() {
+        // Reproduces "Has To Be" where a verified static sheet omits the spoken "(You're wrong)" intro
+        // or "Smile" where line 0 wording/censoring differs from the reference sheet.
+        val hasToBe =
+            Lyrics(
+                error = false,
+                syncType = "LINE_SYNCED",
+                lines =
+                    listOf(
+                        line("2790", "(You're wrong)"),
+                        line("3940", "(You don't belong here Terra)"),
+                        line("7500", "Wait for me"),
+                    ),
+            )
+        val referenceWithoutIntro =
+            Lyrics(
+                error = false,
+                syncType = "UNSYNCED",
+                lines =
+                    listOf(
+                        line("0", "(You don't belong here Terra)"),
+                        line("0", "Wait for me"),
+                    ),
+            )
+        val sanitizedHasToBe =
+            LyricsHeaderSanitizer.stripLeadingNonSungLinesAgainstReference(
+                candidate = hasToBe,
+                reference = referenceWithoutIntro,
+            )
+        assertEquals(3, sanitizedHasToBe.lines?.size)
+        assertEquals("(You're wrong)", sanitizedHasToBe.lines?.first()?.words)
+
+        val smile =
+            Lyrics(
+                error = false,
+                syncType = "LINE_SYNCED",
+                lines =
+                    listOf(
+                        line("20750", "When you first left me, I was wanting more"),
+                        line("24480", "But you were fucking that girl next door"),
+                        line("28000", "What'd you do that for?"),
+                    ),
+            )
+        val referenceStartingAtSecondLine =
+            Lyrics(
+                error = false,
+                syncType = "UNSYNCED",
+                lines =
+                    listOf(
+                        line("0", "But you were fucking that girl next door"),
+                        line("0", "What'd you do that for?"),
+                    ),
+            )
+        val sanitizedSmile =
+            LyricsHeaderSanitizer.stripLeadingNonSungLinesAgainstReference(
+                candidate = smile,
+                reference = referenceStartingAtSecondLine,
+            )
+        assertEquals(3, sanitizedSmile.lines?.size)
+        assertEquals("When you first left me, I was wanting more", sanitizedSmile.lines?.first()?.words)
+    }
+
+    @Test
+    fun preservesTitleCasedTwoWordOrThreeWordOpeningLyricsWithoutCreditMatch() {
+        val lyrics =
+            Lyrics(
+                error = false,
+                syncType = "LINE_SYNCED",
+                lines =
+                    listOf(
+                        line("1200", "Hold On Tight"),
+                        line("9500", "We are driving through the night"),
+                        line("14000", "Underneath the neon light"),
+                    ),
+            )
+        val sanitized = LyricsHeaderSanitizer.sanitize(lyrics, "Neon Drive", "Some Artist")
+        assertEquals(3, sanitized.lines?.size)
+        assertEquals("Hold On Tight", sanitized.lines?.first()?.words)
+    }
+
     private fun line(
         startMs: String,
         words: String,
