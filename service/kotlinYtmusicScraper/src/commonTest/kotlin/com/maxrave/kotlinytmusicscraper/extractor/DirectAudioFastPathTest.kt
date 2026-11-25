@@ -444,6 +444,26 @@ class DirectAudioFastPathTest {
     }
 
     @Test
+    fun offlineNetworkErrorsAreDetectedAcrossCauseChain() {
+        assertTrue(
+            DirectAudioFastPathState.isOfflineNetworkError(
+                RuntimeException("wrapper", IllegalStateException("Unable to resolve host \"youtubei.googleapis.com\": No address associated with hostname")),
+            ),
+        )
+        assertTrue(
+            DirectAudioFastPathState.isOfflineNetworkError(
+                IllegalStateException("Network is unreachable"),
+            ),
+        )
+        assertFalse(
+            DirectAudioFastPathState.isOfflineNetworkError(
+                IllegalStateException("HTTP 403 Forbidden"),
+            ),
+        )
+        assertFalse(DirectAudioFastPathState.isOfflineNetworkError(null))
+    }
+
+    @Test
     fun buildStandalonePlayerResponseKeepsNonDrcOpus251AndItsMetadataWhenDrcAppearsFirst() {
         val rawJson =
             """

@@ -902,6 +902,7 @@ internal class StreamRepositoryImpl(
                 .onSuccess { response ->
                     emit(response)
                 }.onFailure {
+                    if (it is CancellationException) throw it
                     Logger.e("InitPlayback", "Error: ${it.message}")
                     emit(Pair(0, 0f))
                 }

@@ -168,6 +168,36 @@ internal class DirectAudioFastPathState(
          */
         fun isPerTrackPlayabilityRefusal(status: String?): Boolean =
             status?.uppercase() in PER_TRACK_REFUSAL_STATUSES
+
+        /**
+         * Returns true when [error] (or any cause in its chain) indicates the device has no DNS or
+         * network route. Offline errors are not a YouTube `VISIONOS` refusal and must not trigger a
+         * 15-minute fast-path cooldown.
+         */
+        fun isOfflineNetworkError(error: Throwable?): Boolean {
+            var current = error
+            var depth = 0
+            while (current != null && depth < 8) {
+                val className = current::class.simpleName.orEmpty()
+                if (className == "UnknownHostException" ||
+                    className == "UnresolvedAddressException" ||
+                    className == "NoRouteToHostException"
+                ) {
+                    return true
+                }
+                val msg = current.message.orEmpty()
+                if (msg.contains("Unable to resolve host", ignoreCase = true) ||
+                    msg.contains("No address associated with hostname", ignoreCase = true) ||
+                    msg.contains("Network is unreachable", ignoreCase = true) ||
+                    msg.contains("ENETUNREACH", ignoreCase = true)
+                ) {
+                    return true
+                }
+                current = current.cause
+                depth++
+            }
+            return false
+        }
     }
 }
 

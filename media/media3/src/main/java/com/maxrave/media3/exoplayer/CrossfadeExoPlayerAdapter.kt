@@ -4016,9 +4016,13 @@ internal class CrossfadeExoPlayerAdapter(
                     delay(300)
                     if (!isActive) return@launch
 
-                    val isMetered =
-                        (context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-                            ?.isActiveNetworkMetered == true
+                    val connectivityManager =
+                        context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    if (!isNetworkConnected(connectivityManager)) {
+                        Logger.d(TAG, "Skipping precache while offline")
+                        return@launch
+                    }
+                    val isMetered = connectivityManager?.isActiveNetworkMetered == true
                     val targetLimit = if (isMetered) minOf(1, maxPrecacheCount) else maxPrecacheCount
 
                     // The tracks Next will actually play, in Next's own order: shuffle-aware, wrapping
@@ -4097,6 +4101,16 @@ internal class CrossfadeExoPlayerAdapter(
             }
     }
 
+    private fun isNetworkConnected(
+        connectivityManager: ConnectivityManager? =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager,
+    ): Boolean {
+        val cm = connectivityManager ?: return true
+        val activeNetwork = cm.activeNetwork ?: return false
+        val capabilities = cm.getNetworkCapabilities(activeNetwork) ?: return false
+        return capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
     private fun cancelPrecaching() {
         precacheJob?.cancel()
         precacheJob = null
@@ -4118,6 +4132,10 @@ internal class CrossfadeExoPlayerAdapter(
             override fun onPlayerError(error: PlaybackException) {
                 if (error.isUnrecoverableStreamFailure() || !error.isRetryableSourceError() || attempts >= maxRetryCount) return
                 if (precachedPlayers[videoId]?.player !== player) return
+                if (!isNetworkConnected()) {
+                    Logger.d(TAG, "Skipping precache retry for $videoId while offline")
+                    return
+                }
                 attempts++
                 val attemptNumber = attempts
                 Logger.w(TAG, "Precache source error (attempt $attemptNumber/$maxRetryCount) for $videoId: ${error.errorCodeName}")
@@ -4130,7 +4148,9 @@ internal class CrossfadeExoPlayerAdapter(
                         // burning retries milliseconds apart on the same drop.
                         delay(1_500L * attemptNumber)
                         // Promoted or released while waiting/dropping format: nothing left to retry.
-                        if (precachedPlayers[videoId]?.player === player) player.prepare()
+                        if (precachedPlayers[videoId]?.player === player && isNetworkConnected()) {
+                            player.prepare()
+                        }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         Logger.e(TAG, "Precache retry failed for $videoId: ${e.message}")

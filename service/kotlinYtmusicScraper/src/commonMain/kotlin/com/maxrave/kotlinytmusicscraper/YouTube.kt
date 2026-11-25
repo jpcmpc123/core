@@ -2042,22 +2042,31 @@ class YouTube {
         ) : DirectAudioOutcome
     }
 
+    private sealed interface VisitorDataFetchResult {
+        data class Available(val value: String) : VisitorDataFetchResult
+
+        data object Offline : VisitorDataFetchResult
+
+        data object Unavailable : VisitorDataFetchResult
+    }
+
     @OptIn(ExperimentalTime::class)
-    private suspend fun getVisionOsVisitorData(): String? {
+    private suspend fun getVisionOsVisitorData(): VisitorDataFetchResult {
         val nowMs = Clock.System.now().toEpochMilliseconds()
         val cached = cachedVisionOsVisitorData
         if (!cached.isNullOrBlank() && nowMs - cachedVisionOsVisitorDataAtMs < VISIONOS_VISITOR_DATA_TTL_MS) {
-            return cached
+            return VisitorDataFetchResult.Available(cached)
         }
         return visionOsVisitorMutex.withLock {
             val lockedNow = Clock.System.now().toEpochMilliseconds()
             val lockedCached = cachedVisionOsVisitorData
             if (!lockedCached.isNullOrBlank() && lockedNow - cachedVisionOsVisitorDataAtMs < VISIONOS_VISITOR_DATA_TTL_MS) {
-                return@withLock lockedCached
+                return@withLock VisitorDataFetchResult.Available(lockedCached)
             }
+            var offline = false
             val fresh =
                 withTimeoutOrNull(2_500L) {
-                    runCatching {
+                    try {
                         val raw = ytMusic.visionOsVisitorId().bodyAsText()
                         Json { ignoreUnknownKeys = true }
                             .parseToJsonElement(raw)
@@ -2066,13 +2075,24 @@ class YouTube {
                             ?.get("visitorData")
                             ?.jsonPrimitive
                             ?.contentOrNull
-                    }.getOrNull()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        if (DirectAudioFastPathState.isOfflineNetworkError(e)) {
+                            offline = true
+                        }
+                        null
+                    }
                 }
             if (!fresh.isNullOrBlank()) {
                 cachedVisionOsVisitorData = fresh
                 cachedVisionOsVisitorDataAtMs = Clock.System.now().toEpochMilliseconds()
+                VisitorDataFetchResult.Available(fresh)
+            } else if (offline) {
+                VisitorDataFetchResult.Offline
+            } else {
+                VisitorDataFetchResult.Unavailable
             }
-            fresh
         }
     }
 
@@ -2088,20 +2108,35 @@ class YouTube {
         preferredAudioLanguage: String?,
     ): DirectAudioOutcome {
         val startMs = Clock.System.now().toEpochMilliseconds()
-        val anonVisitor =
+        val visitorResult =
             try {
                 getVisionOsVisitorData()
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
-                null
+            } catch (e: Exception) {
+                if (DirectAudioFastPathState.isOfflineNetworkError(e)) {
+                    VisitorDataFetchResult.Offline
+                } else {
+                    VisitorDataFetchResult.Unavailable
+                }
             }
-        if (anonVisitor.isNullOrBlank()) {
-            val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
-            Logger.w(TAG, "VISIONOS visitorData unavailable for $videoId; falling back to BravePipe")
-            directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
-            return DirectAudioOutcome.Failure("no_visitor", elapsed)
-        }
+        val anonVisitor =
+            when (visitorResult) {
+                is VisitorDataFetchResult.Available -> visitorResult.value
+                VisitorDataFetchResult.Offline -> {
+                    val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+                    Logger.d(TAG, "VISIONOS visitorData skipped while offline for $videoId")
+                    return DirectAudioOutcome.Failure("offline", elapsed)
+                }
+                VisitorDataFetchResult.Unavailable -> {
+                    val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+                    Logger.w(TAG, "VISIONOS visitorData unavailable for $videoId; falling back to BravePipe")
+                    if (directAudioFastPath.recordTransportFailure(Clock.System.now().toEpochMilliseconds())) {
+                        invalidateVisionOsVisitorData()
+                    }
+                    return DirectAudioOutcome.Failure("no_visitor", elapsed)
+                }
+            }
         val rawBody =
             try {
                 withTimeoutOrNull(VISIONOS_FAST_PATH_TIMEOUT_MS) {
@@ -2111,6 +2146,10 @@ class YouTube {
                 throw e
             } catch (e: Exception) {
                 val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+                if (DirectAudioFastPathState.isOfflineNetworkError(e)) {
+                    Logger.d(TAG, "VISIONOS player request skipped while offline for $videoId")
+                    return DirectAudioOutcome.Failure("offline", elapsed)
+                }
                 Logger.w(TAG, "VISIONOS player request failed for $videoId (${e.message})")
                 if (directAudioFastPath.recordTransportFailure(Clock.System.now().toEpochMilliseconds())) {
                     invalidateVisionOsVisitorData()
