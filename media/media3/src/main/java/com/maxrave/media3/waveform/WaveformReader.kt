@@ -68,14 +68,22 @@ internal class WaveformReader(
             WaveformAudioSink(delegate, mediaId.removePrefix(MERGING_DATA_TYPE.VIDEO), playbackWaveforms)
         }
 
-    /** AutoMix's measurements of the track; null when it has none (yet, or ever). */
-    suspend fun structure(mediaId: String): TrackStructure? =
+    /**
+     * AutoMix's measurements of the track; null when it has none (yet, or ever).
+     * When [allowNetworkDownload] is false (e.g. metered cellular connection), only an existing
+     * local `.mix` cache is read so the audio is never downloaded a second time over mobile data.
+     */
+    suspend fun structure(
+        mediaId: String,
+        allowNetworkDownload: Boolean = true,
+    ): TrackStructure? =
         withContext(Dispatchers.IO) {
             if (mediaId.isBlank() || LiveStreamRegistry.isLive(mediaId)) return@withContext null
             val name = mediaId.replace(UNSAFE_FILE_CHARS, "_")
             val stored = File(dir, "$name.mix")
             dropOutdated(stored)
             if (stored.isFile) return@withContext TrackStructure.decode(stored.readText())
+            if (!allowNetworkDownload) return@withContext null
             decodeLock.withLock {
                 if (stored.isFile) TrackStructure.decode(stored.readText()) else measure(mediaId, name)?.structure
             }

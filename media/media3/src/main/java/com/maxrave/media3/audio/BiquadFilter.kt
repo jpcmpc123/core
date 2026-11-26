@@ -22,34 +22,35 @@ class BiquadFilter {
         HIGH_PASS,
     }
 
-    // Two cascaded biquad stages → 4th order (24 dB/octave)
-    // Stage 1 coefficients
-    @Volatile private var b0_1 = 1.0
-    @Volatile private var b1_1 = 0.0
-    @Volatile private var b2_1 = 0.0
-    @Volatile private var a1_1 = 0.0
-    @Volatile private var a2_1 = 0.0
+    /**
+     * Immutable normalized biquad coefficients for a single 2nd-order Butterworth stage.
+     * Both cascaded stages share the same coefficients (4th order, 24 dB/octave), and
+     * reading a single [@Volatile] reference guarantees the audio thread never observes
+     * half-updated numerator/denominator coefficients.
+     */
+    private data class Coeffs(
+        val b0: Double,
+        val b1: Double,
+        val b2: Double,
+        val a1: Double,
+        val a2: Double,
+    )
 
-    // Stage 2 coefficients
-    @Volatile private var b0_2 = 1.0
-    @Volatile private var b1_2 = 0.0
-    @Volatile private var b2_2 = 0.0
-    @Volatile private var a1_2 = 0.0
-    @Volatile private var a2_2 = 0.0
+    @Volatile
+    private var coeffs: Coeffs = IDENTITY_COEFFS
 
-    // Stage 1 per-channel state (left)
-    private var s1_x1L = 0.0; private var s1_x2L = 0.0
-    private var s1_y1L = 0.0; private var s1_y2L = 0.0
-    // Stage 1 per-channel state (right)
-    private var s1_x1R = 0.0; private var s1_x2R = 0.0
-    private var s1_y1R = 0.0; private var s1_y2R = 0.0
+    // Transposed Direct Form II state (2 state variables per stage per channel).
+    // Significantly more numerically stable than Direct Form I when cutoff frequency
+    // sweeps continuously during a DJ crossfade.
+    private var s1_z1L = 0.0
+    private var s1_z2L = 0.0
+    private var s1_z1R = 0.0
+    private var s1_z2R = 0.0
 
-    // Stage 2 per-channel state (left)
-    private var s2_x1L = 0.0; private var s2_x2L = 0.0
-    private var s2_y1L = 0.0; private var s2_y2L = 0.0
-    // Stage 2 per-channel state (right)
-    private var s2_x1R = 0.0; private var s2_x2R = 0.0
-    private var s2_y1R = 0.0; private var s2_y2R = 0.0
+    private var s2_z1L = 0.0
+    private var s2_z2L = 0.0
+    private var s2_z1R = 0.0
+    private var s2_z2R = 0.0
 
     /**
      * Recalculate filter coefficients for the given parameters.
@@ -67,82 +68,108 @@ class BiquadFilter {
         q: Float = BUTTERWORTH_Q,
         type: FilterType,
     ) {
-        val clampedCutoff = cutoffHz.coerceIn(20f, (sampleRate / 2f) - 1f)
+        if (sampleRate <= 0 || !cutoffHz.isFinite() || !q.isFinite() || q <= 0f) {
+            coeffs = IDENTITY_COEFFS
+            return
+        }
+        val nyquistLimit = (sampleRate / 2f) - 1f
+        if (nyquistLimit <= 20f) {
+            coeffs = IDENTITY_COEFFS
+            return
+        }
+        val clampedCutoff = cutoffHz.coerceIn(20f, nyquistLimit)
         val omega = 2.0 * PI * clampedCutoff / sampleRate
         val sinOmega = sin(omega)
         val cosOmega = cos(omega)
         val alpha = sinOmega / (2.0 * q)
 
-        // Both stages use identical coefficients (cascaded identical Butterworth)
-        val rawA0: Double
+        val rawB0: Double
+        val rawB1: Double
+        val rawB2: Double
+        val rawA0 = 1.0 + alpha
+        val rawA1 = -2.0 * cosOmega
+        val rawA2 = 1.0 - alpha
+
         when (type) {
             FilterType.LOW_PASS -> {
                 val v = (1.0 - cosOmega) / 2.0
-                b0_1 = v; b0_2 = v
-                b1_1 = 1.0 - cosOmega; b1_2 = b1_1
-                b2_1 = v; b2_2 = v
-                rawA0 = 1.0 + alpha
-                a1_1 = -2.0 * cosOmega; a1_2 = a1_1
-                a2_1 = 1.0 - alpha; a2_2 = a2_1
+                rawB0 = v
+                rawB1 = 1.0 - cosOmega
+                rawB2 = v
             }
 
             FilterType.HIGH_PASS -> {
                 val v = (1.0 + cosOmega) / 2.0
-                b0_1 = v; b0_2 = v
-                b1_1 = -(1.0 + cosOmega); b1_2 = b1_1
-                b2_1 = v; b2_2 = v
-                rawA0 = 1.0 + alpha
-                a1_1 = -2.0 * cosOmega; a1_2 = a1_1
-                a2_1 = 1.0 - alpha; a2_2 = a2_1
+                rawB0 = v
+                rawB1 = -(1.0 + cosOmega)
+                rawB2 = v
             }
         }
 
-        // Normalize both stages
-        b0_1 /= rawA0; b1_1 /= rawA0; b2_1 /= rawA0; a1_1 /= rawA0; a2_1 /= rawA0
-        b0_2 /= rawA0; b1_2 /= rawA0; b2_2 /= rawA0; a1_2 /= rawA0; a2_2 /= rawA0
+        coeffs =
+            Coeffs(
+                b0 = rawB0 / rawA0,
+                b1 = rawB1 / rawA0,
+                b2 = rawB2 / rawA0,
+                a1 = rawA1 / rawA0,
+                a2 = rawA2 / rawA0,
+            )
     }
 
     /**
-     * Process a single mono sample through both cascaded stages.
+     * Process a single mono sample through both cascaded stages (Transposed Direct Form II).
      */
     fun processSampleMono(input: Double): Double {
+        val c = coeffs
+        val x = if (input.isFinite()) input else 0.0
+
         // Stage 1
-        val mid = b0_1 * input + b1_1 * s1_x1L + b2_1 * s1_x2L - a1_1 * s1_y1L - a2_1 * s1_y2L
-        s1_x2L = s1_x1L; s1_x1L = input
-        s1_y2L = s1_y1L; s1_y1L = mid
+        val mid = c.b0 * x + s1_z1L
+        s1_z1L = c.b1 * x - c.a1 * mid + s1_z2L
+        s1_z2L = c.b2 * x - c.a2 * mid
 
         // Stage 2
-        val output = b0_2 * mid + b1_2 * s2_x1L + b2_2 * s2_x2L - a1_2 * s2_y1L - a2_2 * s2_y2L
-        s2_x2L = s2_x1L; s2_x1L = mid
-        s2_y2L = s2_y1L; s2_y1L = output
+        val out = c.b0 * mid + s2_z1L
+        s2_z1L = c.b1 * mid - c.a1 * out + s2_z2L
+        s2_z2L = c.b2 * mid - c.a2 * out
 
-        return output
+        return if (out.isFinite()) out else 0.0
     }
 
     /**
      * Process left stereo sample through both cascaded stages without allocating.
      */
     fun processStereoLeft(inputLeft: Double): Double {
-        val midL = b0_1 * inputLeft + b1_1 * s1_x1L + b2_1 * s1_x2L - a1_1 * s1_y1L - a2_1 * s1_y2L
-        s1_x2L = s1_x1L; s1_x1L = inputLeft
-        s1_y2L = s1_y1L; s1_y1L = midL
-        val outL = b0_2 * midL + b1_2 * s2_x1L + b2_2 * s2_x2L - a1_2 * s2_y1L - a2_2 * s2_y2L
-        s2_x2L = s2_x1L; s2_x1L = midL
-        s2_y2L = s2_y1L; s2_y1L = outL
-        return outL
+        val c = coeffs
+        val x = if (inputLeft.isFinite()) inputLeft else 0.0
+
+        val midL = c.b0 * x + s1_z1L
+        s1_z1L = c.b1 * x - c.a1 * midL + s1_z2L
+        s1_z2L = c.b2 * x - c.a2 * midL
+
+        val outL = c.b0 * midL + s2_z1L
+        s2_z1L = c.b1 * midL - c.a1 * outL + s2_z2L
+        s2_z2L = c.b2 * midL - c.a2 * outL
+
+        return if (outL.isFinite()) outL else 0.0
     }
 
     /**
      * Process right stereo sample through both cascaded stages without allocating.
      */
     fun processStereoRight(inputRight: Double): Double {
-        val midR = b0_1 * inputRight + b1_1 * s1_x1R + b2_1 * s1_x2R - a1_1 * s1_y1R - a2_1 * s1_y2R
-        s1_x2R = s1_x1R; s1_x1R = inputRight
-        s1_y2R = s1_y1R; s1_y1R = midR
-        val outR = b0_2 * midR + b1_2 * s2_x1R + b2_2 * s2_x2R - a1_2 * s2_y1R - a2_2 * s2_y2R
-        s2_x2R = s2_x1R; s2_x1R = midR
-        s2_y2R = s2_y1R; s2_y1R = outR
-        return outR
+        val c = coeffs
+        val x = if (inputRight.isFinite()) inputRight else 0.0
+
+        val midR = c.b0 * x + s1_z1R
+        s1_z1R = c.b1 * x - c.a1 * midR + s1_z2R
+        s1_z2R = c.b2 * x - c.a2 * midR
+
+        val outR = c.b0 * midR + s2_z1R
+        s2_z1R = c.b1 * midR - c.a1 * outR + s2_z2R
+        s2_z2R = c.b2 * midR - c.a2 * outR
+
+        return if (outR.isFinite()) outR else 0.0
     }
 
     /**
@@ -157,14 +184,16 @@ class BiquadFilter {
      * Call when starting a new audio stream or disabling the filter.
      */
     fun reset() {
-        s1_x1L = 0.0; s1_x2L = 0.0; s1_y1L = 0.0; s1_y2L = 0.0
-        s1_x1R = 0.0; s1_x2R = 0.0; s1_y1R = 0.0; s1_y2R = 0.0
-        s2_x1L = 0.0; s2_x2L = 0.0; s2_y1L = 0.0; s2_y2L = 0.0
-        s2_x1R = 0.0; s2_x2R = 0.0; s2_y1R = 0.0; s2_y2R = 0.0
+        s1_z1L = 0.0; s1_z2L = 0.0
+        s1_z1R = 0.0; s1_z2R = 0.0
+        s2_z1L = 0.0; s2_z2L = 0.0
+        s2_z1R = 0.0; s2_z2R = 0.0
     }
 
     companion object {
         /** Butterworth Q factor: maximally flat passband, no resonance at cutoff. */
         const val BUTTERWORTH_Q = 0.707f
+
+        private val IDENTITY_COEFFS = Coeffs(b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0)
     }
 }

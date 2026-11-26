@@ -21,52 +21,71 @@ import java.nio.ByteOrder
 @UnstableApi
 class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
 
-    /**
-     * Whether the filter is active. When false, audio passes through unmodified.
-     * Changing this triggers a flush in ExoPlayer's pipeline.
-     */
+    private data class FilterConfig(
+        val enabled: Boolean = false,
+        val filterType: BiquadFilter.FilterType = BiquadFilter.FilterType.LOW_PASS,
+        val cutoffFrequencyHz: Float = DEFAULT_CUTOFF_HZ,
+    )
+
     @Volatile
-    var enabled: Boolean = false
+    private var config: FilterConfig = FilterConfig()
+
+    /**
+     * Atomically update enabled state, filter type, and cutoff frequency in a single write
+     * so the audio thread never observes a torn combination across fields.
+     */
+    fun configure(
+        enabled: Boolean,
+        filterType: BiquadFilter.FilterType,
+        cutoffFrequencyHz: Float,
+    ) {
+        config = FilterConfig(enabled = enabled, filterType = filterType, cutoffFrequencyHz = cutoffFrequencyHz)
+    }
+
+    /**
+     * Whether the filter is active. When false, audio ramps cleanly back to dry passthrough.
+     */
+    var enabled: Boolean
+        get() = config.enabled
         set(value) {
-            if (field != value) {
-                field = value
-                if (!value) {
-                    pendingReset = true
-                }
+            val current = config
+            if (current.enabled != value) {
+                config = current.copy(enabled = value)
             }
         }
 
     /**
      * Current cutoff frequency in Hz. Updated during crossfade animation.
      */
-    @Volatile
-    var cutoffFrequencyHz: Float = 20000f
+    var cutoffFrequencyHz: Float
+        get() = config.cutoffFrequencyHz
         set(value) {
-            if (field != value) {
-                field = value
-                coefficientsDirty = true
+            val current = config
+            if (current.cutoffFrequencyHz != value) {
+                config = current.copy(cutoffFrequencyHz = value)
             }
         }
 
     /**
      * Filter type: LOW_PASS for outgoing track, HIGH_PASS for incoming track.
      */
-    @Volatile
-    var filterType: BiquadFilter.FilterType = BiquadFilter.FilterType.LOW_PASS
+    var filterType: BiquadFilter.FilterType
+        get() = config.filterType
         set(value) {
-            if (field != value) {
-                field = value
-                coefficientsDirty = true
+            val current = config
+            if (current.filterType != value) {
+                config = current.copy(filterType = value)
             }
         }
 
     private val filter = BiquadFilter()
 
-    @Volatile
-    private var coefficientsDirty = true
-
-    @Volatile
-    private var pendingReset = false
+    // Audio-thread-only tracking of the last applied filter parameters and dry/wet ramp.
+    private var appliedFilterType: BiquadFilter.FilterType? = null
+    private var appliedCutoffHz: Float = -1f
+    private var appliedSampleRate: Int = 0
+    private var wetMix: Double = 0.0
+    private var wetRampStep: Double = 1.0 / MIN_RAMP_SAMPLES
 
     private var sampleRate = 0
     private var channelCount = 0
@@ -77,7 +96,9 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
         }
         sampleRate = inputAudioFormat.sampleRate
         channelCount = inputAudioFormat.channelCount
-        coefficientsDirty = true
+        val rampSamples = (sampleRate * DRY_WET_RAMP_SECONDS).toInt().coerceAtLeast(MIN_RAMP_SAMPLES)
+        wetRampStep = 1.0 / rampSamples
+        appliedSampleRate = 0
         return inputAudioFormat
     }
 
@@ -87,39 +108,56 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
 
-        if (pendingReset) {
-            pendingReset = false
-            filter.reset()
-        }
+        val snapshot = config
+        val targetWet = if (snapshot.enabled) 1.0 else 0.0
 
-        if (!enabled || sampleRate == 0) {
-            // Pass through: copy input to output (avoid put(sameBuffer) which throws)
+        // Fast zero-overhead passthrough when fully disabled and ramp-out finished.
+        if (sampleRate == 0 || (!snapshot.enabled && wetMix <= 0.0)) {
+            if (appliedFilterType != null) {
+                filter.reset()
+                appliedFilterType = null
+            }
             val output = replaceOutputBuffer(remaining)
             copyBuffer(inputBuffer, output, remaining)
             output.flip()
             return
         }
 
-        // Recalculate coefficients on audio thread if cutoff or type changed
-        if (coefficientsDirty) {
-            coefficientsDirty = false
+        // Freshly engaging the filter from dry passthrough: clear any stale delay history first.
+        if (snapshot.enabled && wetMix <= 0.0) {
+            filter.reset()
+        }
+
+        // Recalculate coefficients on the audio thread only when cutoff, type, or sample rate changed.
+        if (appliedFilterType != snapshot.filterType ||
+            appliedCutoffHz != snapshot.cutoffFrequencyHz ||
+            appliedSampleRate != sampleRate
+        ) {
             filter.updateCoefficients(
-                cutoffHz = cutoffFrequencyHz,
+                cutoffHz = snapshot.cutoffFrequencyHz,
                 sampleRate = sampleRate,
-                type = filterType,
+                type = snapshot.filterType,
             )
+            appliedFilterType = snapshot.filterType
+            appliedCutoffHz = snapshot.cutoffFrequencyHz
+            appliedSampleRate = sampleRate
         }
 
         val output = replaceOutputBuffer(remaining)
         inputBuffer.order(ByteOrder.nativeOrder())
 
         when (channelCount) {
-            1 -> processMonoBlock(inputBuffer, output)
-            2 -> processStereoBlock(inputBuffer, output)
+            1 -> processMonoBlock(inputBuffer, output, targetWet)
+            2 -> processStereoBlock(inputBuffer, output, targetWet)
             else -> {
                 // Unsupported channel count: pass through
                 copyBuffer(inputBuffer, output, remaining)
             }
+        }
+
+        if (!snapshot.enabled && wetMix <= 0.0) {
+            filter.reset()
+            appliedFilterType = null
         }
 
         output.flip()
@@ -142,40 +180,60 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
         }
     }
 
-    private fun processMonoBlock(input: ByteBuffer, output: ByteBuffer) {
+    private fun stepWetMix(targetWet: Double): Double {
+        if (wetMix < targetWet) {
+            wetMix = (wetMix + wetRampStep).coerceAtMost(targetWet)
+        } else if (wetMix > targetWet) {
+            wetMix = (wetMix - wetRampStep).coerceAtLeast(targetWet)
+        }
+        return wetMix
+    }
+
+    private fun processMonoBlock(input: ByteBuffer, output: ByteBuffer, targetWet: Double) {
         while (input.remaining() >= 2) {
-            val sample = input.short.toDouble() / Short.MAX_VALUE
-            val filtered = filter.processSampleMono(sample)
-            output.putShort((filtered.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
+            val dry = input.short.toDouble() / Short.MAX_VALUE
+            val wet = filter.processSampleMono(dry)
+            val mix = stepWetMix(targetWet)
+            val out = if (mix >= 1.0) wet else dry * (1.0 - mix) + wet * mix
+            output.putShort((out.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
         }
     }
 
-    private fun processStereoBlock(input: ByteBuffer, output: ByteBuffer) {
+    private fun processStereoBlock(input: ByteBuffer, output: ByteBuffer, targetWet: Double) {
         while (input.remaining() >= 4) {
-            val left = input.short.toDouble() / Short.MAX_VALUE
-            val right = input.short.toDouble() / Short.MAX_VALUE
-            val filteredL = filter.processStereoLeft(left)
-            val filteredR = filter.processStereoRight(right)
-            output.putShort((filteredL.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
-            output.putShort((filteredR.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
+            val dryL = input.short.toDouble() / Short.MAX_VALUE
+            val dryR = input.short.toDouble() / Short.MAX_VALUE
+            val wetL = filter.processStereoLeft(dryL)
+            val wetR = filter.processStereoRight(dryR)
+            val mix = stepWetMix(targetWet)
+            val outL = if (mix >= 1.0) wetL else dryL * (1.0 - mix) + wetL * mix
+            val outR = if (mix >= 1.0) wetR else dryR * (1.0 - mix) + wetR * mix
+            output.putShort((outL.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
+            output.putShort((outR.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
         }
     }
 
     override fun onFlush() {
         super.onFlush()
-        pendingReset = false
+        wetMix = if (config.enabled) 1.0 else 0.0
         filter.reset()
     }
 
     override fun onReset() {
         super.onReset()
-        enabled = false
-        pendingReset = false
-        coefficientsDirty = true
-        cutoffFrequencyHz = 20000f
-        filterType = BiquadFilter.FilterType.LOW_PASS
+        config = FilterConfig()
+        appliedFilterType = null
+        appliedCutoffHz = -1f
+        appliedSampleRate = 0
+        wetMix = 0.0
         sampleRate = 0
         channelCount = 0
         filter.reset()
+    }
+
+    companion object {
+        private const val DEFAULT_CUTOFF_HZ = 20000f
+        private const val DRY_WET_RAMP_SECONDS = 0.010 // ~10 ms (~480 samples @ 48 kHz)
+        private const val MIN_RAMP_SAMPLES = 64
     }
 }

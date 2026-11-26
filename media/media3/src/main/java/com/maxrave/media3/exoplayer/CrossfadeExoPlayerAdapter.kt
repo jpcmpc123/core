@@ -74,15 +74,19 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.coroutines.resume
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -143,8 +147,17 @@ internal class CrossfadeExoPlayerAdapter(
     init {
         adapterScope.launch {
             dataStoreManager.crossfadeEnabled.distinctUntilChanged().collect { enabled ->
-                crossfadeEnabled = (enabled == DataStoreManager.TRUE)
+                val newEnabled = (enabled == DataStoreManager.TRUE)
+                crossfadeEnabled = newEnabled
                 Logger.d(TAG, "Crossfade enabled: $crossfadeEnabled")
+                if (!newEnabled && (isCrossfading || crossfadeTransitionJob?.isActive == true)) {
+                    if (secondaryPlayer != null && forwardingPlayer.wrappedPlayer === secondaryPlayer) {
+                        commitIncomingAsCurrentInternal()
+                        startPositionUpdates()
+                    } else {
+                        cancelCrossfadeAsAbortedInternal()
+                    }
+                }
             }
         }
         adapterScope.launch {
@@ -480,6 +493,53 @@ internal class CrossfadeExoPlayerAdapter(
     private var structureJob: Job? = null
     private val transitionPlans = ConcurrentHashMap<String, TransitionPlan>()
     private val pairsWithoutPlan: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    @Volatile
+    private var autoMixCacheVersion: Int = 0
+
+    // Tracks a (currentId>nextId) pair whose STATE_READY wait timed out or errored so the 50ms
+    // position monitor does not spin-retry crossfade setup on the same pair before track end.
+    @Volatile
+    private var crossfadeDeferredPairKey: String? = null
+
+    private fun <K, V> putBounded(
+        map: ConcurrentHashMap<K, V>,
+        key: K,
+        value: V,
+        maxSize: Int = MAX_AUTOMIX_CACHE_SIZE,
+    ) {
+        if (!map.containsKey(key) && map.size >= maxSize) {
+            val iterator = map.keys.iterator()
+            var toRemove = map.size - maxSize + 1
+            while (toRemove > 0 && iterator.hasNext()) {
+                val oldest = iterator.next()
+                if (oldest != key) {
+                    map.remove(oldest)
+                    toRemove--
+                }
+            }
+        }
+        map[key] = value
+    }
+
+    private fun addBounded(
+        set: MutableSet<String>,
+        key: String,
+        maxSize: Int = MAX_AUTOMIX_CACHE_SIZE,
+    ) {
+        if (!set.contains(key) && set.size >= maxSize) {
+            val iterator = set.iterator()
+            var toRemove = set.size - maxSize + 1
+            while (toRemove > 0 && iterator.hasNext()) {
+                val oldest = iterator.next()
+                if (oldest != key) {
+                    set.remove(oldest)
+                    toRemove--
+                }
+            }
+        }
+        set.add(key)
+    }
 
     /**
      * Update crossfade state and notify listeners when it changes.
@@ -2739,13 +2799,11 @@ internal class CrossfadeExoPlayerAdapter(
      * Only the current track is measured: the next one has not been prepared yet, so its duration
      * is unknown until it becomes current.
      */
-    private fun isCurrentTrackTooShortForCrossfade(): Boolean {
+    private fun isCurrentTrackTooShortForCrossfade(resolvedFadeMs: Int? = null): Boolean {
         val duration = currentPlayer?.duration ?: return false
         if (duration <= 0L) return false
         val fadeMs =
-            if (crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO) {
-                // Auto resolves to 20–45s, nowhere near the 5s default — measuring against the
-                // default would let a 30s track through and then swallow it whole.
+            resolvedFadeMs ?: if (crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO) {
                 resolveAutoCrossfadeDurationMs(
                     currentMediaItem?.mediaId ?: "",
                     playlist.getOrNull(getNextMediaItemIndex())?.mediaId ?: "",
@@ -2762,9 +2820,11 @@ internal class CrossfadeExoPlayerAdapter(
      *
      * Requiring *both* sides is what keeps the edges intact: the last album track into the first
      * track endless queue appended still crossfades, because that one is not in the set.
+     * Shuffled playback breaks sequential album continuity, so crossfade is allowed while shuffling.
      */
     private fun isWithinAlbum(): Boolean {
         if (!skipCrossfadeInAlbum) return false
+        if (internalShuffleModeEnabled) return false
         val ids = internalAlbumTrackIds
         if (ids.isEmpty()) return false
         val current = currentMediaItem?.mediaId ?: return false
@@ -2858,7 +2918,6 @@ internal class CrossfadeExoPlayerAdapter(
         val transitionJob =
             adapterScope.launch {
                 try {
-                    setCrossfading(true)
                     val currentVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId ?: ""
                     val isAutoMode = crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO
 
@@ -2868,8 +2927,7 @@ internal class CrossfadeExoPlayerAdapter(
                         loadAudioMetaIfNeeded(currentVideoId)
                         loadAudioMetaIfNeeded(nextVideoId)
                     }
-                    if (!currentCoroutineContext().isActive || isCastActive) {
-                        setCrossfading(false)
+                    if (!currentCoroutineContext().isActive || isCastActive || !crossfadeEnabled) {
                         return@launch
                     }
                     val resolvedNextIndex =
@@ -2880,7 +2938,6 @@ internal class CrossfadeExoPlayerAdapter(
                         }
                     if (resolvedNextIndex == null) {
                         Logger.w(TAG, "Crossfade aborted: next track $nextVideoId removed during setup")
-                        setCrossfading(false)
                         return@launch
                     }
                     val nextMediaItem = playlist[resolvedNextIndex]
@@ -2931,6 +2988,63 @@ internal class CrossfadeExoPlayerAdapter(
                     secondaryPlayer = nextPlayer
                     secondaryPlayerFilter = nextFilter
 
+                    val wasCurrentEnded = currentPlayer?.playbackState == Player.STATE_ENDED
+                    val speedForWait = internalPlaybackSpeed.coerceAtLeast(0.1f)
+                    val remainingBeforeWaitMs =
+                        currentPlayer?.let { player ->
+                            val dur = player.duration
+                            val pos = player.currentPosition
+                            if (dur > 0 && pos >= 0) ((dur - pos) / speedForWait).toLong() else 0L
+                        } ?: 0L
+
+                    // Keep the outgoing track at full volume (and do not swap MediaSession or UI
+                    // timeline) until the incoming player is actually ready to emit audio.
+                    if (nextPlayer.playbackState != Player.STATE_READY) {
+                        val maxWaitMs =
+                            if (wasCurrentEnded) {
+                                4000L
+                            } else {
+                                (remainingBeforeWaitMs - 1500L).coerceIn(500L, 6000L)
+                            }
+                        val ready = awaitPlayerReady(nextPlayer, maxWaitMs)
+                        if (!currentCoroutineContext().isActive || isCastActive || !crossfadeEnabled) {
+                            cancelCrossfadeAsAbortedInternal(cancelJob = false, restoreDelegate = false)
+                            return@launch
+                        }
+                        if (!ready) {
+                            Logger.w(
+                                TAG,
+                                "Crossfade wait ended without STATE_READY for $nextVideoId " +
+                                    "(state=${nextPlayer.playbackState}, err=${nextPlayer.playerError?.errorCodeName})",
+                            )
+                            val currentEndedNow = wasCurrentEnded || currentPlayer?.playbackState == Player.STATE_ENDED
+                            cancelCrossfadeAsAbortedInternal(cancelJob = false, restoreDelegate = false)
+                            if (currentEndedNow) {
+                                val fallbackIndex = playlist.indexOfFirst { it.mediaId == nextVideoId }
+                                if (fallbackIndex >= 0) {
+                                    seekTo(fallbackIndex, 0)
+                                }
+                            } else {
+                                crossfadeDeferredPairKey = "$currentVideoId>$nextVideoId"
+                            }
+                            return@launch
+                        }
+                    }
+
+                    // Re-verify queue slot in case the playlist was mutated while awaiting STATE_READY.
+                    val confirmedNextIndex =
+                        if (playlist.getOrNull(resolvedNextIndex)?.mediaId == nextVideoId) {
+                            resolvedNextIndex
+                        } else {
+                            playlist.indexOfFirst { it.mediaId == nextVideoId }.takeIf { it >= 0 }
+                        }
+                    if (confirmedNextIndex == null) {
+                        Logger.w(TAG, "Crossfade aborted: next track $nextVideoId removed while waiting for STATE_READY")
+                        cancelCrossfadeAsAbortedInternal(cancelJob = false, restoreDelegate = false)
+                        return@launch
+                    }
+                    val confirmedNextMediaItem = playlist[confirmedNextIndex]
+
                     val resolvedConfigDurationMs =
                         if (plan != null) {
                             plan.durationMs.toInt()
@@ -2949,10 +3063,13 @@ internal class CrossfadeExoPlayerAdapter(
                     nextPlayer.skipSilenceEnabled = internalSkipSilence
                     nextPlayer.volume = 0f
 
+                    setCrossfading(true)
+                    crossfadeDeferredPairKey = null
+
                     // Update index BEFORE swapping/notifying MediaSession so getAvailableCommands()
                     // immediately sees the incoming track's queue navigation state.
                     crossfadeFromIndex = localCurrentMediaItemIndex
-                    localCurrentMediaItemIndex = resolvedNextIndex
+                    localCurrentMediaItemIndex = confirmedNextIndex
                     unpinCurrent()
 
                     // *** KEY: Move our custom listener from current to next player ***
@@ -2972,12 +3089,12 @@ internal class CrossfadeExoPlayerAdapter(
                     forwardingPlayer.notifyMediaItemChanged()
                     listeners.forEach {
                         it.onMediaItemTransition(
-                            nextMediaItem,
+                            confirmedNextMediaItem,
                             PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_AUTO,
                         )
                     }
 
-                    Logger.d(TAG, "Now playing updated to track $resolvedNextIndex during crossfade")
+                    Logger.d(TAG, "Now playing updated to track $confirmedNextIndex during crossfade")
 
                     // Calculate effective crossfade duration based on ACTUAL remaining time.
                     val actualTimeRemaining =
@@ -3003,7 +3120,7 @@ internal class CrossfadeExoPlayerAdapter(
                     )
 
                     // Perform crossfade animation inline inside this job and finalize cleanly
-                    performCrossfade(resolvedNextIndex, nextPlayer, effectiveCrossfadeDurationMs, bpmSpeedRatio, keyPitchRatio)
+                    performCrossfade(confirmedNextIndex, nextPlayer, effectiveCrossfadeDurationMs, bpmSpeedRatio, keyPitchRatio)
                 } catch (e: Exception) {
                     if (e is CancellationException) {
                         if (secondaryPlayer != null && secondaryPlayer !== currentPlayer) {
@@ -3034,6 +3151,54 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     /**
+     * Suspends until [player] reaches [Player.STATE_READY] (returning true), or returns false
+     * immediately on error / [Player.STATE_ENDED] / [timeoutMs] expiry.
+     */
+    private suspend fun awaitPlayerReady(
+        player: ExoPlayer,
+        timeoutMs: Long,
+    ): Boolean {
+        if (player.playerError != null) return false
+        if (player.playbackState == Player.STATE_READY) return true
+        if (player.playbackState == Player.STATE_ENDED) return false
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine { cont ->
+                val listener =
+                    object : Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            when (playbackState) {
+                                Player.STATE_READY -> {
+                                    player.removeListener(this)
+                                    if (cont.isActive) cont.resume(true)
+                                }
+
+                                Player.STATE_ENDED -> {
+                                    player.removeListener(this)
+                                    if (cont.isActive) cont.resume(false)
+                                }
+                            }
+                        }
+
+                        override fun onPlayerError(error: PlaybackException) {
+                            player.removeListener(this)
+                            if (cont.isActive) cont.resume(false)
+                        }
+                    }
+                player.addListener(listener)
+                cont.invokeOnCancellation { player.removeListener(listener) }
+                // Re-check after registering the listener to avoid missing a synchronous transition.
+                if (player.playerError != null || player.playbackState == Player.STATE_ENDED) {
+                    player.removeListener(listener)
+                    if (cont.isActive) cont.resume(false)
+                } else if (player.playbackState == Player.STATE_READY) {
+                    player.removeListener(listener)
+                    if (cont.isActive) cont.resume(true)
+                }
+            }
+        } ?: false
+    }
+
+    /**
      * S-curve (sigmoid) function for DJ filter crossfade timing.
      * Keeps both tracks near full spectrum at the start and end,
      * with a steep transition in the middle — like a real DJ mixer crossfader.
@@ -3061,16 +3226,16 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     /**
-     * Perform the actual crossfade animation.
-     * Mirrors GstreamerPlayerAdapter.performCrossfade()
+     * Perform the actual crossfade animation using a ~30 Hz wall-clock loop so volume,
+     * DJ filter sweep, and BPM/pitch ramps stay smooth across both short (1s) and long (45s) fades.
      *
      * @param effectiveDurationMs The actual crossfade duration to use. May be shorter than
      *   the configured [crossfadeDurationMs] if URL resolution / buffering consumed
      *   part of the crossfade window.
-     * @param targetSpeedRatio BPM-based speed ratio for incoming track (1.0 = no adjustment).
-     *   Ramps from this value to 1.0 during crossfade so the track plays at natural speed after.
-     * @param targetPitchRatio Key-based pitch ratio for incoming track (1.0 = no adjustment).
-     *   Ramps from this value to 1.0 during crossfade.
+     * @param targetSpeedRatio BPM-based speed ratio for outgoing track (1.0 = no adjustment).
+     *   Ramps toward this value during crossfade so both tracks share the same effective BPM.
+     * @param targetPitchRatio Key-based pitch ratio for outgoing track (1.0 = no adjustment).
+     *   Ramps toward this value during crossfade.
      */
     private suspend fun performCrossfade(
         nextIndex: Int,
@@ -3079,29 +3244,28 @@ internal class CrossfadeExoPlayerAdapter(
         targetSpeedRatio: Float = 1.0f,
         targetPitchRatio: Float = 1.0f,
     ) {
-        val steps = 50 // 50 steps for smooth transition
-        val delayPerStep = (effectiveDurationMs / steps).coerceAtLeast(20) // min 20ms per step
-        val targetVolume = internalVolume
+        val durationMs = effectiveDurationMs.coerceAtLeast(100).toLong()
+        val stepIntervalMs = CROSSFADE_STEP_INTERVAL_MS
         val useDjFilter = djCrossfadeEnabled
         val useAutoMixRamp = targetSpeedRatio != 1.0f || targetPitchRatio != 1.0f
         Logger.d(
             TAG,
-            "Crossfade animation: ${effectiveDurationMs}ms, $steps steps, ${delayPerStep}ms/step, " +
+            "Crossfade animation: ${durationMs}ms, ${stepIntervalMs}ms wall-clock step (~30 Hz), " +
                 "dj=$useDjFilter, autoMix=$useAutoMixRamp (speed=$targetSpeedRatio, pitch=$targetPitchRatio)",
         )
 
-        // Setup DJ filters before starting animation
+        // Setup DJ filters atomically before starting animation
         if (useDjFilter) {
-            currentPlayerFilter?.let { filter ->
-                filter.filterType = BiquadFilter.FilterType.LOW_PASS
-                filter.cutoffFrequencyHz = LPF_START_HZ
-                filter.enabled = true
-            }
-            secondaryPlayerFilter?.let { filter ->
-                filter.filterType = BiquadFilter.FilterType.HIGH_PASS
-                filter.cutoffFrequencyHz = HPF_START_HZ
-                filter.enabled = true
-            }
+            currentPlayerFilter?.configure(
+                enabled = true,
+                filterType = BiquadFilter.FilterType.LOW_PASS,
+                cutoffFrequencyHz = LPF_START_HZ,
+            )
+            secondaryPlayerFilter?.configure(
+                enabled = true,
+                filterType = BiquadFilter.FilterType.HIGH_PASS,
+                cutoffFrequencyHz = HPF_START_HZ,
+            )
         }
 
         // Track last quantized speed/pitch to avoid redundant PlaybackParameters updates
@@ -3115,9 +3279,9 @@ internal class CrossfadeExoPlayerAdapter(
         val bpmRampPortion = BPM_RAMP_PORTION
 
         try {
-            for (step in 0..steps) {
-                if (!currentCoroutineContext().isActive) break
-
+            val startElapsedMs = SystemClock.elapsedRealtime()
+            var stepIndex = 0L
+            while (currentCoroutineContext().isActive) {
                 // The incoming player's error is routed by onPlayerError (retry or
                 // propagate) — stop the ramp instead of spending the rest of the fade
                 // fading in a dead player. finalizeCrossfade refuses to promote it.
@@ -3126,7 +3290,8 @@ internal class CrossfadeExoPlayerAdapter(
                     break
                 }
 
-                val progress = step.toFloat() / steps
+                val elapsedMs = (SystemClock.elapsedRealtime() - startElapsedMs).coerceAtLeast(0L)
+                val progress = (elapsedMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
                 val activeTargetVolume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
 
                 // Equal-power crossfade (cos/sin curves) instead of linear.
@@ -3148,7 +3313,7 @@ internal class CrossfadeExoPlayerAdapter(
                     currentPlayerFilter?.cutoffFrequencyHz =
                         exponentialInterpolate(LPF_START_HZ, LPF_END_HZ, filterProgress)
 
-                    // Incoming: HPF sweeps 8kHz → 20Hz
+                    // Incoming: HPF sweeps 2kHz → 20Hz
                     secondaryPlayerFilter?.cutoffFrequencyHz =
                         exponentialInterpolate(HPF_START_HZ, HPF_END_HZ, filterProgress)
                 }
@@ -3174,7 +3339,17 @@ internal class CrossfadeExoPlayerAdapter(
                     }
                 }
 
-                delay(delayPerStep.toLong())
+                if (progress >= 1f) break
+
+                stepIndex++
+                val nextTickElapsedMs = startElapsedMs + stepIndex * stepIntervalMs
+                val remainingToEndMs = (startElapsedMs + durationMs) - SystemClock.elapsedRealtime()
+                val sleepMs =
+                    minOf(
+                        (nextTickElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(10L),
+                        remainingToEndMs.coerceAtLeast(10L),
+                    ).coerceAtMost(stepIntervalMs)
+                delay(sleepMs)
             }
 
             // Transition complete
@@ -3236,20 +3411,26 @@ internal class CrossfadeExoPlayerAdapter(
         if (wanted.isEmpty()) return
         structureJob =
             adapterScope.launch {
+                val connectivityManager =
+                    context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val isMetered = connectivityManager?.isActiveNetworkMetered == true
                 for (id in wanted) {
                     loadAudioMetaIfNeeded(id)
-                    structureAttempts[id] = (structureAttempts[id] ?: 0) + 1
-                    structureRetryAt[id] = System.currentTimeMillis() + STRUCTURE_RETRY_MS
+                    if (!isMetered) {
+                        putBounded(structureAttempts, id, (structureAttempts[id] ?: 0) + 1)
+                    }
+                    putBounded(structureRetryAt, id, System.currentTimeMillis() + STRUCTURE_RETRY_MS)
                     val structure =
                         try {
-                            waveformReader.structure(id)
+                            waveformReader.structure(id, allowNetworkDownload = !isMetered)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
                             Logger.w(TAG, "AutoMix: could not measure $id: ${e.message}")
                             null
                         } ?: continue
-                    trackStructures[id] = structure
+                    putBounded(trackStructures, id, structure)
+                    autoMixCacheVersion++
                 }
             }
     }
@@ -3271,7 +3452,7 @@ internal class CrossfadeExoPlayerAdapter(
                 resolveAutoCrossfadeDurationMs(currentVideoId, nextVideoId).toLong(),
                 calculateBpmSpeedRatio(currentVideoId, nextVideoId),
             )
-        if (plan != null) transitionPlans[key] = plan else pairsWithoutPlan.add(key)
+        if (plan != null) putBounded(transitionPlans, key, plan) else addBounded(pairsWithoutPlan, key)
         Logger.d(TAG, "AutoMix plan $key: ${plan ?: "no clear drop, plain fade at the end"}")
         return plan
     }
@@ -3288,7 +3469,8 @@ internal class CrossfadeExoPlayerAdapter(
         keyScale: String?,
     ) {
         if (bpm != null || key != null) {
-            audioMetaCache[videoId] = SongAudioMeta(bpm, key, keyScale)
+            putBounded(audioMetaCache, videoId, SongAudioMeta(bpm, key, keyScale))
+            autoMixCacheVersion++
             Logger.d(TAG, "AutoMix meta updated: videoId=$videoId, bpm=$bpm, key=$key $keyScale")
         }
     }
@@ -3308,7 +3490,8 @@ internal class CrossfadeExoPlayerAdapter(
                 return
             }
             if (format.bpm != null || format.musicKey != null) {
-                audioMetaCache[videoId] = SongAudioMeta(format.bpm, format.musicKey, format.keyScale)
+                putBounded(audioMetaCache, videoId, SongAudioMeta(format.bpm, format.musicKey, format.keyScale))
+                autoMixCacheVersion++
                 Logger.d(TAG, "AutoMix meta loaded: videoId=$videoId, bpm=${format.bpm}, key=${format.musicKey} ${format.keyScale}")
             } else {
                 Logger.d(TAG, "AutoMix meta: format exists but no bpm/key data for videoId=$videoId")
@@ -3316,6 +3499,16 @@ internal class CrossfadeExoPlayerAdapter(
         } catch (e: Exception) {
             Logger.w(TAG, "Failed to load AutoMix meta for $videoId: ${e.message}")
         }
+    }
+
+    /**
+     * Resolve track BPM preferring Tidal audio analysis metadata and falling back to the local
+     * [TrackStructureAnalyzer] measurement when available.
+     */
+    private fun resolveBpm(videoId: String): Int? {
+        if (videoId.isBlank()) return null
+        audioMetaCache[videoId]?.bpm?.takeIf { it > 0 }?.let { return it }
+        return trackStructures[videoId]?.bpm?.roundToInt()?.takeIf { it > 0 }
     }
 
     /**
@@ -3336,8 +3529,8 @@ internal class CrossfadeExoPlayerAdapter(
 
     /**
      * Get BPM-adaptive target duration for auto crossfade.
-     * Linear interpolation: BPM 70 → 35s, BPM 170 → 12s.
-     * Slower songs get longer crossfade (like Apple Music AutoMix ~30s average).
+     * Linear interpolation: BPM 70 → 30s, BPM 170 → 7s.
+     * Slower songs get longer crossfade (like Apple Music AutoMix).
      */
     private fun getAutoTargetDurationMs(bpm: Int): Double {
         val clampedBpm = bpm.coerceIn(70, 170)
@@ -3358,10 +3551,9 @@ internal class CrossfadeExoPlayerAdapter(
         currentVideoId: String,
         nextVideoId: String,
     ): Int {
-        val currentBpm = audioMetaCache[currentVideoId]?.bpm
-        val nextBpm = audioMetaCache[nextVideoId]?.bpm
+        val currentBpm = resolveBpm(currentVideoId)
+        val nextBpm = resolveBpm(nextVideoId)
         if (currentBpm == null || nextBpm == null) return AUTO_FALLBACK_DURATION_MS
-        if (currentBpm <= 0 || nextBpm <= 0) return AUTO_FALLBACK_DURATION_MS
 
         val beatMs = 60_000.0 / currentBpm
         val baseTargetMs = getAutoTargetDurationMs(currentBpm)
@@ -3439,16 +3631,14 @@ internal class CrossfadeExoPlayerAdapter(
         currentVideoId: String,
         nextVideoId: String,
     ): Float {
-        val currentMeta = audioMetaCache[currentVideoId]
-        val nextMeta = audioMetaCache[nextVideoId]
-        val currentBpm = currentMeta?.bpm
-        val nextBpm = nextMeta?.bpm
+        val currentBpm = resolveBpm(currentVideoId)
+        val nextBpm = resolveBpm(nextVideoId)
 
         if (currentBpm == null || nextBpm == null) {
             Logger.d(
                 TAG,
-                "AutoMix BPM: missing data - current=$currentBpm (cached=${currentMeta != null}), " +
-                    "next=$nextBpm (cached=${nextMeta != null})",
+                "AutoMix BPM: missing data - current=$currentBpm (meta=${audioMetaCache.containsKey(currentVideoId)}, struct=${trackStructures.containsKey(currentVideoId)}), " +
+                    "next=$nextBpm (meta=${audioMetaCache.containsKey(nextVideoId)}, struct=${trackStructures.containsKey(nextVideoId)})",
             )
             return 1.0f
         }
@@ -3675,12 +3865,16 @@ internal class CrossfadeExoPlayerAdapter(
         private const val HPF_START_HZ = 2000f // High-pass starts lower — incoming track fills in faster
         private const val HPF_END_HZ = 20f // High-pass ends wide open
 
+        // Crossfade wall-clock ramp cadence (~30 Hz = 33 ms per step)
+        private const val CROSSFADE_STEP_INTERVAL_MS = 33L
+
         // AutoMix constants
-        private const val AUTO_FALLBACK_DURATION_MS = 30000 // Default when no BPM data
+        private const val AUTO_FALLBACK_DURATION_MS = 8000 // Safe default when no BPM data is available
         private const val STRUCTURE_RETRY_MS = 30_000L
         private const val STRUCTURE_MAX_ATTEMPTS = 3
-        private const val AUTO_MIN_DURATION_MS = 20000
+        private const val AUTO_MIN_DURATION_MS = 8000
         private const val AUTO_MAX_DURATION_MS = 45000
+        private const val MAX_AUTOMIX_CACHE_SIZE = 100
         private val BEAT_COUNT_OPTIONS = intArrayOf(8, 16, 24, 32, 40, 48, 64, 80, 96)
         private const val DEFAULT_BEAT_COUNT = 32
         private const val BPM_RATIO_MIN = 0.75f // Max 25% slower
@@ -3807,12 +4001,20 @@ internal class CrossfadeExoPlayerAdapter(
      */
     private fun startPositionUpdates() {
         stopPositionUpdates()
+        crossfadeDeferredPairKey = null
 
         // Stall watchdog state — local cursor/stall timer per loop, while watchdogFireCount stays
         // class-scoped per track so a watchdog reload cannot reset its own retry budget (#stall-loop).
         var watchdogLastPositionMs = -1L
         var watchdogStallStartMs = 0L
         var watchdogTrackHasPlayed = false
+
+        // Cached AutoMix resolution for the active (current, next) pair so the 50ms polling loop
+        // does not recompute BPM/Camelot duration or spam logs 40 times per second.
+        var cachedAutoPairKey: String? = null
+        var cachedAutoMetaVersion = -1
+        var cachedAutoDurationMs = AUTO_FALLBACK_DURATION_MS
+        var cachedAutoPlan: TransitionPlan? = null
 
         positionUpdateJob =
             adapterScope.launch {
@@ -3850,44 +4052,58 @@ internal class CrossfadeExoPlayerAdapter(
                                     !isNextTrackVideo() &&
                                     !isCurrentTrackLive() &&
                                     !isNextTrackLive() &&
-                                    !isCurrentTrackTooShortForCrossfade() &&
                                     !isWithinAlbum()
                                 ) {
-                                    // Account for playback speed: at higher speed, media time
-                                    // is consumed faster, so wall-clock remaining is shorter
-                                    val speed = internalPlaybackSpeed.coerceAtLeast(0.1f)
-                                    val timeRemaining = ((dur - pos) / speed).toLong()
                                     val nextVideoId = playlist.getOrNull(getNextMediaItemIndex())?.mediaId
-                                    val isPrecached = nextVideoId != null && precachedPlayers.containsKey(nextVideoId)
-                                    // If next track is precached, trigger at exactly crossfadeDurationMs.
-                                    // If NOT precached, trigger 3s earlier to allow preparation time.
-                                    val preparationBufferMs = if (isPrecached) 0L else 3000L
-                                    val isAutoMode = crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO
                                     val currentVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId ?: ""
-                                    if (isAutoMode) measureTrackStructures(currentVideoId, nextVideoId ?: "")
-                                    val plan = if (isAutoMode) transitionPlan(currentVideoId, nextVideoId ?: "") else null
-                                    // In Auto mode, calculate beat-quantized duration for trigger threshold.
-                                    val resolvedDurationMs =
-                                        if (isAutoMode) {
-                                            resolveAutoCrossfadeDurationMs(currentVideoId, nextVideoId ?: "")
-                                        } else {
-                                            crossfadeDurationMs
+                                    val pairKey = "$currentVideoId>${nextVideoId ?: ""}"
+                                    val isAutoMode = crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO
+                                    if (isAutoMode) {
+                                        measureTrackStructures(currentVideoId, nextVideoId ?: "")
+                                    }
+
+                                    val resolvedDurationMs: Int
+                                    val plan: TransitionPlan?
+                                    if (isAutoMode) {
+                                        val version = autoMixCacheVersion
+                                        if (cachedAutoPairKey != pairKey || cachedAutoMetaVersion != version) {
+                                            cachedAutoPairKey = pairKey
+                                            cachedAutoMetaVersion = version
+                                            cachedAutoDurationMs = resolveAutoCrossfadeDurationMs(currentVideoId, nextVideoId ?: "")
+                                            cachedAutoPlan = transitionPlan(currentVideoId, nextVideoId ?: "")
                                         }
-                                    val triggerThreshold = resolvedDurationMs.toLong() + preparationBufferMs
-                                    // A placed fade starts when the outgoing track reaches its window,
-                                    // with no preparation lead: the incoming track must not start early,
-                                    // or its drop misses the phrase end. Past the window (a seek) it falls
-                                    // back to the end of the track.
-                                    val reached =
-                                        if (plan != null && pos < plan.outgoingEndMs) {
-                                            pos >= plan.outgoingStartMs
-                                        } else {
-                                            timeRemaining in 1..triggerThreshold
-                                        }
-                                    if (reached) {
-                                        if (hasNextMediaItem()) {
-                                            val nextIndex = getNextMediaItemIndex()
-                                            triggerCrossfadeTransition(nextIndex)
+                                        resolvedDurationMs = cachedAutoDurationMs
+                                        plan = cachedAutoPlan
+                                    } else {
+                                        resolvedDurationMs = crossfadeDurationMs
+                                        plan = null
+                                    }
+
+                                    if (crossfadeDeferredPairKey != pairKey && !isCurrentTrackTooShortForCrossfade(resolvedDurationMs)) {
+                                        // Account for playback speed: at higher speed, media time
+                                        // is consumed faster, so wall-clock remaining is shorter
+                                        val speed = internalPlaybackSpeed.coerceAtLeast(0.1f)
+                                        val timeRemaining = ((dur - pos) / speed).toLong()
+                                        val isPrecached = nextVideoId != null && precachedPlayers.containsKey(nextVideoId)
+                                        // If next track is precached, trigger at exactly crossfadeDurationMs.
+                                        // If NOT precached, trigger 3s earlier to allow preparation time.
+                                        val preparationBufferMs = if (isPrecached) 0L else 3000L
+                                        val triggerThreshold = resolvedDurationMs.toLong() + preparationBufferMs
+                                        // A placed fade starts when the outgoing track reaches its window,
+                                        // with no preparation lead: the incoming track must not start early,
+                                        // or its drop misses the phrase end. Past the window (a seek) it falls
+                                        // back to the end of the track.
+                                        val reached =
+                                            if (plan != null && pos < plan.outgoingEndMs) {
+                                                pos >= plan.outgoingStartMs
+                                            } else {
+                                                timeRemaining in 1..triggerThreshold
+                                            }
+                                        if (reached) {
+                                            if (hasNextMediaItem()) {
+                                                val nextIndex = getNextMediaItemIndex()
+                                                triggerCrossfadeTransition(nextIndex)
+                                            }
                                         }
                                     }
                                 }
