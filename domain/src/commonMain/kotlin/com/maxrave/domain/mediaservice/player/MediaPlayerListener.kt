@@ -31,6 +31,8 @@ interface MediaPlayerListener {
 
     fun shouldOpenOrCloseEqualizerIntent(shouldOpen: Boolean) {}
 
+    fun onAudioSessionIdChanged(audioSessionId: Int) {}
+
     fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean, list: List<GenericMediaItem>) {}
 
     fun onRepeatModeChanged(repeatMode: Int) {}

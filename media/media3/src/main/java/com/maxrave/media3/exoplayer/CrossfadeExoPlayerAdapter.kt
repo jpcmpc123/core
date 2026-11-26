@@ -286,57 +286,153 @@ internal class CrossfadeExoPlayerAdapter(
     // of "music stops between tracks" (see androidx/media#2100). Instead we hold one
     // app-level AudioFocusRequest at the adapter level so focus survives every swap.
 
-    private val duckVolumeFactor = 0.2f
+    private val duckVolumeFactor = 0.35f
+    private val duckWatchdogTimeoutMs = 15_000L
+    private val duckRampDurationMs = 150L
 
     private val audioManager: AudioManager? by lazy {
         context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
 
-    @Volatile
-    private var hasAudioFocus = false
-
-    /** True when focus was lost transiently so playback should auto-resume on regain. */
-    @Volatile
-    private var resumeOnFocusGain = false
+    private val duckState = AudioFocusDuckState()
+    private var duckWatchdogJob: Job? = null
+    private var duckAnimationJob: Job? = null
 
     @Volatile
-    private var isDucked = false
+    private var currentDuckMultiplier = 1.0f
+
+    @Volatile
+    private var lastReportedAudioSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
+
+    private fun currentEffectiveVolume(): Float = internalVolume * currentDuckMultiplier
+
+    private fun applyEffectiveVolumeToCurrentPlayer() {
+        if (!isCrossfading) {
+            currentPlayer?.volume = currentEffectiveVolume()
+        }
+    }
+
+    private fun cancelDuckJobs() {
+        duckWatchdogJob?.cancel()
+        duckWatchdogJob = null
+        duckAnimationJob?.cancel()
+        duckAnimationJob = null
+    }
+
+    private fun animateDuckMultiplier(target: Float) {
+        val clamped = target.coerceIn(0f, 1f)
+        duckAnimationJob?.cancel()
+        duckAnimationJob = null
+        val start = currentDuckMultiplier
+        if (abs(start - clamped) < 0.005f) {
+            currentDuckMultiplier = clamped
+            applyEffectiveVolumeToCurrentPlayer()
+            return
+        }
+        val steps = 6
+        val stepDelayMs = (duckRampDurationMs / steps).coerceAtLeast(15L)
+        duckAnimationJob =
+            adapterScope.launch {
+                for (step in 1..steps) {
+                    val fraction = step.toFloat() / steps.toFloat()
+                    currentDuckMultiplier = start + (clamped - start) * fraction
+                    runOnAdapterMain {
+                        applyEffectiveVolumeToCurrentPlayer()
+                    }
+                    if (step < steps) {
+                        delay(stepDelayMs)
+                    }
+                }
+                currentDuckMultiplier = clamped
+                runOnAdapterMain {
+                    applyEffectiveVolumeToCurrentPlayer()
+                }
+            }
+    }
+
+    private fun startDuckWatchdog(expectedGeneration: Long) {
+        duckWatchdogJob?.cancel()
+        duckWatchdogJob =
+            adapterScope.launch {
+                delay(duckWatchdogTimeoutMs)
+                runOnAdapterMain {
+                    val isStillActive = internalState == InternalState.PLAYING || internalPlayWhenReady
+                    if (duckState.recoverOnWatchdogTimeout(expectedGeneration, isStillActive)) {
+                        Logger.i(
+                            "AudioFocus",
+                            "Duck watchdog expired after ${duckWatchdogTimeoutMs}ms; restoring full volume and re-requesting focus",
+                        )
+                        animateDuckMultiplier(1.0f)
+                        requestAudioFocusInternal(force = true)
+                    }
+                }
+            }
+    }
+
+    private fun clearDuckOnUserAction(reason: String) {
+        if (duckState.recoverOnUserAction()) {
+            cancelDuckJobs()
+            currentDuckMultiplier = 1.0f
+            applyEffectiveVolumeToCurrentPlayer()
+            Logger.i("AudioFocus", "Cleared stuck duck state on $reason; re-requesting audio focus")
+            requestAudioFocusInternal(force = true)
+        }
+    }
 
     private val audioFocusListener =
         AudioManager.OnAudioFocusChangeListener { focusChange ->
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_GAIN -> {
-                    isDucked = false
-                    // Don't fight the crossfade ramp; while crossfading it owns the volume (and reads isDucked).
-                    if (!isCrossfading) currentPlayer?.volume = internalVolume
-                    if (resumeOnFocusGain) {
-                        resumeOnFocusGain = false
-                        play()
+                    val res = duckState.onGain()
+                    Logger.i("AudioFocus", "AUDIOFOCUS_GAIN (wasDucked=${res.wasDucked}, shouldResume=${res.shouldResume})")
+                    duckWatchdogJob?.cancel()
+                    duckWatchdogJob = null
+                    runOnAdapterMain {
+                        animateDuckMultiplier(1.0f)
+                        if (res.shouldResume) {
+                            play()
+                        }
                     }
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS -> {
                     // Permanent loss (another app took over): pause and stop tracking focus.
-                    isDucked = false
-                    resumeOnFocusGain = false
-                    hasAudioFocus = false
-                    pauseInternal(fromFocusLoss = true)
+                    val wasDucked = duckState.onLossPermanent()
+                    Logger.i("AudioFocus", "AUDIOFOCUS_LOSS (wasDucked=$wasDucked)")
+                    cancelDuckJobs()
+                    currentDuckMultiplier = 1.0f
+                    runOnAdapterMain {
+                        pauseInternal(fromFocusLoss = true)
+                    }
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                    // Temporary loss (e.g. an incoming call): pause and remember to resume
-                    // both when playing and when preparing with intent to play.
-                    resumeOnFocusGain =
+                    // Temporary loss (e.g. an incoming call): clear ducking and mark focus lost so
+                    // explicit play or regain cleanly restores full volume.
+                    val shouldResume =
                         internalState == InternalState.PLAYING ||
-                        (internalState == InternalState.PREPARING && internalPlayWhenReady)
-                    pauseInternal(fromFocusLoss = true)
+                            (internalState == InternalState.PREPARING && internalPlayWhenReady)
+                    val wasDucked = duckState.onLossTransient(shouldResume)
+                    Logger.i("AudioFocus", "AUDIOFOCUS_LOSS_TRANSIENT (wasDucked=$wasDucked, willResume=$shouldResume)")
+                    cancelDuckJobs()
+                    currentDuckMultiplier = 1.0f
+                    runOnAdapterMain {
+                        applyEffectiveVolumeToCurrentPlayer()
+                        pauseInternal(fromFocusLoss = true)
+                    }
                 }
 
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                    // Lower the volume instead of pausing (e.g. a navigation prompt).
-                    // Skip direct assignment during crossfade — the ramp reads isDucked per step.
-                    isDucked = true
-                    if (!isCrossfading) currentPlayer?.volume = internalVolume * duckVolumeFactor
+                    // Lower the volume instead of pausing (e.g. a navigation prompt or notification).
+                    val generation = duckState.onLossTransientCanDuck()
+                    Logger.i(
+                        "AudioFocus",
+                        "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK (gen=$generation, factor=$duckVolumeFactor)",
+                    )
+                    startDuckWatchdog(generation)
+                    runOnAdapterMain {
+                        animateDuckMultiplier(duckVolumeFactor)
+                    }
                 }
             }
         }
@@ -355,24 +451,23 @@ internal class CrossfadeExoPlayerAdapter(
             .build()
     }
 
-    /** Request app-level audio focus once; idempotent while focus is held. */
-    private fun requestAudioFocusInternal(): Boolean {
+    /** Request app-level audio focus; pass [force] = true after stuck-duck or watchdog recovery. */
+    private fun requestAudioFocusInternal(force: Boolean = false): Boolean {
         val am = audioManager ?: return true
-        if (hasAudioFocus) return true
+        if (!force && duckState.hasAudioFocus) return true
         val granted = am.requestAudioFocus(audioFocusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        hasAudioFocus = granted
-        Logger.d(TAG, "requestAudioFocus -> granted=$granted")
+        duckState.onFocusRequested(granted)
+        Logger.i("AudioFocus", "requestAudioFocus(force=$force) -> granted=$granted")
         return granted
     }
 
     private fun abandonAudioFocusInternal() {
         val am = audioManager ?: return
-        isDucked = false
-        if (!hasAudioFocus) return
+        cancelDuckJobs()
+        currentDuckMultiplier = 1.0f
+        if (!duckState.onAbandon()) return
         am.abandonAudioFocusRequest(audioFocusRequest)
-        hasAudioFocus = false
-        resumeOnFocusGain = false
-        Logger.d(TAG, "abandonAudioFocus")
+        Logger.i("AudioFocus", "abandonAudioFocus")
     }
 
     // ========== Precaching System ==========
@@ -680,7 +775,9 @@ internal class CrossfadeExoPlayerAdapter(
         if (remotePlayer != null) {
             if (castRemotePlayer === remotePlayer) return
             castRemotePlayer = remotePlayer
-            isDucked = false
+            cancelDuckJobs()
+            currentDuckMultiplier = 1.0f
+            lastReportedAudioSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
             Logger.w(TAG, "Cast session active on ${deviceName ?: "unknown device"} — local playback suspended")
             runOnAdapterMain {
                 // Kill anything that makes local noise or wastes battery while remote, committing
@@ -872,6 +969,7 @@ internal class CrossfadeExoPlayerAdapter(
             return
         }
         runOnAdapterMain {
+            clearDuckOnUserAction("play")
             when (internalState) {
                 InternalState.IDLE -> {
                     val idleIndex = localCurrentMediaItemIndex
@@ -938,19 +1036,21 @@ internal class CrossfadeExoPlayerAdapter(
                         currentPlayer?.let { player ->
                             if (!requestAudioFocusInternal()) {
                                 Logger.w(TAG, "Play: audio focus denied; not starting playback")
-                                resumeOnFocusGain = true
+                                duckState.setResumeOnFocusGain(true)
                                 return@let
                             }
+                            duckState.clearResumeOnFocusGain()
                             if (internalState == InternalState.ENDED) {
                                 Logger.d(TAG, "Play: replaying from the start after end of queue")
                                 player.seekTo(0L)
                                 watchdogFireCount = 0
                             }
                             pausedAtMs = 0L
-                            player.volume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+                            player.volume = currentEffectiveVolume()
                             player.play()
                             transitionToState(InternalState.PLAYING)
                             internalPlayWhenReady = true
+                            syncAudioSessionAndEqualizer(player, notifyEqOpenIfPlaying = true)
                         } ?: Logger.w(TAG, "Play called but currentPlayer is null")
                     }
                 }
@@ -960,13 +1060,15 @@ internal class CrossfadeExoPlayerAdapter(
                     currentPlayer?.takeIf { it.playbackState != Player.STATE_ENDED }?.let { player ->
                         if (!requestAudioFocusInternal()) {
                             Logger.w(TAG, "Play: audio focus denied during PREPARING; will resume on focus gain")
-                            resumeOnFocusGain = true
+                            duckState.setResumeOnFocusGain(true)
                             internalPlayWhenReady = false
                             player.pause()
                         } else {
-                            player.volume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+                            duckState.clearResumeOnFocusGain()
+                            player.volume = currentEffectiveVolume()
                             player.play()
                             transitionToState(InternalState.PLAYING)
+                            syncAudioSessionAndEqualizer(player, notifyEqOpenIfPlaying = true)
                         }
                     }
                     Logger.d(TAG, "Play: During PREPARING - playWhenReady=$internalPlayWhenReady")
@@ -1034,7 +1136,7 @@ internal class CrossfadeExoPlayerAdapter(
     private fun pauseInternal(fromFocusLoss: Boolean) {
         Logger.d(TAG, "pause() called (state: $internalState, playWhenReady: $internalPlayWhenReady, focusLoss: $fromFocusLoss)")
         if (!fromFocusLoss) {
-            resumeOnFocusGain = false
+            duckState.clearResumeOnFocusGain()
         }
         castRemotePlayer?.let { remote ->
             internalPlayWhenReady = false
@@ -1091,7 +1193,7 @@ internal class CrossfadeExoPlayerAdapter(
     }
 
     override fun stop() {
-        resumeOnFocusGain = false
+        duckState.clearResumeOnFocusGain()
         castRemotePlayer?.let { remote ->
             remote.stop()
             return
@@ -1113,6 +1215,7 @@ internal class CrossfadeExoPlayerAdapter(
                 cachedBufferedPosition = 0L
                 cachedIsLoading = false
                 pausedAtMs = 0L
+                lastReportedAudioSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
                 transitionToState(InternalState.IDLE)
                 stopPositionUpdates()
                 abandonAudioFocusInternal()
@@ -1200,6 +1303,7 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun seekToNext() {
         runOnAdapterMain {
+            clearDuckOnUserAction("seekToNext")
             // During crossfade A→A+1, "next" commits A+1 as current (Direction 1: the UI already
             // shows A+1) and then advances to A+2. Outside crossfade it advances normally.
             val wasCrossfading = isCrossfading
@@ -1218,6 +1322,7 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun seekToPrevious() {
         runOnAdapterMain {
+            clearDuckOnUserAction("seekToPrevious")
             // During a crossfade, commit the incoming track (A+1) as current FIRST, so the
             // 3-second rule below evaluates against A+1's position/index (Direction 1).
             if (isCrossfading) {
@@ -1247,6 +1352,7 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun seekToPreviousMediaItem() {
         runOnAdapterMain {
+            clearDuckOnUserAction("seekToPreviousMediaItem")
             // Mirror seekToPrevious(): commit the incoming track (A+1) as current first.
             if (isCrossfading) {
                 Logger.d(TAG, "seekToPreviousMediaItem: committing incoming (A+1) first")
@@ -1867,7 +1973,7 @@ internal class CrossfadeExoPlayerAdapter(
         set(value) {
             Logger.w(TAG, "Setting volume to $value")
             internalVolume = value.coerceIn(0f, 1f)
-            val applied = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+            val applied = currentEffectiveVolume()
             runOnAdapterMain {
                 castRemotePlayer?.volume = internalVolume
                 if (!isCrossfading) {
@@ -1978,6 +2084,7 @@ internal class CrossfadeExoPlayerAdapter(
         clearAllPrecacheInternal()
 
         abandonAudioFocusInternal()
+        lastReportedAudioSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
         // Only this adapter's jobs — never the shared SERVICE_SCOPE (see adapterJob).
         adapterJob.cancel()
         outputRouter.release()
@@ -2232,7 +2339,10 @@ internal class CrossfadeExoPlayerAdapter(
             cachedIsLoading = !precacheAlreadyReady && adoptedBufferedPos <= startPos
 
             // 3. Apply settings and seek if needed
-            player.volume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+            if (shouldPlay && internalPlayWhenReady) {
+                clearDuckOnUserAction("loadAndPlayTrack")
+            }
+            player.volume = currentEffectiveVolume()
             player.playbackParameters = PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
             player.skipSilenceEnabled = internalSkipSilence
             if (startPos > 0L) {
@@ -2257,7 +2367,7 @@ internal class CrossfadeExoPlayerAdapter(
             if (shouldPlay && internalPlayWhenReady) {
                 if (!requestAudioFocusInternal()) {
                     Logger.w(TAG, "Load: audio focus denied; pausing until focus is granted")
-                    resumeOnFocusGain = true
+                    duckState.setResumeOnFocusGain(true)
                     internalPlayWhenReady = false
                     player.pause()
                     transitionToState(InternalState.READY)
@@ -2269,6 +2379,10 @@ internal class CrossfadeExoPlayerAdapter(
                 player.pause()
                 transitionToState(if (!internalPlayWhenReady) InternalState.PAUSED else InternalState.READY)
             }
+            syncAudioSessionAndEqualizer(
+                activePlayer = player,
+                notifyEqOpenIfPlaying = shouldPlay && internalPlayWhenReady,
+            )
 
             forwardingPlayer.suppressPlaybackEnded = false
 
@@ -2384,7 +2498,7 @@ internal class CrossfadeExoPlayerAdapter(
                         val pos = player.currentPosition
                         if (pos >= 0L) cachedPosition = pos
                         internalPlayWhenReady = false
-                        resumeOnFocusGain = false
+                        duckState.clearResumeOnFocusGain()
                         if (internalState != InternalState.PAUSED) {
                             pause()
                         }
@@ -2567,11 +2681,21 @@ internal class CrossfadeExoPlayerAdapter(
                     }
                 }
 
+                override fun onAudioSessionIdChanged(audioSessionId: Int) {
+                    if (player !== currentPlayer && !(isCrossfading && player === secondaryPlayer)) {
+                        return
+                    }
+                    syncAudioSessionAndEqualizer(
+                        activePlayer = player,
+                        notifyEqOpenIfPlaying = true,
+                    )
+                }
+
                 override fun onEvents(
                     player: Player,
                     events: Player.Events,
                 ) {
-                    if (player != currentPlayer) {
+                    if (player != currentPlayer && !(isCrossfading && player === secondaryPlayer)) {
                         Logger.d(TAG, "Ignoring onPlaybackStateChanged from non-current player")
                         return
                     }
@@ -2582,6 +2706,7 @@ internal class CrossfadeExoPlayerAdapter(
                             Player.EVENT_PLAY_WHEN_READY_CHANGED,
                             Player.EVENT_IS_PLAYING_CHANGED,
                             Player.EVENT_POSITION_DISCONTINUITY,
+                            Player.EVENT_AUDIO_SESSION_ID,
                         )
                     ) {
                         if (shouldBePlaying) {
@@ -2756,7 +2881,7 @@ internal class CrossfadeExoPlayerAdapter(
 
         // The incoming player was fading in: reduced volume + DJ filter on. Restore normal playback on A+1.
         currentPlayerFilter?.enabled = false
-        incoming.volume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+        incoming.volume = currentEffectiveVolume()
         incoming.playbackParameters = PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
         incoming.skipSilenceEnabled = internalSkipSilence
 
@@ -2768,6 +2893,7 @@ internal class CrossfadeExoPlayerAdapter(
 
         setCrossfading(false)
         crossfadeFromIndex = -1
+        syncAudioSessionAndEqualizer(incoming, notifyEqOpenIfPlaying = internalPlayWhenReady)
     }
 
     // ========== Internal: Track End ==========
@@ -3292,7 +3418,7 @@ internal class CrossfadeExoPlayerAdapter(
 
                 val elapsedMs = (SystemClock.elapsedRealtime() - startElapsedMs).coerceAtLeast(0L)
                 val progress = (elapsedMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
-                val activeTargetVolume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+                val activeTargetVolume = currentEffectiveVolume()
 
                 // Equal-power crossfade (cos/sin curves) instead of linear.
                 val fadeAngle = (progress * PI / 2).toFloat()
@@ -3958,7 +4084,7 @@ internal class CrossfadeExoPlayerAdapter(
         // not per-player, so it survives this crossfade swap (#2155).
 
         // Ensure correct volume and playback parameters
-        currentPlayer?.volume = if (isDucked) internalVolume * duckVolumeFactor else internalVolume
+        currentPlayer?.volume = currentEffectiveVolume()
         currentPlayer?.playbackParameters = PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
         currentPlayer?.skipSilenceEnabled = internalSkipSilence
 
@@ -3973,6 +4099,7 @@ internal class CrossfadeExoPlayerAdapter(
         setCrossfading(false)
         crossfadeFromIndex = -1
         transitionToState(InternalState.PLAYING)
+        syncAudioSessionAndEqualizer(nextPlayer, notifyEqOpenIfPlaying = true)
 
         // Ensure MediaSession notification has correct metadata after crossfade completes.
         forwardingPlayer.notifyMediaItemChanged()
@@ -4477,6 +4604,24 @@ internal class CrossfadeExoPlayerAdapter(
 
     private fun notifyEqualizerIntent(shouldOpen: Boolean) {
         listeners.forEach { it.shouldOpenOrCloseEqualizerIntent(shouldOpen) }
+    }
+
+    private fun syncAudioSessionAndEqualizer(
+        activePlayer: ExoPlayer?,
+        notifyEqOpenIfPlaying: Boolean,
+    ) {
+        val sessionId = activePlayer?.audioSessionId ?: PlayerConstants.AUDIO_SESSION_ID_UNSET
+        if (sessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
+        val sessionChanged = sessionId != lastReportedAudioSessionId
+        if (sessionChanged) {
+            lastReportedAudioSessionId = sessionId
+            listeners.forEach { it.onAudioSessionIdChanged(sessionId) }
+        }
+        if (notifyEqOpenIfPlaying &&
+            (internalState == InternalState.PLAYING || (internalPlayWhenReady && activePlayer?.playWhenReady == true))
+        ) {
+            notifyEqualizerIntent(true)
+        }
     }
 
     // ========== Internal: Shuffle Management ==========

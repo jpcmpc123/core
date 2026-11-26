@@ -355,7 +355,8 @@ internal class MediaServiceHandlerImpl(
     // List of Specific variables
 
     private var loudnessEnhancer: LoudnessEnhancer? = null
-    private var secondLoudnessEnhancer: LoudnessEnhancer? = null
+    private var openedEqualizerSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
+    private var volumeRampJob: Job? = null
 
     @Volatile
     private var skipSilent = false
@@ -732,6 +733,9 @@ internal class MediaServiceHandlerImpl(
                 skipSilent = initialSkipSilent
                 player.skipSilenceEnabled = initialSkipSilent
                 normalizeVolume = initialNormalize
+                if (initialNormalize) {
+                    mayBeNormalizeVolume()
+                }
                 if (savePlaybackState) {
                     Logger.d(TAG, "SaveStateOfPlayback TRUE")
                     Logger.d(TAG, "Shuffle: $shuffleKey")
@@ -1227,23 +1231,11 @@ internal class MediaServiceHandlerImpl(
         }
     }
 
-    private fun sendOpenEqualizerIntent() {
-        // No local audio session to expose to an equalizer while casting (or before one exists).
-        if (_castState.value.isRemote || player.audioSessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
-        context.sendBroadcast(
-            Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
-                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, player.audioSessionId)
-                putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.packageName)
-                putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
-            },
-        )
-    }
-
-    private fun sendCloseEqualizerIntent() {
-        if (_castState.value.isRemote || player.audioSessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
+    private fun sendCloseEqualizerIntentFor(sessionId: Int) {
+        if (sessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
         context.sendBroadcast(
             Intent(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION).apply {
-                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, player.audioSessionId)
+                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
                 // Mandatory per AudioEffect's javadoc, and missing from the pre-2.0.0 code this was
                 // restored from. AOSP's MusicFX returns early on a null package and closes sessions
                 // by package, so without it every CLOSE was ignored — and switching from the system
@@ -1251,6 +1243,43 @@ internal class MediaServiceHandlerImpl(
                 putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.packageName)
             },
         )
+    }
+
+    private fun sendOpenEqualizerIntent() {
+        // No local audio session to expose to an equalizer while casting (or before one exists).
+        val sessionId = player.audioSessionId
+        if (_castState.value.isRemote || sessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
+        if (openedEqualizerSessionId != PlayerConstants.AUDIO_SESSION_ID_UNSET &&
+            openedEqualizerSessionId != sessionId
+        ) {
+            sendCloseEqualizerIntentFor(openedEqualizerSessionId)
+        }
+        openedEqualizerSessionId = sessionId
+        context.sendBroadcast(
+            Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
+                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
+                putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.packageName)
+                putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
+            },
+        )
+    }
+
+    private fun sendCloseEqualizerIntent() {
+        if (_castState.value.isRemote) {
+            val previous = openedEqualizerSessionId
+            openedEqualizerSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
+            sendCloseEqualizerIntentFor(previous)
+            return
+        }
+        val currentSession = player.audioSessionId
+        val previousSession = openedEqualizerSessionId
+        openedEqualizerSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
+        if (previousSession != PlayerConstants.AUDIO_SESSION_ID_UNSET) {
+            sendCloseEqualizerIntentFor(previousSession)
+        }
+        if (currentSession != PlayerConstants.AUDIO_SESSION_ID_UNSET && currentSession != previousSession) {
+            sendCloseEqualizerIntentFor(currentSession)
+        }
     }
 
     @SuppressLint("PrivateResource")
@@ -2819,15 +2848,56 @@ internal class MediaServiceHandlerImpl(
         equalizerLivePreview.value = config
     }
 
+    private fun rampPlayerVolumeSmoothly(
+        targetVolume: Float,
+        durationMs: Long = 300L,
+    ) {
+        val clamped = targetVolume.coerceIn(0f, 1f)
+        volumeRampJob?.cancel()
+        volumeRampJob = null
+        if (_castState.value.isRemote) return
+        val start = player.volume
+        if (kotlin.math.abs(start - clamped) <= 0.01f || !player.isPlaying || player.currentPosition < 500L) {
+            if (player.volume != clamped) {
+                player.volume = clamped
+            }
+            return
+        }
+        val steps = 10
+        val stepDelayMs = (durationMs / steps).coerceAtLeast(15L)
+        volumeRampJob =
+            coroutineScope.launch(Dispatchers.Main) {
+                for (step in 1..steps) {
+                    if (_castState.value.isRemote) break
+                    val fraction = step.toFloat() / steps.toFloat()
+                    player.volume = start + (clamped - start) * fraction
+                    if (step < steps) {
+                        delay(stepDelayMs)
+                    }
+                }
+                if (!_castState.value.isRemote && player.volume != clamped) {
+                    player.volume = clamped
+                }
+            }
+    }
+
     override fun mayBeNormalizeVolume() {
         if (!normalizeVolume) {
+            val hadEnhancer = loudnessEnhancer != null
+            val hadAdjustedVolume = !_castState.value.isRemote && player.volume != 1f
             appliedEnhancerSessionId = PlayerConstants.AUDIO_SESSION_ID_UNSET
             loudnessEnhancer?.enabled = false
             loudnessEnhancer?.release()
             loudnessEnhancer = null
+            volumeRampJob?.cancel()
+            volumeRampJob = null
             volumeNormalizationJob?.cancel()
-            if (!_castState.value.isRemote && player.volume != 1f) {
+            volumeNormalizationJob = null
+            if (hadAdjustedVolume) {
                 player.volume = 1f
+            }
+            if (hadEnhancer || hadAdjustedVolume) {
+                Logger.i("AudioVolume", "Normalization disabled; restored volume=1.0")
             }
             return
         }
@@ -2857,7 +2927,7 @@ internal class MediaServiceHandlerImpl(
             volumeNormalizationJob?.cancel()
             volumeNormalizationJob =
                 coroutineScope.launch(Dispatchers.Main) {
-                    fun Float?.toMb() = ((this ?: 0f) * 100).toInt()
+                    var lastLoggedTrackAndParams: String? = null
                     streamRepository
                         .getFormatFlow(videoId)
                         .cancellable()
@@ -2865,24 +2935,33 @@ internal class MediaServiceHandlerImpl(
                         .collectLatest { format ->
                             if (format != null) {
                                 val norm = computeVolumeNormalization(format.loudnessDb)
-                                Logger.d(
-                                    TAG,
-                                    "Loudness: ${format.loudnessDb} dB -> volume=${norm.playerVolume}, enhancer=${norm.enhancerGainMb} mB",
-                                )
-                                if (!_castState.value.isRemote && player.volume != norm.playerVolume) {
-                                    player.volume = norm.playerVolume
+                                val summary = "$videoId:${format.loudnessDb}->vol=${norm.playerVolume},mb=${norm.enhancerGainMb}"
+                                if (lastLoggedTrackAndParams != summary) {
+                                    lastLoggedTrackAndParams = summary
+                                    Logger.i(
+                                        "AudioVolume",
+                                        "track=$videoId loudnessDb=${format.loudnessDb} -> volume=${norm.playerVolume}, enhancer=${norm.enhancerGainMb} mB",
+                                    )
                                 }
+                                rampPlayerVolumeSmoothly(norm.playerVolume)
                                 try {
                                     loudnessEnhancer?.setTargetGain(norm.enhancerGainMb)
                                     loudnessEnhancer?.enabled = norm.enhancerGainMb > 0
                                 } catch (e: Exception) {
                                     Logger.e(TAG, "mayBeNormalizeVolume: ${e.message}")
                                 }
+                            } else {
+                                // Never inherit the previous track's attenuation or enhancer boost while metadata is missing.
+                                volumeRampJob?.cancel()
+                                volumeRampJob = null
+                                if (!_castState.value.isRemote && player.volume != 1f) {
+                                    player.volume = 1f
+                                }
                                 try {
-                                    secondLoudnessEnhancer?.setTargetGain(norm.enhancerGainMb)
-                                    secondLoudnessEnhancer?.enabled = norm.enhancerGainMb > 0
+                                    loudnessEnhancer?.setTargetGain(0)
+                                    loudnessEnhancer?.enabled = false
                                 } catch (e: Exception) {
-                                    Logger.e(TAG, "mayBeNormalizeVolume: ${e.message}")
+                                    Logger.e(TAG, "mayBeNormalizeVolume(reset): ${e.message}")
                                 }
                             }
                         }
@@ -3022,10 +3101,6 @@ internal class MediaServiceHandlerImpl(
                 loudnessEnhancer?.enabled = false
                 loudnessEnhancer?.release()
                 loudnessEnhancer = null
-
-                secondLoudnessEnhancer?.enabled = false
-                secondLoudnessEnhancer?.release()
-                secondLoudnessEnhancer = null
             } catch (e: Exception) {
                 Logger.e("ServiceHandler", "Error releasing audio effects ${e.message}")
             }
@@ -3044,6 +3119,8 @@ internal class MediaServiceHandlerImpl(
             bufferedJob = null
             sleepTimerJob?.cancel()
             sleepTimerJob = null
+            volumeRampJob?.cancel()
+            volumeRampJob = null
             volumeNormalizationJob?.cancel()
             volumeNormalizationJob = null
             toggleLikeJob?.cancel()
@@ -3535,6 +3612,16 @@ internal class MediaServiceHandlerImpl(
         // Built-in selected: the session is never handed to a system equalizer, so the two cannot run together.
         if (!systemEqualizerSelected) return
         if (shouldOpen) sendOpenEqualizerIntent() else sendCloseEqualizerIntent()
+    }
+
+    override fun onAudioSessionIdChanged(audioSessionId: Int) {
+        if (_castState.value.isRemote || audioSessionId == PlayerConstants.AUDIO_SESSION_ID_UNSET) return
+        if (systemEqualizerSelected && player.isPlaying) {
+            sendOpenEqualizerIntent()
+        }
+        if (normalizeVolume && appliedEnhancerSessionId != audioSessionId) {
+            mayBeNormalizeVolume()
+        }
     }
 
     override fun onShuffleModeEnabledChanged(

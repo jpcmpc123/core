@@ -211,7 +211,7 @@ internal class StreamRepositoryImpl(
                         playbackTrackingVideostatsPlaybackUrl = playbackUrl,
                         playbackTrackingAtrUrl = atrUrl,
                         playbackTrackingVideostatsWatchtimeUrl = watchtimeUrl,
-                        loudnessDb = loudnessDb ?: existing.loudnessDb,
+                        loudnessDb = existing.loudnessDb ?: loudnessDb,
                     )
                 formatCache.update { it + (formatKey to (currentPair.first to updated)) }
             }

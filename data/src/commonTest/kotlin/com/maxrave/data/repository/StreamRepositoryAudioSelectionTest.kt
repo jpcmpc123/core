@@ -2,6 +2,8 @@ package com.maxrave.data.repository
 
 import com.maxrave.common.ITAG
 import com.maxrave.common.QUALITY
+import com.maxrave.data.mediaservice.NORMALIZATION_MAX_ENHANCER_MB
+import com.maxrave.data.mediaservice.NORMALIZATION_MIN_PLAYER_VOLUME
 import com.maxrave.data.mediaservice.computeVolumeNormalization
 import com.maxrave.kotlinytmusicscraper.models.response.PlayerResponse
 import kotlin.test.Test
@@ -133,18 +135,30 @@ class StreamRepositoryAudioSelectionTest {
     }
 
     @Test
-    fun computeVolumeNormalizationNeverEmitsNegativeEnhancerGain() {
-        val loudTrack = computeVolumeNormalization(6.0f)
-        assertTrue(loudTrack.playerVolume in 0.49f..0.51f)
-        assertEquals(0, loudTrack.enhancerGainMb)
+    fun computeVolumeNormalizationTargetsMobileLoudAndCapsCutsAndBoosts() {
+        // Normal commercial range (0..+4 dB above -14 LUFS) stays at full volume (1.0f)
+        val normalHot = computeVolumeNormalization(2.5f)
+        assertEquals(1.0f, normalHot.playerVolume)
+        assertEquals(0, normalHot.enhancerGainMb)
 
-        val quietTrack = computeVolumeNormalization(-4.0f)
+        // Over-hot master (+9 dB -> +5 dB over target) attenuates smoothly to ~0.56f (never < 0.56f)
+        val veryLoudTrack = computeVolumeNormalization(9.0f)
+        assertTrue(veryLoudTrack.playerVolume in 0.56f..0.57f)
+        assertEquals(0, veryLoudTrack.enhancerGainMb)
+
+        // Extreme +15 dB caps safely at the 0.56f (-5 dB) floor
+        val cappedLoudTrack = computeVolumeNormalization(15.0f)
+        assertEquals(NORMALIZATION_MIN_PLAYER_VOLUME, cappedLoudTrack.playerVolume)
+        assertEquals(0, cappedLoudTrack.enhancerGainMb)
+
+        // Quiet tracks boost cleanly via LoudnessEnhancer up to +500 mB
+        val quietTrack = computeVolumeNormalization(-3.5f)
         assertEquals(1.0f, quietTrack.playerVolume)
-        assertEquals(400, quietTrack.enhancerGainMb)
+        assertEquals(350, quietTrack.enhancerGainMb)
 
-        val veryQuietTrack = computeVolumeNormalization(-15.0f)
+        val veryQuietTrack = computeVolumeNormalization(-12.8f)
         assertEquals(1.0f, veryQuietTrack.playerVolume)
-        assertEquals(600, veryQuietTrack.enhancerGainMb)
+        assertEquals(NORMALIZATION_MAX_ENHANCER_MB, veryQuietTrack.enhancerGainMb)
 
         val neutralTrack = computeVolumeNormalization(0f)
         assertEquals(1.0f, neutralTrack.playerVolume)

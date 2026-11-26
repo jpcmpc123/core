@@ -796,7 +796,7 @@ interface DatabaseDao {
             "SET playbackTrackingVideostatsPlaybackUrl = :playbackUrl, " +
             "playbackTrackingAtrUrl = :atrUrl, " +
             "playbackTrackingVideostatsWatchtimeUrl = :watchtimeUrl, " +
-            "loudnessDb = COALESCE(:loudnessDb, loudnessDb) " +
+            "loudnessDb = COALESCE(loudnessDb, :loudnessDb) " +
             "WHERE videoId = :videoId AND cpn = :cpn",
     )
     suspend fun updatePlaybackTrackingAndLoudness(
