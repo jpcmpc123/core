@@ -79,7 +79,10 @@ internal class LocalDataSource(
 
     suspend fun getCanvasSong(max: Int) = databaseDao.getCanvasSong(max)
 
-    suspend fun getSongByListVideoIdFull(primaryKeyList: List<String>) = databaseDao.getSongByListVideoIdFull(primaryKeyList)
+    suspend fun getSongByListVideoIdFull(primaryKeyList: List<String>): List<SongEntity> =
+        queryInSqlChunks(primaryKeyList) { chunk ->
+            databaseDao.getSongByListVideoIdFull(chunk)
+        }
 
     suspend fun getDownloadedSongs(
         limit: Int,
@@ -913,3 +916,14 @@ private fun String.escapeForLike(): String =
     replace("\\", "\\\\")
         .replace("_", "\\_")
         .replace("%", "\\%")
+
+internal inline fun <T> queryInSqlChunks(
+    keys: List<String>,
+    chunkSize: Int = 500,
+    fetch: (List<String>) -> List<T>,
+): List<T> {
+    if (keys.isEmpty()) return emptyList()
+    val distinctKeys = keys.distinct()
+    if (distinctKeys.size <= chunkSize) return fetch(distinctKeys)
+    return distinctKeys.chunked(chunkSize).flatMap(fetch)
+}

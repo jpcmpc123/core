@@ -455,7 +455,7 @@ interface DatabaseDao {
         offset: Int,
     ): List<SongEntity>
 
-    @Query("SELECT * FROM song WHERE videoId IN (:primaryKeyList) LIMIT 1000")
+    @Query("SELECT * FROM song WHERE videoId IN (:primaryKeyList)")
     suspend fun getSongByListVideoIdFull(primaryKeyList: List<String>): List<SongEntity>
 
     @Query("SELECT * FROM song WHERE videoId IN (:primaryKeyList) LIMIT 50 OFFSET :offset")

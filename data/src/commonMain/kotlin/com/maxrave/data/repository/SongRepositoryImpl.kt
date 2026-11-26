@@ -296,6 +296,16 @@ internal class SongRepositoryImpl(
 
     override fun insertSong(songEntity: SongEntity): Flow<Long> = flow<Long> { emit(localDataSource.insertSong(songEntity)) }.flowOn(Dispatchers.IO)
 
+    override suspend fun insertSongs(songs: List<SongEntity>) {
+        if (songs.isEmpty()) return
+        withContext(Dispatchers.IO) {
+            for (chunk in songs.chunked(150)) {
+                localDataSource.insertSongs(chunk)
+                kotlinx.coroutines.yield()
+            }
+        }
+    }
+
     override fun updateThumbnailsSongEntity(
         thumbnail: String,
         videoId: String,

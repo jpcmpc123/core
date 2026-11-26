@@ -103,6 +103,7 @@ import com.maxrave.kotlinytmusicscraper.parser.fromPlaylistToTrackWithSetVideoId
 import com.maxrave.kotlinytmusicscraper.parser.getContinuePlaylistContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistExtrasNextContinuation
+import com.maxrave.kotlinytmusicscraper.parser.getPlaylistSectionContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getRelatedPlaylistItems
 import com.maxrave.kotlinytmusicscraper.parser.getReloadParams
 import com.maxrave.kotlinytmusicscraper.parser.getSuggestionSongItems
@@ -1065,11 +1066,18 @@ class YouTube {
                     .playlist(
                         if (playlistId.startsWith("VL")) playlistId else "VL$playlistId",
                     ).body<BrowseResponse>()
-            var continuation = initialResponse.getPlaylistContinuation()
+            if (initialResponse.hasReloadParams()) {
+                return@runCatching Pair(initialResponse.getReloadParams(), initialResponse.getSuggestionSongItems())
+            }
+            var continuation =
+                initialResponse.getPlaylistSectionContinuation()
+                    ?: initialResponse.getPlaylistContinuation()
             Logger.d(TAG, "YouTube: getSuggestionsTrackForPlaylist: $continuation")
             // A token seen twice would loop forever.
             val seenContinuations = mutableSetOf<String>()
-            while (continuation != null && seenContinuations.add(continuation)) {
+            var pages = 0
+            while (continuation != null && seenContinuations.add(continuation) && pages < 4) {
+                pages++
                 val continuationResponse =
                     ytMusic
                         .browse(
@@ -1082,11 +1090,13 @@ class YouTube {
                 if (continuationResponse.hasReloadParams()) {
                     return@runCatching Pair(continuationResponse.getReloadParams(), continuationResponse.getSuggestionSongItems())
                 } else {
-                    continuation = continuationResponse.getContinuePlaylistContinuation()
+                    continuation =
+                        continuationResponse.getPlaylistExtrasNextContinuation()
+                            ?: continuationResponse.getContinuePlaylistContinuation()
                 }
             }
             return@runCatching null
-        }
+        }.onFailure { if (it is CancellationException) throw it }
 
     data class PlaylistExtrasData(
         val reloadParams: String? = null,
@@ -1094,25 +1104,54 @@ class YouTube {
         val relatedPlaylists: List<PlaylistItem> = emptyList(),
     )
 
-    suspend fun getPlaylistSuggestionsAndRelated(playlistId: String): Result<PlaylistExtrasData> =
+    suspend fun getPlaylistSuggestionsAndRelated(
+        playlistId: String,
+        initialContinuation: String? = null,
+        initialExtras: PlaylistExtrasData? = null,
+    ): Result<PlaylistExtrasData> =
         runCatching {
-            val initialResponse =
-                ytMusic
-                    .playlist(
-                        if (playlistId.startsWith("VL")) playlistId else "VL$playlistId",
-                    ).body<BrowseResponse>()
-            var reloadParams = initialResponse.getReloadParams()
+            var reloadParams = initialExtras?.reloadParams
             val suggestions = mutableListOf<SongItem>()
-            if (reloadParams != null) {
-                suggestions.addAll(initialResponse.getSuggestionSongItems())
+            if (initialExtras != null) {
+                suggestions.addAll(initialExtras.suggestions)
             }
             val relatedPlaylists = mutableListOf<PlaylistItem>()
-            relatedPlaylists.addAll(initialResponse.getRelatedPlaylistItems())
+            if (initialExtras != null) {
+                relatedPlaylists.addAll(initialExtras.relatedPlaylists)
+            }
 
-            var continuation = initialResponse.getPlaylistExtrasNextContinuation()
+            if (reloadParams != null && relatedPlaylists.isNotEmpty()) {
+                return@runCatching PlaylistExtrasData(
+                    reloadParams = reloadParams,
+                    suggestions = suggestions,
+                    relatedPlaylists = relatedPlaylists,
+                )
+            }
+
+            var continuation: String? = initialContinuation
+            if (continuation == null) {
+                val initialResponse =
+                    ytMusic
+                        .playlist(
+                            if (playlistId.startsWith("VL")) playlistId else "VL$playlistId",
+                        ).body<BrowseResponse>()
+                if (reloadParams == null) {
+                    reloadParams = initialResponse.getReloadParams()
+                    if (reloadParams != null) {
+                        suggestions.addAll(initialResponse.getSuggestionSongItems())
+                    }
+                }
+                val initialRelated = initialResponse.getRelatedPlaylistItems()
+                if (initialRelated.isNotEmpty()) {
+                    val existingIds = relatedPlaylists.mapTo(HashSet()) { it.id }
+                    initialRelated.filterTo(relatedPlaylists) { it.id !in existingIds }
+                }
+                continuation = initialResponse.getPlaylistSectionContinuation()
+            }
+
             val seenContinuations = mutableSetOf<String>()
             var pages = 0
-            while (continuation != null && seenContinuations.add(continuation) && pages < 6) {
+            while (continuation != null && seenContinuations.add(continuation) && pages < 4) {
                 pages++
                 val continuationResponse =
                     ytMusic
@@ -1141,7 +1180,7 @@ class YouTube {
                 suggestions = suggestions,
                 relatedPlaylists = relatedPlaylists,
             )
-        }
+        }.onFailure { if (it is CancellationException) throw it }
 
     suspend fun getPlaylistFullTracks(playlistId: String): Result<List<SongItem>> =
         runCatching {

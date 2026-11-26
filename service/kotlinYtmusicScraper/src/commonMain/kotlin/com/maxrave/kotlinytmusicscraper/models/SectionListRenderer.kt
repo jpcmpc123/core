@@ -1,6 +1,7 @@
 package com.maxrave.kotlinytmusicscraper.models
 
 import com.maxrave.kotlinytmusicscraper.models.response.BrowseResponse
+import com.maxrave.kotlinytmusicscraper.models.youtube.data.YouTubeDataPage
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNames
@@ -47,6 +48,8 @@ data class SectionListRenderer(
         val musicResponsiveHeaderRenderer: MusicResponsiveHeaderRenderer?,
         val musicEditablePlaylistDetailHeaderRenderer: BrowseResponse.Header.MusicEditablePlaylistDetailHeaderRenderer?,
         val gridRenderer: GridRenderer?,
+        val continuationItemRenderer:
+            YouTubeDataPage.Contents.TwoColumnWatchNextResults.Results.Results.Content.ItemSectionRenderer.Content.ContinuationItemRenderer? = null,
     ) {
         @Serializable
         data class MusicResponsiveHeaderRenderer(

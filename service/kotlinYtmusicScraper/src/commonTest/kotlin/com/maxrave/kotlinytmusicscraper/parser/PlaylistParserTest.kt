@@ -202,4 +202,107 @@ class PlaylistParserTest {
         assertNull(body.description)
         assertEquals("PUBLIC", body.privacyStatus)
     }
+
+    @Test
+    fun largePlaylistPrefersSectionContinuationOverTrackContinuation() {
+        val raw =
+            """
+            {
+              "responseContext": {
+                "serviceTrackingParams": []
+              },
+              "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                  "tabs": [],
+                  "secondaryContents": {
+                    "sectionListRenderer": {
+                      "contents": [
+                        {
+                          "musicPlaylistShelfRenderer": {
+                            "collapsedItemCount": 100,
+                            "contents": [
+                              {
+                                "continuationItemRenderer": {
+                                  "continuationEndpoint": {
+                                    "continuationCommand": {
+                                      "token": "TRACK_CONT_PAGE_2"
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "continuations": [
+                        {
+                          "nextContinuationData": {
+                            "continuation": "SECTION_CONT_EXTRAS"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+            """.trimIndent()
+
+        val response = json.decodeFromString<BrowseResponse>(raw)
+        assertEquals("TRACK_CONT_PAGE_2", response.getPlaylistContinuation())
+        assertEquals("SECTION_CONT_EXTRAS", response.getPlaylistSectionContinuation())
+        assertEquals("SECTION_CONT_EXTRAS", response.getPlaylistExtrasNextContinuation())
+    }
+
+    @Test
+    fun largePlaylistExtractsSectionContinuationItemRendererOverTrackContinuation() {
+        val raw =
+            """
+            {
+              "responseContext": {
+                "serviceTrackingParams": []
+              },
+              "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                  "tabs": [],
+                  "secondaryContents": {
+                    "sectionListRenderer": {
+                      "contents": [
+                        {
+                          "musicPlaylistShelfRenderer": {
+                            "collapsedItemCount": 100,
+                            "contents": [
+                              {
+                                "continuationItemRenderer": {
+                                  "continuationEndpoint": {
+                                    "continuationCommand": {
+                                      "token": "TRACK_CONT_PAGE_2"
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "continuationItemRenderer": {
+                            "continuationEndpoint": {
+                              "continuationCommand": {
+                                "token": "SECTION_CONT_ITEM_TOKEN"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+            """.trimIndent()
+
+        val response = json.decodeFromString<BrowseResponse>(raw)
+        assertEquals("SECTION_CONT_ITEM_TOKEN", response.getPlaylistSectionContinuation())
+        assertEquals("SECTION_CONT_ITEM_TOKEN", response.getPlaylistExtrasNextContinuation())
+    }
 }

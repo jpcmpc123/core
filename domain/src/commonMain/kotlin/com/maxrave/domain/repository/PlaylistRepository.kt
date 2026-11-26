@@ -93,7 +93,11 @@ interface PlaylistRepository {
      */
     fun getChartPlaylist(): Flow<Resource<List<ChartItem>>>
 
-    fun getPlaylistExtras(playlistId: String): Flow<Resource<PlaylistExtras>>
+    fun getPlaylistExtras(
+        playlistId: String,
+        initialContinuation: String? = null,
+        initialExtras: PlaylistExtras? = null,
+    ): Flow<Resource<PlaylistExtras>>
 
     fun reloadPlaylistSuggestions(reloadParams: String): Flow<Resource<Pair<String?, List<Track>>>>
 

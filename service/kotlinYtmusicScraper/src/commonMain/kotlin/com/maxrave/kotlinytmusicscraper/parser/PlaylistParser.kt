@@ -351,7 +351,7 @@ fun MusicShelfRenderer.Content.toSongItem(): SongItem? {
         artists =
             flexColumns
                 .apply {
-                    Logger.w(
+                    Logger.d(
                         "PlaylistParser",
                         "Artists: ${this.map {
                             it.musicResponsiveListItemFlexColumnRenderer.text
@@ -363,7 +363,7 @@ fun MusicShelfRenderer.Content.toSongItem(): SongItem? {
                 }.filter {
                     it.musicResponsiveListItemFlexColumnRenderer.isArtist()
                 }.apply {
-                    Logger.w(
+                    Logger.d(
                         "PlaylistParser",
                         "Artists after filter: ${this.map {
                             it.musicResponsiveListItemFlexColumnRenderer.text
@@ -444,6 +444,25 @@ internal fun BrowseResponse.sectionListContents(): List<SectionListRenderer.Cont
             ?.sectionListRenderer
             ?.contents
             ?.let(::addAll)
+        onResponseReceivedActions
+            ?.mapNotNull { it.appendContinuationItemsAction }
+            ?.flatMap { it.continuationItems }
+            ?.forEach { item ->
+                if (item.musicShelfRenderer != null || item.musicCarouselShelfRenderer != null) {
+                    add(
+                        SectionListRenderer.Content(
+                            musicCarouselShelfRenderer = item.musicCarouselShelfRenderer,
+                            musicShelfRenderer = item.musicShelfRenderer,
+                            musicCardShelfRenderer = null,
+                            musicPlaylistShelfRenderer = null,
+                            musicDescriptionShelfRenderer = null,
+                            musicResponsiveHeaderRenderer = null,
+                            musicEditablePlaylistDetailHeaderRenderer = null,
+                            gridRenderer = null,
+                        ),
+                    )
+                }
+            }
     }
 
 private fun BrowseResponse.findSuggestionMusicShelf(): MusicShelfRenderer? =
@@ -453,10 +472,43 @@ private fun BrowseResponse.findSuggestionMusicShelf(): MusicShelfRenderer? =
             shelf.continuations?.firstOrNull()?.reloadContinuationData?.continuation != null
         }
 
-fun BrowseResponse.getPlaylistExtrasNextContinuation(): String? =
+/**
+ * Extracts only the outer `sectionListRenderer` continuation token used for lower playlist
+ * sections (Suggestions + Related Playlists), avoiding the track pagination token inside
+ * `musicPlaylistShelfRenderer` on playlists with >100 tracks.
+ */
+fun BrowseResponse.getPlaylistSectionContinuation(): String? =
     continuationContents?.sectionListContinuation?.continuations?.getContinuation()
+        ?: contents
+            ?.twoColumnBrowseResultsRenderer
+            ?.secondaryContents
+            ?.sectionListRenderer
+            ?.continuations
+            ?.getContinuation()
+        ?: contents
+            ?.singleColumnBrowseResultsRenderer
+            ?.tabs
+            ?.firstOrNull()
+            ?.tabRenderer
+            ?.content
+            ?.sectionListRenderer
+            ?.continuations
+            ?.getContinuation()
+        ?: contents?.sectionListRenderer?.continuations?.getContinuation()
+        ?: (
+            continuationContents?.sectionListContinuation?.contents
+                ?: contents?.twoColumnBrowseResultsRenderer?.secondaryContents?.sectionListRenderer?.contents
+                ?: contents?.singleColumnBrowseResultsRenderer?.tabs?.firstOrNull()?.tabRenderer?.content?.sectionListRenderer?.contents
+                ?: contents?.sectionListRenderer?.contents
+        )?.lastOrNull { it.continuationItemRenderer != null }
+            ?.continuationItemRenderer
+            ?.continuationEndpoint
+            ?.continuationCommand
+            ?.token
+
+fun BrowseResponse.getPlaylistExtrasNextContinuation(): String? =
+    getPlaylistSectionContinuation()
         ?: continuationContents?.musicPlaylistShelfContinuation?.continuations?.getContinuation()
-        ?: getPlaylistContinuation()
 
 /**
  * Check if the browse response has reload params, if true, this has the suggestion tracks

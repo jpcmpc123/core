@@ -30,16 +30,24 @@ import com.maxrave.domain.utils.toTrack
 import com.maxrave.kotlinytmusicscraper.YouTube
 import com.maxrave.kotlinytmusicscraper.extension.verifyYouTubePlaylistId
 import com.maxrave.kotlinytmusicscraper.models.MusicShelfRenderer
+import com.maxrave.kotlinytmusicscraper.models.PlaylistItem
 import com.maxrave.kotlinytmusicscraper.models.SongItem
 import com.maxrave.kotlinytmusicscraper.models.WatchEndpoint
 import com.maxrave.kotlinytmusicscraper.pages.NextPage
 import com.maxrave.kotlinytmusicscraper.pages.SearchPage
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistRadioEndpoint
+import com.maxrave.kotlinytmusicscraper.parser.getPlaylistSectionContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistShuffleEndpoint
+import com.maxrave.kotlinytmusicscraper.parser.getRelatedPlaylistItems
+import com.maxrave.kotlinytmusicscraper.parser.getReloadParams
+import com.maxrave.kotlinytmusicscraper.parser.getSuggestionSongItems
+import com.maxrave.kotlinytmusicscraper.parser.hasReloadParams
 import com.maxrave.logger.Logger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
@@ -480,7 +488,6 @@ internal class PlaylistRepositoryImpl(
                                     ?.musicPlaylistShelfRenderer
                                     ?.contents
                         if (data != null) {
-                            Logger.d("getPlaylistData", "data: $data")
                             Logger.d("getPlaylistData", "data size: ${data.size}")
                         }
                         val header =
@@ -508,14 +515,34 @@ internal class PlaylistRepositoryImpl(
                                     ?.musicEditablePlaylistDetailHeaderRenderer
                                     ?.header
                                     ?.musicResponsiveHeaderRenderer
-                        Logger.d("getPlaylistData", "header: $header")
                         val continueParam =
                             result.getPlaylistContinuation()
+                        val extrasContinueParam =
+                            result.getPlaylistSectionContinuation()
+                        val inlineReloadParams =
+                            if (result.hasReloadParams()) result.getReloadParams() else null
+                        val inlineSuggestions =
+                            if (inlineReloadParams != null) {
+                                result.getSuggestionSongItems().map { it.toTrack() }
+                            } else {
+                                emptyList()
+                            }
+                        val inlineRelated =
+                            result.getRelatedPlaylistItems().map { it.toPlaylistsResult() }
+                        val inlineExtras =
+                            if (inlineReloadParams != null || inlineSuggestions.isNotEmpty() || inlineRelated.isNotEmpty()) {
+                                PlaylistExtras(
+                                    reloadParams = inlineReloadParams,
+                                    suggestions = inlineSuggestions,
+                                    relatedPlaylists = inlineRelated,
+                                )
+                            } else {
+                                null
+                            }
                         val radioEndpoint =
                             result.getPlaylistRadioEndpoint()
                         val shuffleEndpoint =
                             result.getPlaylistShuffleEndpoint()
-                        Logger.d("getPlaylistData", "Endpoint: $radioEndpoint $shuffleEndpoint")
                         try {
                             parsePlaylistData(header, data ?: emptyList(), playlistId, viewString)?.let { playlist ->
                                 emit(
@@ -529,6 +556,8 @@ internal class PlaylistRepositoryImpl(
                                                 trackCount = (playlist.trackCount + listContent.size),
                                                 shuffleEndpoint = shuffleEndpoint?.toYouTubeWatchEndpoint(),
                                                 radioEndpoint = radioEndpoint?.toYouTubeWatchEndpoint(),
+                                                extrasContinuation = extrasContinueParam,
+                                                initialExtras = inlineExtras,
                                             ),
                                             continueParam,
                                         ),
@@ -540,6 +569,7 @@ internal class PlaylistRepositoryImpl(
                                 >("Error"),
                             )
                         } catch (e: Exception) {
+                            if (e is CancellationException) throw e
                             e.printStackTrace()
                             emit(
                                 Resource.Error<
@@ -548,6 +578,7 @@ internal class PlaylistRepositoryImpl(
                             )
                         }
                     }.onFailure { e ->
+                        if (e is CancellationException) throw e
                         Logger.e("getPlaylistData", e.message ?: "Error")
                         emit(
                             Resource.Error<
@@ -793,44 +824,98 @@ internal class PlaylistRepositoryImpl(
                 }
         }.flowOn(Dispatchers.IO)
 
-    override fun getPlaylistExtras(playlistId: String): Flow<Resource<PlaylistExtras>> =
+    override fun getPlaylistExtras(
+        playlistId: String,
+        initialContinuation: String?,
+        initialExtras: PlaylistExtras?,
+    ): Flow<Resource<PlaylistExtras>> =
         flow {
             val bareId = playlistId.removePrefix("VL")
-            youTube
-                .getPlaylistSuggestionsAndRelated(bareId)
+            val hasInitialSuggestions =
+                initialExtras != null &&
+                    (!initialExtras.reloadParams.isNullOrEmpty() || initialExtras.suggestions.isNotEmpty())
+            val hasInitialRelated = initialExtras?.relatedPlaylists?.isNotEmpty() == true
+            if (initialExtras != null && hasInitialSuggestions && hasInitialRelated) {
+                Logger.i(
+                    "PlaylistExtras",
+                    "id=$bareId inline=true suggestions=${initialExtras.suggestions.size} related=${initialExtras.relatedPlaylists.size}",
+                )
+                emit(Resource.Success(initialExtras))
+                return@flow
+            }
+            if (initialExtras != null && initialContinuation.isNullOrBlank()) {
+                Logger.i(
+                    "PlaylistExtras",
+                    "id=$bareId inlineOnly=true suggestions=${initialExtras.suggestions.size} related=${initialExtras.relatedPlaylists.size}",
+                )
+                emit(Resource.Success(initialExtras))
+                return@flow
+            }
+
+            var result = youTube.getPlaylistSuggestionsAndRelated(bareId, initialContinuation = initialContinuation)
+            if (result.isFailure) {
+                val err = result.exceptionOrNull()
+                if (err is CancellationException) throw err
+                delay(1000L)
+                result = youTube.getPlaylistSuggestionsAndRelated(bareId, initialContinuation = initialContinuation)
+            }
+            result
                 .onSuccess { data ->
-                    val suggestions = data.suggestions.map { it.toTrack() }
-                    val related =
-                        data.relatedPlaylists.map { item ->
-                            PlaylistsResult(
-                                author = item.author?.name.orEmpty(),
-                                browseId = item.id,
-                                category = "",
-                                itemCount = item.songCountText.orEmpty(),
-                                resultType = "PLAYLIST",
-                                thumbnails =
-                                    if (item.thumbnail.isNotBlank()) {
-                                        listOf(Thumbnail(width = 544, url = item.thumbnail, height = 544))
-                                    } else {
-                                        emptyList()
-                                    },
-                                title = item.title,
-                            )
+                    val fetchedSuggestions = data.suggestions.map { it.toTrack() }
+                    val fetchedRelated = data.relatedPlaylists.map { it.toPlaylistsResult() }
+                    val mergedSuggestions =
+                        if (fetchedSuggestions.isNotEmpty()) fetchedSuggestions else initialExtras?.suggestions.orEmpty()
+                    val mergedReload =
+                        data.reloadParams ?: initialExtras?.reloadParams
+                    val mergedRelated =
+                        buildList {
+                            val seen = HashSet<String>()
+                            initialExtras?.relatedPlaylists?.forEach { item ->
+                                if (seen.add(item.browseId)) add(item)
+                            }
+                            fetchedRelated.forEach { item ->
+                                if (seen.add(item.browseId)) add(item)
+                            }
                         }
+                    Logger.i(
+                        "PlaylistExtras",
+                        "id=$bareId reusedCont=${!initialContinuation.isNullOrBlank()} suggestions=${mergedSuggestions.size} related=${mergedRelated.size}",
+                    )
                     emit(
                         Resource.Success(
                             PlaylistExtras(
-                                reloadParams = data.reloadParams,
-                                suggestions = suggestions,
-                                relatedPlaylists = related,
+                                reloadParams = mergedReload,
+                                suggestions = mergedSuggestions,
+                                relatedPlaylists = mergedRelated,
                             ),
                         ),
                     )
                 }.onFailure { exception ->
-                    Logger.e("getPlaylistExtras", exception.message ?: "Error")
-                    emit(Resource.Error<PlaylistExtras>(exception.message ?: "Unknown error"))
+                    if (exception is CancellationException) throw exception
+                    if (initialExtras != null) {
+                        emit(Resource.Success(initialExtras))
+                    } else {
+                        Logger.e("getPlaylistExtras", exception.message ?: "Error")
+                        emit(Resource.Error<PlaylistExtras>(exception.message ?: "Unknown error"))
+                    }
                 }
         }.flowOn(Dispatchers.IO)
+
+    private fun PlaylistItem.toPlaylistsResult(): PlaylistsResult =
+        PlaylistsResult(
+            author = author?.name.orEmpty(),
+            browseId = id,
+            category = "",
+            itemCount = songCountText.orEmpty(),
+            resultType = "PLAYLIST",
+            thumbnails =
+                if (thumbnail.isNotBlank()) {
+                    listOf(Thumbnail(width = 544, url = thumbnail, height = 544))
+                } else {
+                    emptyList()
+                },
+            title = title,
+        )
 
     override fun reloadPlaylistSuggestions(reloadParams: String): Flow<Resource<Pair<String?, List<Track>>>> =
         flow {
@@ -856,9 +941,11 @@ internal class PlaylistRepositoryImpl(
                             emit(Resource.Error<Pair<String?, List<Track>>>("Empty suggestions"))
                         }
                     }.onFailure { exception ->
+                        if (exception is CancellationException) throw exception
                         emit(Resource.Error<Pair<String?, List<Track>>>(exception.message ?: "Unknown error"))
                     }
             }.onFailure { exception ->
+                if (exception is CancellationException) throw exception
                 emit(Resource.Error<Pair<String?, List<Track>>>(exception.message ?: "Unknown error"))
             }
         }.flowOn(Dispatchers.IO)
@@ -886,6 +973,7 @@ internal class PlaylistRepositoryImpl(
                         emit(Resource.Error<String>("FAILED"))
                     }
                 }.onFailure { exception ->
+                    if (exception is CancellationException) throw exception
                     emit(Resource.Error<String>(exception.message ?: "FAILED"))
                 }
         }.flowOn(Dispatchers.IO)

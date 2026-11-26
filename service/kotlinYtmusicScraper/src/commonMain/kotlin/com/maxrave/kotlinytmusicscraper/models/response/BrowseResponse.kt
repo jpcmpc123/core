@@ -3,6 +3,7 @@ package com.maxrave.kotlinytmusicscraper.models.response
 import com.maxrave.kotlinytmusicscraper.models.Button
 import com.maxrave.kotlinytmusicscraper.models.Continuation
 import com.maxrave.kotlinytmusicscraper.models.Menu
+import com.maxrave.kotlinytmusicscraper.models.MusicCarouselShelfRenderer
 import com.maxrave.kotlinytmusicscraper.models.MusicResponsiveListItemRenderer
 import com.maxrave.kotlinytmusicscraper.models.MusicShelfRenderer
 import com.maxrave.kotlinytmusicscraper.models.MusicTwoRowItemRenderer
@@ -39,6 +40,8 @@ data class BrowseResponse(
                 val musicResponsiveListItemRenderer: MusicResponsiveListItemRenderer?,
                 val continuationItemRenderer:
                     YouTubeDataPage.Contents.TwoColumnWatchNextResults.Results.Results.Content.ItemSectionRenderer.Content.ContinuationItemRenderer?,
+                val musicShelfRenderer: MusicShelfRenderer? = null,
+                val musicCarouselShelfRenderer: MusicCarouselShelfRenderer? = null,
             )
         }
     }

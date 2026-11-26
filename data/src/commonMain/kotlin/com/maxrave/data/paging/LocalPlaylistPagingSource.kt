@@ -25,7 +25,7 @@ internal class LocalPlaylistPagingSource(
                     filterState = filter,
                     offset = currentPage,
                 )
-            Logger.d("LocalPlaylistPagingSource", "load: $pairs")
+            Logger.d("LocalPlaylistPagingSource", "load pairs=${pairs?.size ?: 0}")
             val songs =
                 localDataSource
                     .getSongByListVideoIdFull(
@@ -38,14 +38,14 @@ internal class LocalPlaylistPagingSource(
                         Pair(songEntity, it)
                     }
                 }
-            Logger.d("LocalPlaylistPagingSource", "load: $songs")
+            Logger.d("LocalPlaylistPagingSource", "load songs=${songs.size}")
             return LoadResult.Page(
                 data = sorted,
                 prevKey = if (currentPage == 0) null else currentPage - 1,
                 nextKey = if (songs.isEmpty()) null else currentPage + 1,
             )
         } catch (e: Exception) {
-            Logger.e("LocalPlaylistPagingSource", "load: ${e.printStackTrace()}")
+            Logger.e("LocalPlaylistPagingSource", "load: ${e.message}")
             LoadResult.Error(e)
         }
     }
@@ -93,7 +93,7 @@ internal class LocalPlaylistTimeBasedPagingSource(
                             it
                         }
                     }
-            Logger.d("LocalPlaylistPagingSource", "load: $pairs")
+            Logger.d("LocalPlaylistPagingSource", "load time pairs=${pairs?.size ?: 0}")
             val songs =
                 localDataSource
                     .getSongByListVideoIdFull(
@@ -106,7 +106,7 @@ internal class LocalPlaylistTimeBasedPagingSource(
                         Pair(songEntity, it)
                     }
                 }
-            Logger.d("LocalPlaylistPagingSource", "load: $songs")
+            Logger.d("LocalPlaylistPagingSource", "load time songs=${songs.size}")
             val nextKey =
                 pairs?.lastOrNull()?.inPlaylist.let {
                     converter.dateToTimestamp(it)
