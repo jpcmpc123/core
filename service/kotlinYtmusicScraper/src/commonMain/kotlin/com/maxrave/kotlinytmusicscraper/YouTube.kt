@@ -352,51 +352,7 @@ class YouTube {
     ): Result<SearchResult> =
         runCatching {
             val response = ytMusic.search(WEB_REMIX, query, filter.value).body<SearchResponse>()
-            SearchResult(
-                items =
-                    response.contents
-                        ?.tabbedSearchResultsRenderer
-                        ?.tabs
-                        ?.firstOrNull()
-                        ?.tabRenderer
-                        ?.content
-                        ?.sectionListRenderer
-                        ?.contents
-                        ?.lastOrNull()
-                        ?.musicShelfRenderer
-                        ?.contents
-                        ?.mapNotNull {
-                            SearchPage.toYTItem(it.musicResponsiveListItemRenderer)
-                        }.orEmpty(),
-                listPodcast =
-                    response.contents
-                        ?.tabbedSearchResultsRenderer
-                        ?.tabs
-                        ?.firstOrNull()
-                        ?.tabRenderer
-                        ?.content
-                        ?.sectionListRenderer
-                        ?.contents
-                        ?.lastOrNull()
-                        ?.musicShelfRenderer
-                        ?.contents
-                        ?.mapNotNull {
-                            SearchPage.toPodcast(it.musicResponsiveListItemRenderer)
-                        }.orEmpty(),
-                continuation =
-                    response.contents
-                        ?.tabbedSearchResultsRenderer
-                        ?.tabs
-                        ?.firstOrNull()
-                        ?.tabRenderer
-                        ?.content
-                        ?.sectionListRenderer
-                        ?.contents
-                        ?.lastOrNull()
-                        ?.musicShelfRenderer
-                        ?.continuations
-                        ?.getContinuation(),
-            )
+            SearchPage.parseSearchResponse(response)
         }
 
     /**
@@ -407,23 +363,7 @@ class YouTube {
     suspend fun searchContinuation(continuation: String): Result<SearchResult> =
         runCatching {
             val response = ytMusic.search(WEB_REMIX, continuation = continuation).body<SearchResponse>()
-            SearchResult(
-                items =
-                    response.continuationContents
-                        ?.musicShelfContinuation
-                        ?.contents
-                        ?.mapNotNull {
-                            SearchPage.toYTItem(it.musicResponsiveListItemRenderer)
-                        }!!,
-                listPodcast =
-                    response.continuationContents.musicShelfContinuation.contents
-                        .mapNotNull {
-                            SearchPage.toPodcast(it.musicResponsiveListItemRenderer)
-                        }.orEmpty(),
-                continuation =
-                    response.continuationContents.musicShelfContinuation.continuations
-                        ?.getContinuation(),
-            )
+            SearchPage.parseSearchContinuation(response)
         }
 
     /**

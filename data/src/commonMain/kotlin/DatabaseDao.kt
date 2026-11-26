@@ -210,11 +210,14 @@ interface DatabaseDao {
     }
 
     // Get search history
-    @Query("SELECT * FROM search_history")
+    @Query("SELECT * FROM search_history ORDER BY rowid ASC")
     suspend fun getSearchHistory(): List<SearchHistory>
 
     @Query("DELETE FROM search_history")
     suspend fun deleteSearchHistory()
+
+    @Query("DELETE FROM search_history WHERE `query` = :query")
+    suspend fun deleteSearchHistoryByQuery(query: String)
 
     @Insert(onConflict = OnConflictStrategy.Companion.REPLACE)
     suspend fun insertSearchHistory(searchHistory: SearchHistory): Long

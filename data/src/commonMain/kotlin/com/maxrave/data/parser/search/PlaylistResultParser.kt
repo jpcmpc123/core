@@ -8,7 +8,7 @@ import com.maxrave.kotlinytmusicscraper.pages.SearchResult
 internal fun parseSearchPlaylist(result: SearchResult): ArrayList<PlaylistsResult> {
     val playlistsResult: ArrayList<PlaylistsResult> = arrayListOf()
     result.items.forEach {
-        val playlist = it as PlaylistItem
+        val playlist = it as? PlaylistItem ?: return@forEach
         playlistsResult.add(
             PlaylistsResult(
                 author = playlist.author?.name ?: "",

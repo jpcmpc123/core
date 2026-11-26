@@ -18,7 +18,7 @@ data class SearchResponse(
 
     @Serializable
     data class ContinuationContents(
-        val musicShelfContinuation: MusicShelfContinuation,
+        val musicShelfContinuation: MusicShelfContinuation? = null,
     ) {
         @Serializable
         data class MusicShelfContinuation(

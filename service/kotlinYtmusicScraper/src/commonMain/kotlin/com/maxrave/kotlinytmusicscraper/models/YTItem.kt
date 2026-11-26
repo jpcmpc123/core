@@ -106,8 +106,8 @@ data class PlaylistItem(
     val author: Artist?,
     val songCountText: String?,
     override val thumbnail: String,
-    val playEndpoint: WatchEndpoint?,
-    val shuffleEndpoint: WatchEndpoint,
+    val playEndpoint: WatchEndpoint? = null,
+    val shuffleEndpoint: WatchEndpoint? = null,
     val radioEndpoint: WatchEndpoint? = null,
 ) : YTItem() {
     override val explicit: Boolean

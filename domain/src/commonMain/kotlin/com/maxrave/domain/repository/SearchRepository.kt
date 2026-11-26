@@ -1,6 +1,7 @@
 package com.maxrave.domain.repository
 
 import com.maxrave.domain.data.entities.SearchHistory
+import com.maxrave.domain.data.model.searchResult.PagedSearchResult
 import com.maxrave.domain.data.model.searchResult.SearchSuggestions
 import com.maxrave.domain.data.model.searchResult.albums.AlbumsResult
 import com.maxrave.domain.data.model.searchResult.artists.ArtistsResult
@@ -17,6 +18,8 @@ interface SearchRepository {
 
     suspend fun deleteSearchHistory()
 
+    suspend fun deleteSearchHistoryByQuery(query: String)
+
     fun getSearchDataSong(query: String): Flow<Resource<ArrayList<SongsResult>>>
 
     fun getSearchDataVideo(query: String): Flow<Resource<ArrayList<VideosResult>>>
@@ -30,6 +33,41 @@ interface SearchRepository {
     fun getSearchDataAlbum(query: String): Flow<Resource<ArrayList<AlbumsResult>>>
 
     fun getSearchDataPlaylist(query: String): Flow<Resource<ArrayList<PlaylistsResult>>>
+
+    fun searchSongsPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<SongsResult>>>
+
+    fun searchVideosPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<VideosResult>>>
+
+    fun searchPodcastsPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<PlaylistsResult>>>
+
+    fun searchFeaturedPlaylistsPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<PlaylistsResult>>>
+
+    fun searchArtistsPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<ArtistsResult>>>
+
+    fun searchAlbumsPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<AlbumsResult>>>
+
+    fun searchPlaylistsPaged(
+        query: String,
+        continuation: String? = null,
+    ): Flow<Resource<PagedSearchResult<PlaylistsResult>>>
 
     fun getSuggestQuery(query: String): Flow<Resource<SearchSuggestions>>
 }

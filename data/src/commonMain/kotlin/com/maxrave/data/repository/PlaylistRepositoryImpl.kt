@@ -643,6 +643,7 @@ internal class PlaylistRepositoryImpl(
                                     parseNextLibraryPlaylist(nextInput),
                                 )
                             }.onFailure { exception ->
+                                if (exception is CancellationException) throw exception
                                 exception.printStackTrace()
                                 Logger.e("Library", "Error: ${exception.message}")
                                 continuation = null
@@ -666,6 +667,7 @@ internal class PlaylistRepositoryImpl(
                         emit(null)
                     }
                 }.onFailure { e ->
+                    if (e is CancellationException) throw e
                     Logger.e("Library", "Error: ${e.message}")
                     e.printStackTrace()
                     val account = localDataSource.getUsedGoogleAccount()

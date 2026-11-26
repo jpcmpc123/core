@@ -421,7 +421,7 @@ internal fun SearchSuggestions.toDomainSearchSuggestions(): com.maxrave.domain.d
                             author = it.author?.name ?: "YouTube Music",
                             browseId = it.id,
                             category = "",
-                            itemCount = "0",
+                            itemCount = it.songCountText ?: "",
                             resultType = "PLAYLIST",
                             thumbnails =
                                 listOf(
