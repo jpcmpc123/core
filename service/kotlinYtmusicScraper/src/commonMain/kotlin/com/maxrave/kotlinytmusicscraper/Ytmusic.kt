@@ -698,13 +698,17 @@ class Ytmusic {
     suspend fun createYouTubePlaylist(
         title: String,
         listVideoId: List<String>?,
+        description: String? = null,
+        privacyStatus: String = CreatePlaylistBody.PrivacyStatus.PRIVATE,
     ) = httpClient.post("playlist/create") {
         ytClient(WEB_REMIX, setLogin = true)
         setBody(
             CreatePlaylistBody(
                 context = WEB_REMIX.toContext(locale, visitorData),
                 title = title,
-                videoIds = listVideoId,
+                description = description?.takeIf { it.isNotBlank() },
+                privacyStatus = privacyStatus,
+                videoIds = listVideoId?.takeIf { it.isNotEmpty() },
             ),
         )
     }

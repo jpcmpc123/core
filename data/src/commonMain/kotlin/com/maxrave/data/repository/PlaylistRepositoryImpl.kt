@@ -16,6 +16,7 @@ import com.maxrave.domain.data.entities.YourYouTubePlaylistList
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.browse.playlist.Author
 import com.maxrave.domain.data.model.browse.playlist.PlaylistBrowse
+import com.maxrave.domain.data.model.browse.playlist.PlaylistExtras
 import com.maxrave.domain.data.model.searchResult.playlists.PlaylistsResult
 import com.maxrave.domain.data.model.searchResult.songs.Thumbnail
 import com.maxrave.domain.data.type.ChartItem
@@ -27,10 +28,12 @@ import com.maxrave.domain.utils.Resource
 import com.maxrave.domain.utils.isRadioMix
 import com.maxrave.domain.utils.toTrack
 import com.maxrave.kotlinytmusicscraper.YouTube
+import com.maxrave.kotlinytmusicscraper.extension.verifyYouTubePlaylistId
 import com.maxrave.kotlinytmusicscraper.models.MusicShelfRenderer
 import com.maxrave.kotlinytmusicscraper.models.SongItem
 import com.maxrave.kotlinytmusicscraper.models.WatchEndpoint
 import com.maxrave.kotlinytmusicscraper.pages.NextPage
+import com.maxrave.kotlinytmusicscraper.pages.SearchPage
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistRadioEndpoint
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistShuffleEndpoint
@@ -787,6 +790,103 @@ internal class PlaylistRepositoryImpl(
                 }.onFailure { exception ->
                     exception.printStackTrace()
                     emit(Resource.Error<List<ChartItem>>(exception.message ?: "Unknown error"))
+                }
+        }.flowOn(Dispatchers.IO)
+
+    override fun getPlaylistExtras(playlistId: String): Flow<Resource<PlaylistExtras>> =
+        flow {
+            val bareId = playlistId.removePrefix("VL")
+            youTube
+                .getPlaylistSuggestionsAndRelated(bareId)
+                .onSuccess { data ->
+                    val suggestions = data.suggestions.map { it.toTrack() }
+                    val related =
+                        data.relatedPlaylists.map { item ->
+                            PlaylistsResult(
+                                author = item.author?.name.orEmpty(),
+                                browseId = item.id,
+                                category = "",
+                                itemCount = item.songCountText.orEmpty(),
+                                resultType = "PLAYLIST",
+                                thumbnails =
+                                    if (item.thumbnail.isNotBlank()) {
+                                        listOf(Thumbnail(width = 544, url = item.thumbnail, height = 544))
+                                    } else {
+                                        emptyList()
+                                    },
+                                title = item.title,
+                            )
+                        }
+                    emit(
+                        Resource.Success(
+                            PlaylistExtras(
+                                reloadParams = data.reloadParams,
+                                suggestions = suggestions,
+                                relatedPlaylists = related,
+                            ),
+                        ),
+                    )
+                }.onFailure { exception ->
+                    Logger.e("getPlaylistExtras", exception.message ?: "Error")
+                    emit(Resource.Error<PlaylistExtras>(exception.message ?: "Unknown error"))
+                }
+        }.flowOn(Dispatchers.IO)
+
+    override fun reloadPlaylistSuggestions(reloadParams: String): Flow<Resource<Pair<String?, List<Track>>>> =
+        flow {
+            runCatching {
+                youTube
+                    .customQuery(browseId = "", continuation = reloadParams, setLogin = true)
+                    .onSuccess { values ->
+                        val contents = values.continuationContents?.musicShelfContinuation?.contents.orEmpty()
+                        val nextReload =
+                            values.continuationContents
+                                ?.musicShelfContinuation
+                                ?.continuations
+                                ?.firstOrNull()
+                                ?.reloadContinuationData
+                                ?.continuation
+                        val tracks =
+                            contents.mapNotNull { item ->
+                                (SearchPage.toYTItem(item.musicResponsiveListItemRenderer) as? SongItem)?.toTrack()
+                            }
+                        if (tracks.isNotEmpty() || nextReload != null) {
+                            emit(Resource.Success<Pair<String?, List<Track>>>(nextReload to tracks))
+                        } else {
+                            emit(Resource.Error<Pair<String?, List<Track>>>("Empty suggestions"))
+                        }
+                    }.onFailure { exception ->
+                        emit(Resource.Error<Pair<String?, List<Track>>>(exception.message ?: "Unknown error"))
+                    }
+            }.onFailure { exception ->
+                emit(Resource.Error<Pair<String?, List<Track>>>(exception.message ?: "Unknown error"))
+            }
+        }.flowOn(Dispatchers.IO)
+
+    override fun addTrackToYouTubePlaylist(
+        playlistId: String,
+        videoId: String,
+    ): Flow<Resource<String>> =
+        flow {
+            youTube
+                .addPlaylistItem(playlistId.verifyYouTubePlaylistId(), videoId)
+                .onSuccess { response ->
+                    if (response.playlistEditResults.isNotEmpty()) {
+                        for (editResult in response.playlistEditResults) {
+                            insertSetVideoId(
+                                SetVideoIdEntity(
+                                    videoId = editResult.playlistEditVideoAddedResultData.videoId,
+                                    setVideoId = editResult.playlistEditVideoAddedResultData.setVideoId,
+                                    youtubePlaylistId = playlistId.removePrefix("VL"),
+                                ),
+                            )
+                        }
+                        emit(Resource.Success(response.status))
+                    } else {
+                        emit(Resource.Error<String>("FAILED"))
+                    }
+                }.onFailure { exception ->
+                    emit(Resource.Error<String>(exception.message ?: "FAILED"))
                 }
         }.flowOn(Dispatchers.IO)
 }

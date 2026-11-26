@@ -1,7 +1,12 @@
 package com.maxrave.kotlinytmusicscraper.parser
 
+import com.maxrave.kotlinytmusicscraper.models.Artist
+import com.maxrave.kotlinytmusicscraper.models.BrowseEndpoint.BrowseEndpointContextSupportedConfigs.BrowseEndpointContextMusicConfig.Companion.MUSIC_PAGE_TYPE_PLAYLIST
 import com.maxrave.kotlinytmusicscraper.models.MusicResponsiveListItemRenderer
 import com.maxrave.kotlinytmusicscraper.models.MusicShelfRenderer
+import com.maxrave.kotlinytmusicscraper.models.MusicTwoRowItemRenderer
+import com.maxrave.kotlinytmusicscraper.models.PlaylistItem
+import com.maxrave.kotlinytmusicscraper.models.SectionListRenderer
 import com.maxrave.kotlinytmusicscraper.models.SongItem
 import com.maxrave.kotlinytmusicscraper.models.WatchEndpoint
 import com.maxrave.kotlinytmusicscraper.models.getContinuation
@@ -420,42 +425,148 @@ fun MusicShelfRenderer.Content.toSongItem(): SongItem? {
     )
 }
 
+internal fun BrowseResponse.sectionListContents(): List<SectionListRenderer.Content> =
+    buildList {
+        continuationContents?.sectionListContinuation?.contents?.let(::addAll)
+        contents?.sectionListRenderer?.contents?.let(::addAll)
+        contents
+            ?.singleColumnBrowseResultsRenderer
+            ?.tabs
+            ?.firstOrNull()
+            ?.tabRenderer
+            ?.content
+            ?.sectionListRenderer
+            ?.contents
+            ?.let(::addAll)
+        contents
+            ?.twoColumnBrowseResultsRenderer
+            ?.secondaryContents
+            ?.sectionListRenderer
+            ?.contents
+            ?.let(::addAll)
+    }
+
+private fun BrowseResponse.findSuggestionMusicShelf(): MusicShelfRenderer? =
+    sectionListContents()
+        .mapNotNull { it.musicShelfRenderer }
+        .firstOrNull { shelf ->
+            shelf.continuations?.firstOrNull()?.reloadContinuationData?.continuation != null
+        }
+
+fun BrowseResponse.getPlaylistExtrasNextContinuation(): String? =
+    continuationContents?.sectionListContinuation?.continuations?.getContinuation()
+        ?: continuationContents?.musicPlaylistShelfContinuation?.continuations?.getContinuation()
+        ?: getPlaylistContinuation()
+
 /**
  * Check if the browse response has reload params, if true, this has the suggestion tracks
  */
-fun BrowseResponse.hasReloadParams(): Boolean =
-    this.continuationContents
-        ?.sectionListContinuation
-        ?.contents
-        ?.firstOrNull()
-        ?.musicShelfRenderer
-        ?.continuations
-        ?.firstOrNull()
-        ?.reloadContinuationData
-        ?.continuation != null
+fun BrowseResponse.hasReloadParams(): Boolean = findSuggestionMusicShelf() != null
 
 fun BrowseResponse.getReloadParams(): String? =
-    this.continuationContents
-        ?.sectionListContinuation
-        ?.contents
-        ?.firstOrNull()
-        ?.musicShelfRenderer
+    findSuggestionMusicShelf()
         ?.continuations
         ?.firstOrNull()
         ?.reloadContinuationData
         ?.continuation
 
 fun BrowseResponse.getSuggestionSongItems(): List<SongItem> =
-    if (hasReloadParams()) {
-        this.continuationContents
-            ?.sectionListContinuation
-            ?.contents
+    findSuggestionMusicShelf()
+        ?.contents
+        ?.mapNotNull { content ->
+            content.toSongItem()
+        } ?: emptyList()
+
+fun BrowseResponse.getRelatedPlaylistItems(): List<PlaylistItem> =
+    sectionListContents()
+        .mapNotNull { it.musicCarouselShelfRenderer }
+        .flatMap { carousel ->
+            carousel.contents.mapNotNull { item ->
+                item.musicTwoRowItemRenderer?.toRelatedPlaylistItemOrNull()
+            }
+        }
+
+internal fun MusicTwoRowItemRenderer.toRelatedPlaylistItemOrNull(): PlaylistItem? {
+    val browseId =
+        navigationEndpoint
+            ?.browseEndpoint
+            ?.browseId
+            ?.removePrefix("VL")
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+    val pageType =
+        navigationEndpoint
+            ?.browseEndpoint
+            ?.browseEndpointContextSupportedConfigs
+            ?.browseEndpointContextMusicConfig
+            ?.pageType
+    if (!isPlaylist && pageType != MUSIC_PAGE_TYPE_PLAYLIST) return null
+    val playlistTitle =
+        title
+            ?.runs
             ?.firstOrNull()
-            ?.musicShelfRenderer
-            ?.contents
-            ?.mapNotNull { content ->
-                content.toSongItem()
-            } ?: emptyList()
-    } else {
-        emptyList()
-    }
+            ?.text
+            ?.takeIf { it.isNotBlank() } ?: return null
+    val thumb = thumbnailRenderer?.musicThumbnailRenderer?.getThumbnailUrl() ?: ""
+    val subtitleTokens =
+        subtitle
+            ?.runs
+            ?.map { it.text.trim() }
+            ?.filter { it.isNotEmpty() && it != "•" && it != "·" && it != "|" && it != "-" }
+            ?: emptyList()
+    val cleanedTokens =
+        if (subtitleTokens.firstOrNull().equals("playlist", ignoreCase = true)) {
+            subtitleTokens.drop(1)
+        } else {
+            subtitleTokens
+        }
+    val authorText = cleanedTokens.firstOrNull()
+    val authorId =
+        subtitle
+            ?.runs
+            ?.firstOrNull { it.navigationEndpoint?.browseEndpoint?.browseId != null }
+            ?.navigationEndpoint
+            ?.browseEndpoint
+            ?.browseId
+    val countOrViewsText =
+        if (cleanedTokens.size >= 2) {
+            cleanedTokens.drop(1).joinToString(" • ")
+        } else {
+            null
+        }
+    val overlayWatchEndpoint =
+        thumbnailOverlay
+            ?.musicItemThumbnailOverlayRenderer
+            ?.content
+            ?.musicPlayButtonRenderer
+            ?.playNavigationEndpoint
+            ?.watchPlaylistEndpoint
+    return PlaylistItem(
+        id = browseId,
+        title = playlistTitle,
+        author = authorText?.let { Artist(name = it, id = authorId) },
+        songCountText = countOrViewsText,
+        thumbnail = thumb,
+        playEndpoint = overlayWatchEndpoint ?: WatchEndpoint(playlistId = browseId),
+        shuffleEndpoint =
+            menu
+                ?.menuRenderer
+                ?.items
+                ?.find {
+                    it.menuNavigationItemRenderer?.icon?.iconType == "MUSIC_SHUFFLE"
+                }?.menuNavigationItemRenderer
+                ?.navigationEndpoint
+                ?.watchPlaylistEndpoint
+                ?: overlayWatchEndpoint
+                ?: WatchEndpoint(playlistId = browseId),
+        radioEndpoint =
+            menu
+                ?.menuRenderer
+                ?.items
+                ?.find {
+                    it.menuNavigationItemRenderer?.icon?.iconType == "MIX"
+                }?.menuNavigationItemRenderer
+                ?.navigationEndpoint
+                ?.watchPlaylistEndpoint,
+    )
+}

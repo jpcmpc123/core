@@ -4,7 +4,9 @@ import com.maxrave.domain.data.entities.ArtistEntity
 import com.maxrave.domain.data.entities.PlaylistEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.entities.YourYouTubePlaylistList
+import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.browse.playlist.PlaylistBrowse
+import com.maxrave.domain.data.model.browse.playlist.PlaylistExtras
 import com.maxrave.domain.data.model.searchResult.playlists.PlaylistsResult
 import com.maxrave.domain.data.type.ChartItem
 import com.maxrave.domain.data.type.PlaylistType
@@ -90,4 +92,13 @@ interface PlaylistRepository {
      * @return Country Code -> YouTube Music Playlist ID
      */
     fun getChartPlaylist(): Flow<Resource<List<ChartItem>>>
+
+    fun getPlaylistExtras(playlistId: String): Flow<Resource<PlaylistExtras>>
+
+    fun reloadPlaylistSuggestions(reloadParams: String): Flow<Resource<Pair<String?, List<Track>>>>
+
+    fun addTrackToYouTubePlaylist(
+        playlistId: String,
+        videoId: String,
+    ): Flow<Resource<String>>
 }

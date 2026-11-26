@@ -45,6 +45,7 @@ import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.TVHTML5_S
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.WEB
 import com.maxrave.kotlinytmusicscraper.models.YouTubeClient.Companion.WEB_REMIX
 import com.maxrave.kotlinytmusicscraper.models.YouTubeLocale
+import com.maxrave.kotlinytmusicscraper.models.body.CreatePlaylistBody
 import com.maxrave.kotlinytmusicscraper.models.getContinuation
 import com.maxrave.kotlinytmusicscraper.models.oddElements
 import com.maxrave.kotlinytmusicscraper.models.response.AccountMenuResponse
@@ -101,6 +102,8 @@ import com.maxrave.kotlinytmusicscraper.parser.fromPlaylistToTrack
 import com.maxrave.kotlinytmusicscraper.parser.fromPlaylistToTrackWithSetVideoId
 import com.maxrave.kotlinytmusicscraper.parser.getContinuePlaylistContinuation
 import com.maxrave.kotlinytmusicscraper.parser.getPlaylistContinuation
+import com.maxrave.kotlinytmusicscraper.parser.getPlaylistExtrasNextContinuation
+import com.maxrave.kotlinytmusicscraper.parser.getRelatedPlaylistItems
 import com.maxrave.kotlinytmusicscraper.parser.getReloadParams
 import com.maxrave.kotlinytmusicscraper.parser.getSuggestionSongItems
 import com.maxrave.kotlinytmusicscraper.parser.hasReloadParams
@@ -1083,6 +1086,61 @@ class YouTube {
                 }
             }
             return@runCatching null
+        }
+
+    data class PlaylistExtrasData(
+        val reloadParams: String? = null,
+        val suggestions: List<SongItem> = emptyList(),
+        val relatedPlaylists: List<PlaylistItem> = emptyList(),
+    )
+
+    suspend fun getPlaylistSuggestionsAndRelated(playlistId: String): Result<PlaylistExtrasData> =
+        runCatching {
+            val initialResponse =
+                ytMusic
+                    .playlist(
+                        if (playlistId.startsWith("VL")) playlistId else "VL$playlistId",
+                    ).body<BrowseResponse>()
+            var reloadParams = initialResponse.getReloadParams()
+            val suggestions = mutableListOf<SongItem>()
+            if (reloadParams != null) {
+                suggestions.addAll(initialResponse.getSuggestionSongItems())
+            }
+            val relatedPlaylists = mutableListOf<PlaylistItem>()
+            relatedPlaylists.addAll(initialResponse.getRelatedPlaylistItems())
+
+            var continuation = initialResponse.getPlaylistExtrasNextContinuation()
+            val seenContinuations = mutableSetOf<String>()
+            var pages = 0
+            while (continuation != null && seenContinuations.add(continuation) && pages < 6) {
+                pages++
+                val continuationResponse =
+                    ytMusic
+                        .browse(
+                            client = WEB_REMIX,
+                            setLogin = true,
+                            params = "wAEB",
+                            continuation = continuation,
+                        ).body<BrowseResponse>()
+                if (reloadParams == null && continuationResponse.hasReloadParams()) {
+                    reloadParams = continuationResponse.getReloadParams()
+                    suggestions.addAll(continuationResponse.getSuggestionSongItems())
+                }
+                val pageRelated = continuationResponse.getRelatedPlaylistItems()
+                if (pageRelated.isNotEmpty()) {
+                    val existingIds = relatedPlaylists.mapTo(HashSet()) { it.id }
+                    pageRelated.filterTo(relatedPlaylists) { it.id !in existingIds }
+                }
+                if (reloadParams != null && relatedPlaylists.isNotEmpty()) {
+                    break
+                }
+                continuation = continuationResponse.getPlaylistExtrasNextContinuation()
+            }
+            PlaylistExtrasData(
+                reloadParams = reloadParams,
+                suggestions = suggestions,
+                relatedPlaylists = relatedPlaylists,
+            )
         }
 
     suspend fun getPlaylistFullTracks(playlistId: String): Result<List<SongItem>> =
@@ -3292,8 +3350,10 @@ class YouTube {
     suspend fun createPlaylist(
         title: String,
         listVideoId: List<String>?,
+        description: String? = null,
+        privacyStatus: String = CreatePlaylistBody.PrivacyStatus.PRIVATE,
     ) = runCatching {
-        ytMusic.createYouTubePlaylist(title, listVideoId).body<CreatePlaylistResponse>()
+        ytMusic.createYouTubePlaylist(title, listVideoId, description, privacyStatus).body<CreatePlaylistResponse>()
     }
 
     /**

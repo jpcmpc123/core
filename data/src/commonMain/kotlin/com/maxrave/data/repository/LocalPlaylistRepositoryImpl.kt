@@ -22,6 +22,7 @@ import com.maxrave.domain.data.entities.PairSongLocalPlaylist
 import com.maxrave.domain.data.entities.SetVideoIdEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.browse.playlist.DualPlaylistCreationResult
 import com.maxrave.domain.data.model.browse.playlist.PlaylistState
 import com.maxrave.domain.extension.now
 import com.maxrave.domain.repository.LocalPlaylistRepository
@@ -1052,5 +1053,67 @@ internal class LocalPlaylistRepositoryImpl(
             }
 
             emit(LocalResource.Success("Position updated"))
+        }.flowOn(Dispatchers.IO)
+
+    override fun createPlaylistSyncedWithYouTube(
+        title: String,
+        description: String?,
+        privacyStatus: String,
+        isLoggedIn: Boolean,
+    ): Flow<LocalResource<DualPlaylistCreationResult>> =
+        flow {
+            emit(LocalResource.Loading())
+            val localId = localDataSource.insertLocalPlaylist(LocalPlaylistEntity(title = title))
+            if (localId <= 0L) {
+                emit(LocalResource.Error("Failed to create local playlist"))
+                return@flow
+            }
+            if (!isLoggedIn) {
+                emit(
+                    LocalResource.Success(
+                        DualPlaylistCreationResult(
+                            localId = localId,
+                            youtubePlaylistId = null,
+                            synced = false,
+                        ),
+                    ),
+                )
+                return@flow
+            }
+            val result =
+                youTube.createPlaylist(
+                    title = title,
+                    listVideoId = null,
+                    description = description,
+                    privacyStatus = privacyStatus,
+                )
+            val created = result.getOrNull()
+            val ytId = created?.playlistId?.removePrefix("VL")?.takeIf { it.isNotBlank() }
+            if (result.isSuccess && ytId != null) {
+                localDataSource.updateLocalPlaylistYouTubePlaylistId(localId, ytId)
+                localDataSource.updateLocalPlaylistYouTubePlaylistSyncState(localId, Synced)
+                emit(
+                    LocalResource.Success(
+                        DualPlaylistCreationResult(
+                            localId = localId,
+                            youtubePlaylistId = ytId,
+                            synced = true,
+                        ),
+                    ),
+                )
+            } else {
+                val err = result.exceptionOrNull()
+                Logger.w(TAG, "createPlaylistSyncedWithYouTube fallback to local: ${err?.message}")
+                emit(
+                    LocalResource.Success(
+                        DualPlaylistCreationResult(
+                            localId = localId,
+                            youtubePlaylistId = null,
+                            synced = false,
+                            errorMessage = err?.message,
+                        ),
+                    ),
+                )
+            }
         }.flowOn(Dispatchers.IO)
 }

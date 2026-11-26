@@ -6,6 +6,7 @@ import com.maxrave.domain.data.entities.PairSongLocalPlaylist
 import com.maxrave.domain.data.entities.SetVideoIdEntity
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
+import com.maxrave.domain.data.model.browse.playlist.DualPlaylistCreationResult
 import com.maxrave.domain.data.model.browse.playlist.PlaylistState
 import com.maxrave.domain.utils.FilterState
 import com.maxrave.domain.utils.LocalResource
@@ -206,4 +207,11 @@ interface LocalPlaylistRepository {
         youtubePlaylistId: String,
         videoId: String,
     ): Flow<LocalResource<String>>
+
+    fun createPlaylistSyncedWithYouTube(
+        title: String,
+        description: String? = null,
+        privacyStatus: String = "PUBLIC",
+        isLoggedIn: Boolean = false,
+    ): Flow<LocalResource<DualPlaylistCreationResult>>
 }
