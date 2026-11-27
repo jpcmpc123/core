@@ -4,6 +4,8 @@ import kotlinx.serialization.Serializable
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.cosh
+import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.pow
@@ -75,9 +77,11 @@ data class EqualizerEnhancements(
     val stereoWidth: Float = 1f,
     val bassMonoEnabled: Boolean = true,
     val spatialStage: Float = 0f,
+    val crossfeedEnabled: Boolean = false,
     val loudnessAmount: Float = 0f,
     val subsonicFilterEnabled: Boolean = true,
     val limiterEnabled: Boolean = true,
+    val bypassAutoEqOnSpeaker: Boolean = true,
 ) {
     fun sanitized(): EqualizerEnhancements =
         copy(
@@ -94,6 +98,7 @@ data class EqualizerEnhancements(
                 trebleBoostDb == 0f &&
                 abs(stereoWidth - 1f) < 0.005f &&
                 spatialStage < 0.01f &&
+                !crossfeedEnabled &&
                 loudnessAmount == 0f
 }
 
@@ -264,9 +269,11 @@ data class SavedEqualizerProfile(
     val stereoWidth: Float = 1f,
     val bassMonoEnabled: Boolean = true,
     val spatialStage: Float = 0f,
+    val crossfeedEnabled: Boolean = false,
     val loudnessAmount: Float = 0f,
     val subsonicFilterEnabled: Boolean = true,
     val limiterEnabled: Boolean = true,
+    val bypassAutoEqOnSpeaker: Boolean = true,
     val autoEqLayer: AutoEqLayer? = null,
     val updatedAtEpochMs: Long = 0L,
 ) {
@@ -278,9 +285,11 @@ data class SavedEqualizerProfile(
             stereoWidth = stereoWidth,
             bassMonoEnabled = bassMonoEnabled,
             spatialStage = spatialStage,
+            crossfeedEnabled = crossfeedEnabled,
             loudnessAmount = loudnessAmount,
             subsonicFilterEnabled = subsonicFilterEnabled,
             limiterEnabled = limiterEnabled,
+            bypassAutoEqOnSpeaker = bypassAutoEqOnSpeaker,
         ).sanitized()
 
     fun matches(
@@ -301,9 +310,11 @@ data class SavedEqualizerProfile(
         if (abs(stereoWidth - safeEnh.stereoWidth) >= 0.02f) return false
         if (bassMonoEnabled != safeEnh.bassMonoEnabled) return false
         if (abs(spatialStage - safeEnh.spatialStage) >= 0.02f) return false
+        if (crossfeedEnabled != safeEnh.crossfeedEnabled) return false
         if (abs(loudnessAmount - safeEnh.loudnessAmount) >= 0.02f) return false
         if (subsonicFilterEnabled != safeEnh.subsonicFilterEnabled) return false
         if (limiterEnabled != safeEnh.limiterEnabled) return false
+        if (bypassAutoEqOnSpeaker != safeEnh.bypassAutoEqOnSpeaker) return false
         val savedAutoPath = autoEqLayer?.takeIf { it.enabled }?.path
         val curAutoPath = currentAutoEqLayer?.takeIf { it.enabled }?.path
         return savedAutoPath == curAutoPath
@@ -382,7 +393,13 @@ fun computePeakResponseDb(
     return if (maxDb.isFinite()) maxDb else spatialStereoExtraDb.toFloat()
 }
 
-/** Computes normalized `[b0, b1, b2, a1, a2]` RBJ cookbook coefficients for [band] at [sampleRate]. */
+/**
+ * Computes normalized `[b0, b1, b2, a1, a2]` biquad coefficients for [band] at [sampleRate].
+ *
+ * Uses Martin Vicanek's symmetric Nyquist-decramped Matched Second-Order Peaking filter for
+ * [BiquadFilterKind.PEAKING] so 8–16 kHz treble and high AutoEq bands retain true analog bell
+ * geometry without oversampling or extra per-sample CPU cost.
+ */
 fun computeNormalizedBiquad(
     band: ParametricBand,
     sampleRate: Double,
@@ -390,6 +407,15 @@ fun computeNormalizedBiquad(
     if (!sampleRate.isFinite() || sampleRate <= 0.0) return null
     val safe = band.sanitized()
     if (safe.freqHz.toDouble() >= sampleRate * 0.49) return null
+
+    if (safe.kind == BiquadFilterKind.PEAKING) {
+        computeVicanekMatchedPeaking(
+            freqHz = safe.freqHz.toDouble(),
+            gainDb = safe.gainDb.toDouble(),
+            q = safe.q.toDouble(),
+            sampleRate = sampleRate,
+        )?.let { return it }
+    }
 
     val w0 = 2.0 * PI * safe.freqHz / sampleRate
     val cosW0 = cos(w0)
@@ -453,6 +479,80 @@ fun computeNormalizedBiquad(
     if (!a0.isFinite() || abs(a0) < 1e-12) return null
     val result = doubleArrayOf(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
     return if (result.all { it.isFinite() }) result else null
+}
+
+/**
+ * Symmetric Martin Vicanek Matched Second-Order Peaking EQ.
+ *
+ * Computes the boost prototype (`|gainDb| > 0`) using impulse-invariant poles and exact DC /
+ * center-frequency / analog-Nyquist magnitude matching; cuts (`gainDb < 0`) take the exact
+ * minimum-phase reciprocal `1 / H_boost(z)` so `+g dB` and `-g dB` cancel identically.
+ */
+private fun computeVicanekMatchedPeaking(
+    freqHz: Double,
+    gainDb: Double,
+    q: Double,
+    sampleRate: Double,
+): DoubleArray? {
+    if (abs(gainDb) < 1e-6) return doubleArrayOf(1.0, 0.0, 0.0, 0.0, 0.0)
+    val isCut = gainDb < 0.0
+    val absGainDb = if (isCut) -gainDb else gainDb
+    val w0 = 2.0 * PI * freqHz / sampleRate
+    if (w0 <= 1e-6 || w0 >= PI * 0.98) return null
+
+    val a = 10.0.pow(absGainDb / 40.0)
+    val g = a * a
+    val damping = 1.0 / (2.0 * q * a)
+    val expDamp = exp(-damping * w0)
+    val a1 =
+        if (damping <= 1.0) {
+            -2.0 * expDamp * cos(sqrt(1.0 - damping * damping) * w0)
+        } else {
+            -2.0 * expDamp * cosh(sqrt(damping * damping - 1.0) * w0)
+        }
+    val a2 = expDamp * expDamp
+
+    val capA0 = (1.0 + a1 + a2) * (1.0 + a1 + a2)
+    val capA1 = (1.0 - a1 + a2) * (1.0 - a1 + a2)
+    val capA2 = -4.0 * a2
+
+    val sinHalf = sin(w0 * 0.5)
+    val phi1 = sinHalf * sinHalf
+    val phi0 = 1.0 - phi1
+    val phi2 = 4.0 * phi0 * phi1
+    if (phi2 < 1e-12) return null
+
+    // Exact analog prototype squared magnitude at Nyquist (w = pi)
+    val delta = w0 * w0 - PI * PI
+    val term = w0 * PI / q
+    val gNyqSq = (delta * delta + (term * a) * (term * a)) / (delta * delta + (term / a) * (term / a))
+
+    val capB0 = capA0
+    val capB1 = capA1 * gNyqSq
+    val capB2 = (g * g * (capA0 * phi0 + capA1 * phi1 + capA2 * phi2) - capB0 * phi0 - capB1 * phi1) / phi2
+
+    val sqrtB0 = sqrt(capB0.coerceAtLeast(0.0))
+    val sqrtB1 = sqrt(capB1.coerceAtLeast(0.0))
+    val w = 0.5 * (sqrtB0 + sqrtB1)
+    val disc = w * w + capB2
+    if (!disc.isFinite() || disc < 0.0 || w <= 1e-12) return null
+
+    val b0 = 0.5 * (w + sqrt(disc))
+    if (!b0.isFinite() || abs(b0) < 1e-12) return null
+    val b1 = 0.5 * (sqrtB0 - sqrtB1)
+    val b2 = -capB2 / (4.0 * b0)
+
+    val result =
+        if (isCut) {
+            doubleArrayOf(1.0 / b0, a1 / b0, a2 / b0, b1 / b0, b2 / b0)
+        } else {
+            doubleArrayOf(b0, b1, b2, a1, a2)
+        }
+    // Verify Jury stability triangle for the resulting denominator (1, a1_out, a2_out)
+    val a1Out = result[3]
+    val a2Out = result[4]
+    val stable = result.all { it.isFinite() } && abs(a2Out) < 0.999999 && abs(a1Out) < 1.0 + a2Out - 1e-9
+    return if (stable) result else null
 }
 
 private fun finiteOr(

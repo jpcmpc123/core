@@ -212,6 +212,13 @@ interface MediaPlayerInterface {
         setEqualizer(config.normalizedBandsDb, config.effectivePreampDb())
 
     /**
+     * Apply distortion-free linear ReplayGain track normalization (in dB) inside the player's
+     * floating-point DSP pipeline, completely avoiding Android HAL `LoudnessEnhancer` compression
+     * and keeping per-track normalization independent across crossfades.
+     */
+    fun setTrackNormalizationGainDb(gainDb: Float) = Unit
+
+    /**
      * Apply the delay/echo and reverb effects, or remove them.
      *
      * A `null` member of [effects] means that effect is off, and [AudioEffects.NONE] removes both —

@@ -25,15 +25,16 @@ import kotlin.math.tanh
 
 /**
  * Pure-Kotlin studio DSP kernel behind [EqualizerAudioProcessor]:
- * 1. Smooth-ramped input preamp / A-B bypass crossfade (10 ms anti-click transition)
- * 2. Fixed-slot Transposed Direct Form II (TDF-II) RBJ biquad cascade with 10 ms per-coefficient
- *    interpolation so crossing 0 dB or dragging treble sliders never shifts stage state or produces
- *    zipper noise
- * 3. Mid/Side Stereo Width stage (> 100 Hz) with LR2 Bass Mono guard (< 100 Hz) and open
- *    early-reflection Spatial Stage
- * 4. 2 ms Lookahead True-Peak Limiter (-0.8 dBFS ceiling, O(1) monotonic deque, zero heap
- *    allocations) eliminating high-frequency hard clipping, aliasing, and inter-sample peaks
- * 5. TPDF dither on PCM 16-bit output (zero allocation in audio loop)
+ * 1. Independent 64-bit pure linear ReplayGain normalization (200 ms ramp, zero HAL compression)
+ * 2. Smooth-ramped input preamp / A-B bypass crossfade (10 ms anti-click transition)
+ * 3. Fixed-slot Transposed Direct Form II (TDF-II) Vicanek-matched/RBJ biquad cascade with 10 ms
+ *    per-coefficient interpolation so crossing 0 dB or dragging treble sliders never shifts stage
+ *    state or produces zipper noise
+ * 4. Mid/Side Stereo Width stage (> 100 Hz) with LR2 Bass Mono guard (< 100 Hz), open
+ *    early-reflection Spatial Stage, and optional BS2B Headphone Crossfeed (700 Hz / 4.5 dB)
+ * 5. 2 ms Lookahead 4x True-Peak Limiter (-0.3 dBFS ceiling, -1.0 dBFS transparent knee, 8-tap
+ *    Kaiser-sinc polyphase detector, O(1) monotonic deque, zero heap allocations)
+ * 6. TPDF dither on PCM 16-bit output (zero allocation in audio loop)
  *
  * Kept free of Android framework types so unit tests can run directly on JVM without `android.jar`
  * stubs, matching [EchoKernel].
@@ -69,7 +70,14 @@ internal class EqualizerKernel {
     private var bassMonoZ1 = 0.0
     private var bassMonoZ2 = 0.0
 
-    /** Preamp, stereo width, spatial stage & A-B wet/dry smoothing ramps (10 ms). */
+    /** Independent per-track ReplayGain normalization (64-bit linear gain, 200 ms ramp). */
+    private var appliedNormGainDb = 0f
+    private var currentNormGain = 1.0
+    private var targetNormGain = 1.0
+    private var normGainStep = 0.0
+    private var hasProcessedSamples = false
+
+    /** Preamp, stereo width, spatial stage, BS2B crossfeed & A-B wet/dry smoothing ramps (10 ms). */
     private var currentPreampGain = 1.0
     private var targetPreampGain = 1.0
     private var preampStep = 0.0
@@ -85,6 +93,14 @@ internal class EqualizerKernel {
     private var currentSpatialStage = 0.0
     private var targetSpatialStage = 0.0
     private var spatialStageStep = 0.0
+
+    /** BS2B Headphone Crossfeed (700 Hz / 4.5 dB unity-mono 1-pole LPF). */
+    private var currentCrossfeed = 0.0
+    private var targetCrossfeed = 0.0
+    private var crossfeedStep = 0.0
+    private var crossfeedAlpha = 0.91
+    private var crossfeedLpL = 0.0
+    private var crossfeedLpR = 0.0
 
     /** Pre-allocated early-reflection delay lines for Wavelet-style open spatial stage (L/R). */
     private var spatialDelayL = DoubleArray(0)
@@ -111,11 +127,14 @@ internal class EqualizerKernel {
     private var limiterEnabled = true
     private var bypassActive = true
 
-    /** 2 ms Lookahead True-Peak Limiter with O(1) amortized monotonic peak deque. */
+    /** 2 ms Lookahead 4x True-Peak Limiter with O(1) amortized monotonic peak deque. */
     private var lookaheadSamples = 1
     private var lookDelayL = DoubleArray(0)
     private var lookDelayR = DoubleArray(0)
     private var lookWriteIdx = 0
+    private var tpHistL = DoubleArray(TP_TAPS)
+    private var tpHistR = DoubleArray(TP_TAPS)
+    private var tpHistIdx = 0
     private var dequeSeq = LongArray(0)
     private var dequeVal = DoubleArray(0)
     private var dequeCap = 2
@@ -213,19 +232,29 @@ internal class EqualizerKernel {
         val lpfRc = 1.0 / (2.0 * PI * 6_500.0)
         this.spatialHpfAlpha = hpfRc / (hpfRc + dt)
         this.spatialLpfAlpha = dt / (lpfRc + dt)
+        this.crossfeedAlpha = exp(-2.0 * PI * BS2B_CUTOFF_HZ / sampleRate)
         computeBassMonoHpCoeffs(sampleRate.toDouble())
         resetCoeffArraysToIdentity()
         flush()
         this.appliedConfig = null
+        this.appliedNormGainDb = 0f
+        this.currentNormGain = 1.0
+        this.targetNormGain = 1.0
+        this.normGainStep = 0.0
         this.currentWet = 0.0
         this.targetWet = 0.0
+        this.currentCrossfeed = 0.0
+        this.targetCrossfeed = 0.0
+        this.crossfeedStep = 0.0
         this.bypassActive = true
     }
 
-    fun flush() {
+    private fun flushEqStateOnly() {
         stageState.fill(0.0)
         bassMonoZ1 = 0.0
         bassMonoZ2 = 0.0
+        crossfeedLpL = 0.0
+        crossfeedLpR = 0.0
         spatialDelayL.fill(0.0)
         spatialDelayR.fill(0.0)
         spatialWriteIdx = 0
@@ -235,20 +264,32 @@ internal class EqualizerKernel {
         spatialSendHpfR = 0.0
         spatialSendLpfL = 0.0
         spatialSendLpfR = 0.0
+    }
+
+    fun flush() {
+        flushEqStateOnly()
         lookDelayL.fill(0.0)
         lookDelayR.fill(0.0)
         lookWriteIdx = 0
+        tpHistL.fill(0.0)
+        tpHistR.fill(0.0)
+        tpHistIdx = 0
         dequeHead = 0
         dequeTail = 0
         dequeCount = 0
         lookSampleSeq = 0L
         limiterGain = 1.0
+        hasProcessedSamples = false
     }
 
     fun reset() {
         sampleRate = 0
         channelCount = 0
         appliedConfig = null
+        appliedNormGainDb = 0f
+        currentNormGain = 1.0
+        targetNormGain = 1.0
+        normGainStep = 0.0
         stageState = DoubleArray(0)
         spatialDelayL = DoubleArray(0)
         spatialDelayR = DoubleArray(0)
@@ -266,7 +307,31 @@ internal class EqualizerKernel {
         targetStereoWidth = 1.0
         currentSpatialStage = 0.0
         targetSpatialStage = 0.0
+        currentCrossfeed = 0.0
+        targetCrossfeed = 0.0
+        crossfeedStep = 0.0
         bypassActive = true
+    }
+
+    /**
+     * Updates per-track ReplayGain linear normalization (in dB), completely independent of EQ
+     * bypass state. Ramps smoothly over 200 ms once audio is flowing; snaps cleanly before the
+     * first sample of a new stream.
+     */
+    fun syncNormalizationGainDb(gainDb: Float) {
+        val safeDb = if (gainDb.isFinite()) gainDb.coerceIn(-12f, 6f) else 0f
+        if (safeDb == appliedNormGainDb && (hasProcessedSamples || abs(currentNormGain - targetNormGain) <= 1e-9)) {
+            return
+        }
+        appliedNormGainDb = safeDb
+        targetNormGain = if (abs(safeDb) <= 0.001f) 1.0 else 10.0.pow(safeDb.toDouble() / 20.0)
+        if (!hasProcessedSamples || sampleRate <= 0) {
+            currentNormGain = targetNormGain
+            normGainStep = 0.0
+        } else {
+            val rampSamples = max(1, (sampleRate * NORM_RAMP_SECONDS).roundToInt())
+            normGainStep = (targetNormGain - currentNormGain) / rampSamples
+        }
     }
 
     fun syncConfig(config: EqualizerConfig) {
@@ -284,6 +349,8 @@ internal class EqualizerKernel {
             stereoWidthStep = (targetStereoWidth - currentStereoWidth) / rampSamples
             targetSpatialStage = 0.0
             spatialStageStep = (targetSpatialStage - currentSpatialStage) / rampSamples
+            targetCrossfeed = 0.0
+            crossfeedStep = (targetCrossfeed - currentCrossfeed) / rampSamples
             if (currentWet <= 1e-6) {
                 bypassActive = true
             }
@@ -295,30 +362,40 @@ internal class EqualizerKernel {
 
         val fs = sampleRate.toDouble()
         val preampDb = config.effectivePreampDb(fs)
+        val enh = config.safeEnhancements
         targetPreampGain = 10.0.pow(preampDb / 20.0).coerceIn(0.05, 4.0)
+        val nextCrossfeed = if (enh.crossfeedEnabled) BS2B_FEED_K else 0.0
         if (wasFullBypass) {
-            flush()
+            if (hasActiveNormalization()) {
+                flushEqStateOnly()
+            } else {
+                flush()
+            }
             resetCoeffArraysToIdentity()
             currentPreampGain = targetPreampGain
             preampStep = 0.0
-            currentStereoWidth = config.safeEnhancements.stereoWidth.toDouble()
+            currentStereoWidth = enh.stereoWidth.toDouble()
             targetStereoWidth = currentStereoWidth
             stereoWidthStep = 0.0
-            currentSpatialStage = config.safeEnhancements.spatialStage.toDouble()
+            currentSpatialStage = enh.spatialStage.toDouble()
             targetSpatialStage = currentSpatialStage
             spatialStageStep = 0.0
+            currentCrossfeed = nextCrossfeed
+            targetCrossfeed = nextCrossfeed
+            crossfeedStep = 0.0
         } else {
             preampStep = (targetPreampGain - currentPreampGain) / rampSamples
-            targetStereoWidth = config.safeEnhancements.stereoWidth.toDouble()
+            targetStereoWidth = enh.stereoWidth.toDouble()
             stereoWidthStep = (targetStereoWidth - currentStereoWidth) / rampSamples
-            targetSpatialStage = config.safeEnhancements.spatialStage.toDouble()
+            targetSpatialStage = enh.spatialStage.toDouble()
             spatialStageStep = (targetSpatialStage - currentSpatialStage) / rampSamples
+            targetCrossfeed = nextCrossfeed
+            crossfeedStep = (targetCrossfeed - currentCrossfeed) / rampSamples
         }
 
         targetWet = 1.0
         wetStep = (targetWet - currentWet) / rampSamples
 
-        val enh = config.safeEnhancements
         bassMonoEnabled = enh.bassMonoEnabled
         limiterEnabled = enh.limiterEnabled
 
@@ -540,8 +617,12 @@ internal class EqualizerKernel {
         }
     }
 
-    /** True when the DSP is fully idle and caller may bulk-copy input bytes untouched. */
-    fun canDirectBypass(): Boolean = bypassActive && currentWet <= 1e-6 && targetWet <= 1e-6
+    private fun hasActiveNormalization(): Boolean =
+        abs(currentNormGain - 1.0) > 1e-6 || abs(targetNormGain - 1.0) > 1e-6
+
+    /** True when the DSP (including ReplayGain) is fully idle and caller may bulk-copy untouched. */
+    fun canDirectBypass(): Boolean =
+        bypassActive && currentWet <= 1e-6 && targetWet <= 1e-6 && !hasActiveNormalization()
 
     /**
      * Processes [frameCount] interleaved normalized frames in-place from [samples] (size >= frameCount * channelCount).
@@ -566,16 +647,25 @@ internal class EqualizerKernel {
                 samples[idx] = outFrameL
                 samples[idx + 1] = outFrameR
             } else {
+                hasProcessedSamples = true
+                val eqOnlyBypass = bypassActive && currentWet <= 1e-6 && targetWet <= 1e-6
+                val needsNormBoostLimiter = currentNormGain > 1.0005 || targetNormGain > 1.0005
                 var framePeak = 0.0
                 for (ch in 0 until chans) {
-                    val dry = samples[idx + ch]
-                    val filtered = runBiquads(dry * currentPreampGain, ch)
-                    val blended = dry * (1.0 - currentWet) + filtered * currentWet
-                    val clean = if (blended.isFinite()) blended else dry
+                    val raw = samples[idx + ch]
+                    val norm = (if (raw.isFinite()) raw else 0.0) * currentNormGain
+                    val clean =
+                        if (eqOnlyBypass) {
+                            norm
+                        } else {
+                            val filtered = runBiquads(norm * currentPreampGain, ch)
+                            val blended = norm * (1.0 - currentWet) + filtered * currentWet
+                            if (blended.isFinite()) blended else norm
+                        }
                     samples[idx + ch] = clean
                     framePeak = max(framePeak, abs(clean))
                 }
-                if (limiterEnabled) {
+                if (if (eqOnlyBypass) needsNormBoostLimiter else limiterEnabled) {
                     val gain = stepSingleChannelLimiter(framePeak)
                     for (ch in 0 until chans) {
                         samples[idx + ch] = softCeilingGuard(samples[idx + ch] * gain)
@@ -612,14 +702,22 @@ internal class EqualizerKernel {
                 outShorts[idx] = quantizePcm16WithTpdf(outFrameL)
                 outShorts[idx + 1] = quantizePcm16WithTpdf(outFrameR)
             } else {
+                hasProcessedSamples = true
+                val eqOnlyBypass = bypassActive && currentWet <= 1e-6 && targetWet <= 1e-6
+                val needsNormBoostLimiter = currentNormGain > 1.0005 || targetNormGain > 1.0005
                 var framePeak = 0.0
                 if (chans == 1) {
-                    val dry = inShorts[idx] / PCM16_SCALE
-                    val filtered = runBiquads(dry * currentPreampGain, 0)
-                    val blended = dry * (1.0 - currentWet) + filtered * currentWet
-                    val clean = if (blended.isFinite()) blended else dry
+                    val norm = (inShorts[idx] / PCM16_SCALE) * currentNormGain
+                    val clean =
+                        if (eqOnlyBypass) {
+                            norm
+                        } else {
+                            val filtered = runBiquads(norm * currentPreampGain, 0)
+                            val blended = norm * (1.0 - currentWet) + filtered * currentWet
+                            if (blended.isFinite()) blended else norm
+                        }
                     val limited =
-                        if (limiterEnabled) {
+                        if (if (eqOnlyBypass) needsNormBoostLimiter else limiterEnabled) {
                             softCeilingGuard(clean * stepSingleChannelLimiter(abs(clean)))
                         } else {
                             clean
@@ -627,14 +725,19 @@ internal class EqualizerKernel {
                     outShorts[idx] = quantizePcm16WithTpdf(limited)
                 } else {
                     for (ch in 0 until chans) {
-                        val dry = inShorts[idx + ch] / PCM16_SCALE
-                        val filtered = runBiquads(dry * currentPreampGain, ch)
-                        val blended = dry * (1.0 - currentWet) + filtered * currentWet
-                        val clean = if (blended.isFinite()) blended else dry
+                        val norm = (inShorts[idx + ch] / PCM16_SCALE) * currentNormGain
+                        val clean =
+                            if (eqOnlyBypass) {
+                                norm
+                            } else {
+                                val filtered = runBiquads(norm * currentPreampGain, ch)
+                                val blended = norm * (1.0 - currentWet) + filtered * currentWet
+                                if (blended.isFinite()) blended else norm
+                            }
                         framePeak = max(framePeak, abs(clean))
                         outShorts[idx + ch] = quantizePcm16WithTpdf(clean)
                     }
-                    if (limiterEnabled) {
+                    if (if (eqOnlyBypass) needsNormBoostLimiter else limiterEnabled) {
                         val gain = stepSingleChannelLimiter(framePeak)
                         if (framePeak > LIMITER_THRESHOLD) {
                             for (ch in 0 until chans) {
@@ -669,10 +772,18 @@ internal class EqualizerKernel {
         channel: Int,
     ): Double {
         if (channel == 0) stepRamps()
-        val safeDry = if (dry.isFinite()) dry else 0.0
-        val filtered = runBiquads(safeDry * currentPreampGain, channel)
-        val blended = safeDry * (1.0 - currentWet) + filtered * currentWet
-        val clean = if (blended.isFinite()) blended else safeDry
+        hasProcessedSamples = true
+        val norm = (if (dry.isFinite()) dry else 0.0) * currentNormGain
+        if (bypassActive && currentWet <= 1e-6 && targetWet <= 1e-6) {
+            return if (currentNormGain > 1.0005 || targetNormGain > 1.0005) {
+                softCeilingGuard(norm * stepSingleChannelLimiter(abs(norm)))
+            } else {
+                norm
+            }
+        }
+        val filtered = runBiquads(norm * currentPreampGain, channel)
+        val blended = norm * (1.0 - currentWet) + filtered * currentWet
+        val clean = if (blended.isFinite()) blended else norm
         return if (limiterEnabled) {
             softCeilingGuard(clean * stepSingleChannelLimiter(abs(clean)))
         } else {
@@ -689,12 +800,27 @@ internal class EqualizerKernel {
     private fun maybeEnterIdleBypass() {
         if (targetWet <= 1e-6 && currentWet <= 1e-6) {
             currentWet = 0.0
-            bypassActive = true
-            flush()
+            if (!bypassActive) {
+                bypassActive = true
+                if (hasActiveNormalization()) {
+                    flushEqStateOnly()
+                } else {
+                    flush()
+                }
+            }
         }
     }
 
     private fun stepRamps() {
+        if (normGainStep != 0.0) {
+            currentNormGain += normGainStep
+            if ((normGainStep > 0.0 && currentNormGain >= targetNormGain) ||
+                (normGainStep < 0.0 && currentNormGain <= targetNormGain)
+            ) {
+                currentNormGain = targetNormGain
+                normGainStep = 0.0
+            }
+        }
         if (preampStep != 0.0) {
             currentPreampGain += preampStep
             if ((preampStep > 0.0 && currentPreampGain >= targetPreampGain) ||
@@ -731,6 +857,15 @@ internal class EqualizerKernel {
                 spatialStageStep = 0.0
             }
         }
+        if (crossfeedStep != 0.0) {
+            currentCrossfeed += crossfeedStep
+            if ((crossfeedStep > 0.0 && currentCrossfeed >= targetCrossfeed) ||
+                (crossfeedStep < 0.0 && currentCrossfeed <= targetCrossfeed)
+            ) {
+                currentCrossfeed = targetCrossfeed
+                crossfeedStep = 0.0
+            }
+        }
         if (coeffRampRemaining > 0) {
             stepCoeffRamps()
         }
@@ -740,11 +875,26 @@ internal class EqualizerKernel {
         dryL: Double,
         dryR: Double,
     ) {
-        val safeL = if (dryL.isFinite()) dryL else 0.0
-        val safeR = if (dryR.isFinite()) dryR else 0.0
+        hasProcessedSamples = true
+        val normL = (if (dryL.isFinite()) dryL else 0.0) * currentNormGain
+        val normR = (if (dryR.isFinite()) dryR else 0.0) * currentNormGain
 
-        var eqL = runBiquads(safeL * currentPreampGain, 0)
-        var eqR = runBiquads(safeR * currentPreampGain, 1)
+        // Fast ReplayGain-only path when EQ is bypassed: zero biquads, zero M/S, zero coloration.
+        // Attenuation (<= 0 dB) is pure 64-bit multiplication; positive boost (> 0 dB) passes
+        // through the transparent 4x True-Peak lookahead limiter so dynamics stay 100% intact
+        // below -1.0 dBFS while guaranteeing zero inter-sample clipping.
+        if (bypassActive && currentWet <= 1e-6 && targetWet <= 1e-6) {
+            if ((currentNormGain > 1.0005 || targetNormGain > 1.0005) && lookDelayL.isNotEmpty()) {
+                stepLookaheadStereoLimiter(normL, normR)
+            } else {
+                outFrameL = normL
+                outFrameR = normR
+            }
+            return
+        }
+
+        var eqL = runBiquads(normL * currentPreampGain, 0)
+        var eqR = runBiquads(normR * currentPreampGain, 1)
 
         // Stereo width M/S + Bass Mono (< 100 Hz Butterworth TDF-II, unity phase polarity)
         if (abs(currentStereoWidth - 1.0) > 0.002) {
@@ -800,14 +950,24 @@ internal class EqualizerKernel {
             eqR += erR * erGain
         }
 
+        // BS2B Headphone Crossfeed (700 Hz / 4.5 dB, unity mono sum & neutral HF response)
+        if (currentCrossfeed > 1e-4 || targetCrossfeed > 1e-4) {
+            val oneMinusAlpha = 1.0 - crossfeedAlpha
+            crossfeedLpL = crossfeedAlpha * crossfeedLpL + oneMinusAlpha * eqL
+            crossfeedLpR = crossfeedAlpha * crossfeedLpR + oneMinusAlpha * eqR
+            val diff = (crossfeedLpR - crossfeedLpL) * currentCrossfeed
+            eqL += diff
+            eqR -= diff
+        }
+
         val wet = currentWet
         val dryWeight = 1.0 - wet
-        val preLimL = dryWeight * safeL + wet * eqL
-        val preLimR = dryWeight * safeR + wet * eqR
+        val preLimL = dryWeight * normL + wet * eqL
+        val preLimR = dryWeight * normR + wet * eqR
 
         if (!limiterEnabled || lookDelayL.isEmpty()) {
-            outFrameL = if (preLimL.isFinite()) preLimL else safeL
-            outFrameR = if (preLimR.isFinite()) preLimR else safeR
+            outFrameL = if (preLimL.isFinite()) preLimL else normL
+            outFrameR = if (preLimR.isFinite()) preLimR else normR
             return
         }
 
@@ -817,11 +977,52 @@ internal class EqualizerKernel {
         )
     }
 
+    private fun detectTruePeak4x(
+        hist: DoubleArray,
+        writeIdx: Int,
+    ): Double {
+        val s3 = hist[(writeIdx + 3) and 7]
+        val s4 = hist[(writeIdx + 4) and 7]
+        val basePeak = max(abs(s3), abs(s4))
+        // Fast path: bandlimited audio below -7 dBFS cannot produce an inter-sample peak near -1 dBFS.
+        if (basePeak <= TP_FAST_THRESHOLD) return basePeak
+
+        val s0 = hist[writeIdx]
+        val s1 = hist[(writeIdx + 1) and 7]
+        val s2 = hist[(writeIdx + 2) and 7]
+        val s5 = hist[(writeIdx + 5) and 7]
+        val s6 = hist[(writeIdx + 6) and 7]
+        val s7 = hist[(writeIdx + 7) and 7]
+
+        val p25 =
+            abs(
+                TP_T25_0 * s0 + TP_T25_1 * s1 + TP_T25_2 * s2 + TP_T25_3 * s3 +
+                    TP_T25_4 * s4 + TP_T25_5 * s5 + TP_T25_6 * s6 + TP_T25_7 * s7,
+            )
+        val p50 =
+            abs(
+                TP_T50_0 * (s0 + s7) + TP_T50_1 * (s1 + s6) +
+                    TP_T50_2 * (s2 + s5) + TP_T50_3 * (s3 + s4),
+            )
+        val p75 =
+            abs(
+                TP_T25_7 * s0 + TP_T25_6 * s1 + TP_T25_5 * s2 + TP_T25_4 * s3 +
+                    TP_T25_3 * s4 + TP_T25_2 * s5 + TP_T25_1 * s6 + TP_T25_0 * s7,
+            )
+        return max(max(basePeak, p50), max(p25, p75))
+    }
+
     private fun stepLookaheadStereoLimiter(
         inL: Double,
         inR: Double,
     ) {
-        val peak = max(abs(inL), abs(inR))
+        tpHistL[tpHistIdx] = inL
+        tpHistR[tpHistIdx] = inR
+        tpHistIdx = (tpHistIdx + 1) and 7
+
+        val samplePeak = max(abs(inL), abs(inR))
+        val truePeak = max(detectTruePeak4x(tpHistL, tpHistIdx), detectTruePeak4x(tpHistR, tpHistIdx))
+        val peak = max(samplePeak, truePeak)
         val cap = dequeCap
 
         // Maintain monotonic decreasing deque over the 2 ms lookahead window in O(1) amortized time.
@@ -995,19 +1196,41 @@ internal class EqualizerKernel {
         private const val COEFFS_PER_STAGE = 5
         private const val STATE_PER_STAGE = 2
         private const val RAMP_SECONDS = 0.010
+        private const val NORM_RAMP_SECONDS = 0.200
         private const val LOOKAHEAD_SECONDS = 0.002
 
         private const val SPATIAL_WET_MAX = 0.24
 
-        // True-Peak ceiling at -0.8 dBFS with -1.0 dBFS transparent threshold protects against
-        // high-frequency hard clipping, aliasing, and Android AudioFlinger / Bluetooth ISP pops.
+        // BS2B default profile: 700 Hz cutoff, 4.5 dB low-frequency crossfeed separation.
+        private const val BS2B_CUTOFF_HZ = 700.0
+        private const val BS2B_FEED_K = 0.37330
+
+        // 8-tap Kaiser-windowed sinc (beta = 4.0) 4x True-Peak polyphase filter coefficients.
+        private const val TP_TAPS = 8
+        private const val TP_FAST_THRESHOLD = 0.45
+        private const val TP_T25_0 = -0.01782188
+        private const val TP_T25_1 = 0.05579649
+        private const val TP_T25_2 = -0.15215725
+        private const val TP_T25_3 = 0.89765607
+        private const val TP_T25_4 = 0.28337322
+        private const val TP_T25_5 = -0.09146046
+        private const val TP_T25_6 = 0.03285686
+        private const val TP_T25_7 = -0.00824305
+        private const val TP_T50_0 = -0.01763898
+        private const val TP_T50_1 = 0.06104649
+        private const val TP_T50_2 = -0.16600833
+        private const val TP_T50_3 = 0.62260082
+
+        // 4x True-Peak ceiling at -0.3 dBFS with -1.0 dBFS transparent knee preserves +0.5 dB
+        // more clean loudness than a blind sample-peak limiter while catching inter-sample peaks.
         private const val LIMITER_THRESHOLD = 0.891
-        private const val LIMITER_CEILING = 0.912
-        private const val LIMITER_SOFT_START = 0.915
-        private const val LIMITER_HARD_LIMIT = 0.960
+        private const val LIMITER_CEILING = 0.966
+        private const val LIMITER_SOFT_START = 0.968
+        private const val LIMITER_HARD_LIMIT = 0.990
 
         private const val PCM16_SCALE = 32_768.0
         private const val PCM16_MAX = 32_767.0
         private const val PCM16_LSB = 1.0 / 32_768.0
     }
 }
+

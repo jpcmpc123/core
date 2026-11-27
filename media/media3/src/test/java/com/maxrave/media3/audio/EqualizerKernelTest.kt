@@ -315,8 +315,8 @@ class EqualizerKernelTest {
             maxAbs = max(maxAbs, abs(s))
         }
         assertTrue(
-            "Lookahead true-peak limiter must hold sharp treble transients strictly <= 0.925 (got $maxAbs)",
-            maxAbs <= 0.925,
+            "Lookahead 4x true-peak limiter must hold sharp treble transients strictly <= 0.975 (got $maxAbs)",
+            maxAbs <= 0.975,
         )
     }
 
@@ -373,4 +373,229 @@ class EqualizerKernelTest {
         }
         assertTrue("Expected click-free coefficient ramp across 0 dB boundary (maxStep=$maxStep)", maxStep < 0.09)
     }
+
+    @Test
+    fun `vicanek matched peaking avoids high frequency cramping and cancels boost and cut symmetrically`() {
+        val fs = 44_100.0
+        val boostBand =
+            com.maxrave.domain.data.player.ParametricBand(
+                kind = com.maxrave.domain.data.player.BiquadFilterKind.PEAKING,
+                freqHz = 16_000f,
+                gainDb = 6f,
+                q = 1.41f,
+            )
+        val cutBand = boostBand.copy(gainDb = -6f)
+        val cBoost = com.maxrave.domain.data.player.computeNormalizedBiquad(boostBand, fs)
+        val cCut = com.maxrave.domain.data.player.computeNormalizedBiquad(cutBand, fs)
+        assertTrue("Vicanek peaking boost must produce valid coefficients", cBoost != null)
+        assertTrue("Vicanek peaking cut must produce valid coefficients", cCut != null)
+
+        // Evaluate digital magnitude at 19 kHz (where RBJ cramps heavily to ~0 dB at Nyquist):
+        // analog 16 kHz +6 dB Q=1.41 has ~+3.87 dB at 19 kHz; Vicanek stays within < 0.8 dB!
+        fun magDb(c: DoubleArray, f: Double): Double {
+            val w = 2.0 * PI * f / fs
+            val cos1 = kotlin.math.cos(w)
+            val sin1 = kotlin.math.sin(w)
+            val cos2 = kotlin.math.cos(2.0 * w)
+            val sin2 = kotlin.math.sin(2.0 * w)
+            val numRe = c[0] + c[1] * cos1 + c[2] * cos2
+            val numIm = -(c[1] * sin1 + c[2] * sin2)
+            val denRe = 1.0 + c[3] * cos1 + c[4] * cos2
+            val denIm = -(c[3] * sin1 + c[4] * sin2)
+            val magSq = (numRe * numRe + numIm * numIm) / (denRe * denRe + denIm * denIm)
+            return 10.0 * kotlin.math.log10(magSq)
+        }
+
+        val gainAtCenter = magDb(cBoost!!, 16_000.0)
+        assertTrue("16 kHz center gain should match +6 dB closely (got $gainAtCenter)", abs(gainAtCenter - 6.0) < 0.25)
+
+        val gainAt19k = magDb(cBoost, 19_000.0)
+        assertTrue("19 kHz should stay uncramped above +3.0 dB (got $gainAt19k)", gainAt19k > 3.0)
+
+        // Exact symmetric boost/cut cancellation across the spectrum
+        for (freq in listOf(100.0, 4_000.0, 12_000.0, 16_000.0, 20_000.0)) {
+            val sumDb = magDb(cBoost, freq) + magDb(cCut!!, freq)
+            assertTrue("Boost + cut at $freq Hz must cancel symmetrically (sum=$sumDb dB)", abs(sumDb) < 0.01)
+        }
+    }
+
+    @Test
+    fun `four x true peak limiter catches inter sample peaks on fs over 4 shifted sine`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val config =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = listOf(0f, 0f, 0f, 0f, 0f, 0.1f, 0f, 0f, 0f, 0f),
+                manualPreampDb = 0f,
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.MANUAL,
+                        limiterEnabled = true,
+                        subsonicFilterEnabled = false,
+                    ),
+            )
+
+        // Fs/4 sine shifted by 45 degrees with amplitude 1.15:
+        // Raw sample peaks are ONLY 1.15 * 0.7071 = 0.813 (< 0.891 sample-peak threshold!),
+        // yet the reconstructed analog inter-sample True Peak is 1.15 (+1.21 dBTP)!
+        val frames = 2_400
+        val buf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            val s = 1.15 * sin(2.0 * PI * (i / 4.0) + PI / 4.0)
+            buf[i * 2] = s
+            buf[i * 2 + 1] = s
+        }
+
+        kernel.processNormalizedFramesInPlace(buf, frames, config)
+
+        // Steady-state sample peak must be pulled down so analog true peak (sample / 0.7071) <= 0.975!
+        var maxSampleSteady = 0.0
+        for (i in 1_000 until frames) {
+            maxSampleSteady = max(maxSampleSteady, abs(buf[i * 2]))
+        }
+        val estimatedTruePeak = maxSampleSteady / kotlin.math.sqrt(0.5)
+        assertTrue(
+            "4x True-Peak limiter must catch inter-sample peak above 0 dBTP (sample=$maxSampleSteady, TP=$estimatedTruePeak)",
+            estimatedTruePeak <= 0.98,
+        )
+    }
+
+    @Test
+    fun `pure linear replaygain runs independently of eq bypass with zero compression below threshold`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val bypassConfig = EqualizerConfig(enabled = false)
+
+        // 1. Cut-only (-3 dB) with EQ OFF: exact pure linear scaling, zero coloration
+        kernel.syncNormalizationGainDb(-3.0f)
+        assertFalse("Active ReplayGain must disable direct byte bypass", kernel.canDirectBypass())
+        val frames = 1_000
+        val cutBuf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            val v = 0.5 * sin(2.0 * PI * 1_000.0 * i / fs)
+            cutBuf[i * 2] = v
+            cutBuf[i * 2 + 1] = v
+        }
+        kernel.processNormalizedFramesInPlace(cutBuf, frames, bypassConfig)
+        val expectedLinearCut = Math.pow(10.0, -3.0 / 20.0)
+        var maxErr = 0.0
+        for (i in 0 until frames) {
+            val expected = 0.5 * sin(2.0 * PI * 1_000.0 * i / fs) * expectedLinearCut
+            maxErr = max(maxErr, abs(cutBuf[i * 2] - expected))
+        }
+        assertTrue("ReplayGain attenuation must be bit-exact linear gain (maxErr=$maxErr)", maxErr < 1e-6)
+
+        // 2. Positive boost (+3.5 dB) on quiet signal (0.3 peak -> 0.449 peak): 0% compression!
+        kernel.flush()
+        kernel.syncNormalizationGainDb(3.5f)
+        val boostBuf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            val v = 0.3 * sin(2.0 * PI * 500.0 * i / fs)
+            boostBuf[i * 2] = v
+            boostBuf[i * 2 + 1] = v
+        }
+        kernel.processNormalizedFramesInPlace(boostBuf, frames, bypassConfig)
+        val expectedPeak = 0.3 * Math.pow(10.0, 3.5 / 20.0)
+        var measuredPeak = 0.0
+        for (i in 300 until frames) {
+            measuredPeak = max(measuredPeak, abs(boostBuf[i * 2]))
+        }
+        assertEquals(
+            "Positive ReplayGain below -1 dBFS must have 0% dynamic compression",
+            expectedPeak,
+            measuredPeak,
+            0.005,
+        )
+    }
+
+    @Test
+    fun `bs2b crossfeed keeps mono unity gain and feeds low frequency stereo naturally`() {
+        val kernel = EqualizerKernel()
+        val fs = 48_000
+        kernel.configure(sampleRate = fs, channelCount = 2)
+
+        val config =
+            EqualizerConfig(
+                enabled = true,
+                bandsDb = emptyList(),
+                enhancements =
+                    EqualizerEnhancements(
+                        preampMode = PreampMode.MANUAL,
+                        crossfeedEnabled = true,
+                        limiterEnabled = false,
+                        subsonicFilterEnabled = false,
+                    ),
+            )
+
+        val frames = 4_800
+        // 1. Mono signal (L == R): BS2B formula outL = L + k*(lpR - lpL) must have exact unity gain!
+        val monoBuf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            val v = 0.4 * sin(2.0 * PI * 250.0 * i / fs)
+            monoBuf[i * 2] = v
+            monoBuf[i * 2 + 1] = v
+        }
+        kernel.processNormalizedFramesInPlace(monoBuf, frames, config)
+        var maxMonoDiff = 0.0
+        for (i in 2_400 until frames) {
+            val v = 0.4 * sin(2.0 * PI * 250.0 * i / fs)
+            maxMonoDiff = max(maxMonoDiff, abs(monoBuf[i * 2] - v))
+        }
+        assertTrue("BS2B crossfeed must be exact unity gain on mono (maxDiff=$maxMonoDiff)", maxMonoDiff < 1e-6)
+
+        // 2. Hard-panned Left 100 Hz sine -> feeds R with ~4.5 dB separation while preserving L+R sum
+        kernel.flush()
+        val stereoBuf = DoubleArray(frames * 2)
+        for (i in 0 until frames) {
+            stereoBuf[i * 2] = 0.4 * sin(2.0 * PI * 100.0 * i / fs)
+            stereoBuf[i * 2 + 1] = 0.0
+        }
+        kernel.processNormalizedFramesInPlace(stereoBuf, frames, config)
+        var peakL = 0.0
+        var peakR = 0.0
+        var maxSumErr = 0.0
+        for (i in 2_400 until frames) {
+            val dryL = 0.4 * sin(2.0 * PI * 100.0 * i / fs)
+            peakL = max(peakL, abs(stereoBuf[i * 2]))
+            peakR = max(peakR, abs(stereoBuf[i * 2 + 1]))
+            maxSumErr = max(maxSumErr, abs((stereoBuf[i * 2] + stereoBuf[i * 2 + 1]) - dryL))
+        }
+        assertTrue("BS2B crossfeed must preserve exact L+R mono sum (err=$maxSumErr)", maxSumErr < 1e-6)
+        assertTrue("BS2B crossfeed must feed significant low-frequency signal into R (peakR=$peakR)", peakR > 0.12)
+        assertTrue("BS2B crossfeed must keep L louder than R (peakL=$peakL, peakR=$peakR)", peakL > peakR * 1.4)
+    }
+
+    @Test
+    fun `echo kernel float32 path preserves full headroom and exact tap timing`() {
+        val echo = EchoKernel()
+        val fs = 1_000
+        echo.configure(sampleRate = fs, channelCount = 2, useFloat = true)
+        echo.sync(
+            com.maxrave.domain.data.player.AudioEffects(
+                delay = com.maxrave.domain.data.player.DelayEffect(timeMs = 100, feedback = 0.5f, mix = 0.5f),
+                reverb = null,
+            ),
+        )
+        assertFalse(echo.isBypassed)
+
+        val outL = FloatArray(300)
+        val outR = FloatArray(300)
+        echo.beginBuffer()
+        for (i in 0 until 300) {
+            val inL = if (i == 0) 0.8f else 0f
+            val inR = if (i == 0) -0.4f else 0f
+            outL[i] = echo.processInterleavedFloat(inL)
+            outR[i] = echo.processInterleavedFloat(inR)
+        }
+        assertTrue("Direct impulse at sample 0 must be non-zero", outL[0] > 0.1f)
+        assertTrue("First echo tap at 100 ms (sample 100) must fire on L", outL[100] > 0.05f)
+        assertTrue("First echo tap at 100 ms (sample 100) must preserve polarity on R", outR[100] < -0.02f)
+        assertEquals("Silence between impulse and first tap", 0f, outL[50], 1e-6f)
+    }
 }
+

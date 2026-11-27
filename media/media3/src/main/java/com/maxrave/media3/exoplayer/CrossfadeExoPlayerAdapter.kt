@@ -16,15 +16,15 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
-import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.AudioProcessorChain
+import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import com.maxrave.common.MERGING_DATA_TYPE
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
@@ -55,6 +55,7 @@ import com.maxrave.media3.audio.CrossfadeFilterAudioProcessor
 import com.maxrave.media3.audio.EchoAudioProcessor
 import com.maxrave.media3.audio.EightDAudioProcessor
 import com.maxrave.media3.audio.EqualizerAudioProcessor
+import com.maxrave.media3.audio.FloatSafeSilenceSkippingAudioProcessor
 import com.maxrave.media3.audio.SleepFadeAudioProcessor
 import com.maxrave.media3.service.mediasourcefactory.isLiveStreamDetected
 import com.maxrave.media3.service.mediasourcefactory.isLiveStreamEnded
@@ -78,6 +79,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.resume
@@ -844,11 +846,20 @@ internal class CrossfadeExoPlayerAdapter(
         val filter: CrossfadeFilterAudioProcessor,
     )
 
+    private class TrackNormalizationGain(
+        @Volatile var gainDb: Float = 0f,
+    )
+
+    /** Per-player linear ReplayGain holder; WeakHashMap auto-cleans released players with zero audio-thread locking. */
+    private val playerNormGains = Collections.synchronizedMap(WeakHashMap<ExoPlayer, TrackNormalizationGain>())
+
     /**
-     * Create a new ExoPlayer instance with a per-player [CrossfadeFilterAudioProcessor].
+     * Create a new ExoPlayer instance with a per-player [CrossfadeFilterAudioProcessor] and
+     * end-to-end 32-bit Float PCM DSP pipeline.
      *
-     * Each player gets its own filter instance so the fade-out player can have
-     * an independent low-pass filter while the fade-in player has a high-pass filter.
+     * Each player gets its own filter instance and ReplayGain holder so the fade-out player can
+     * keep its own loudness and low-pass sweep while the fade-in player applies its own loudness
+     * and high-pass sweep independently.
      *
      * Audio focus is NOT handled per-player: it is managed once at the adapter level
      * (see the Audio Focus section) so it survives every player swap (#2155).
@@ -857,9 +868,17 @@ internal class CrossfadeExoPlayerAdapter(
         mediaId: String? = null,
         isPrecache: Boolean = false,
     ): PlayerWithFilter {
+        val normGain = TrackNormalizationGain()
+        val silenceSkipping = FloatSafeSilenceSkippingAudioProcessor()
+        val sonic = SonicAudioProcessor()
         val crossfadeFilter = CrossfadeFilterAudioProcessor()
         val sleepFade = SleepFadeAudioProcessor { internalSleepFadeFactor }
-        val equalizer = EqualizerAudioProcessor { internalEqualizerConfig }
+        val equalizer =
+            EqualizerAudioProcessor(
+                configSupplier = { internalEqualizerConfig },
+                normalizationGainDbSupplier = { normGain.gainDb },
+                promoteToFloat = true,
+            )
         val echo = EchoAudioProcessor { internalAudioEffects }
         val reverb = ConvolutionReverbAudioProcessor { internalAudioEffects }
         val eightD = EightDAudioProcessor(eightDOrbit)
@@ -880,38 +899,53 @@ internal class CrossfadeExoPlayerAdapter(
                 ): AudioSink =
                     DefaultAudioSink
                         .Builder(context)
-                        .setEnableFloatOutput(enableFloatOutput)
+                        // Keep DefaultAudioSink.enableFloatOutput = false so Media3 never bypasses
+                        // our AudioProcessorChain on 24-bit/float inputs; EqualizerAudioProcessor
+                        // promotes the stream to C.ENCODING_PCM_FLOAT so the entire DSP chain and
+                        // AudioTrack run natively in 32-bit Float PCM with zero 16-bit truncation.
+                        .setEnableFloatOutput(false)
                         .setEnableAudioOutputPlaybackParameters(enableAudioTrackPlaybackParams)
                         .setAudioProcessorChain(
-                            object : DefaultAudioSink.DefaultAudioProcessorChain(
-                                // Equalizer first, matching the desktop graph, where the ten
-                                // `equalizer` entries sit ahead of everything else in mpv's `af`
-                                // list — it decides which stage a boost can clip in, and the
-                                // preamp that makes room for the boost belongs with it. Then the
-                                // two effects, and only then the crossfade filter: an echo tail
-                                // and a reverb tail belong to the track that caused them, so the
-                                // crossfade has to be able to sweep them out along with it rather
-                                // than the other way round. The sleep fade is the master
-                                // attenuation; only the 8D pan, a gain matrix it commutes with,
-                                // comes after it (see below).
-                                arrayOf(equalizer, echo, reverb, crossfadeFilter, sleepFade),
-                                SilenceSkippingAudioProcessor(
-                                    2_000_000,
-                                    20_000f / 2_000_000f,
-                                    2_000_000,
-                                    0,
-                                    256,
-                                ),
-                                SonicAudioProcessor(),
-                            ) {
-                                // Keep the existing chain/timing methods, but rotate the final
-                                // PCM after Sonic. One turn then lasts the selected wall-clock
-                                // duration even when playback speed or DJ tempo changes.
-                                // DefaultAudioSink builds its pipeline from getAudioProcessors()
-                                // (media3 1.11.1 DefaultAudioSink.java:759).
-                                private val processorsWithEightD = super.getAudioProcessors() + eightD
+                            object : AudioProcessorChain {
+                                // Order:
+                                // 1. FloatSafeSilenceSkipping (operates on input PCM before float promotion)
+                                // 2. Equalizer + pure linear ReplayGain (promotes to C.ENCODING_PCM_FLOAT)
+                                // 3. Echo & Convolution Reverb (native float32; tails belong to the track)
+                                // 4. CrossfadeFilter (native float32; sweeps track + tails cleanly)
+                                // 5. SleepFade (native float32 master attenuation)
+                                // 6. Sonic (native float32 speed/pitch in Media3 1.11.1)
+                                // 7. EightD (native float32 after Sonic so orbit period stays wall-clock)
+                                private val processors: Array<AudioProcessor> =
+                                    arrayOf(
+                                        silenceSkipping,
+                                        equalizer,
+                                        echo,
+                                        reverb,
+                                        crossfadeFilter,
+                                        sleepFade,
+                                        sonic,
+                                        eightD,
+                                    )
 
-                                override fun getAudioProcessors(): Array<AudioProcessor> = processorsWithEightD
+                                override fun getAudioProcessors(): Array<AudioProcessor> = processors
+
+                                override fun applyPlaybackParameters(
+                                    playbackParameters: PlaybackParameters,
+                                ): PlaybackParameters {
+                                    sonic.setSpeed(playbackParameters.speed)
+                                    sonic.setPitch(playbackParameters.pitch)
+                                    return playbackParameters
+                                }
+
+                                override fun applySkipSilenceEnabled(skipSilenceEnabled: Boolean): Boolean {
+                                    silenceSkipping.setEnabled(skipSilenceEnabled)
+                                    return skipSilenceEnabled
+                                }
+
+                                override fun getMediaDuration(playoutDuration: Long): Long =
+                                    if (sonic.isActive) sonic.getMediaDuration(playoutDuration) else playoutDuration
+
+                                override fun getSkippedOutputFrameCount(): Long = silenceSkipping.skippedFrames
                             },
                         ).build().let { waveformReader.playbackSink(it, mediaId) }
             }
@@ -938,6 +972,8 @@ internal class CrossfadeExoPlayerAdapter(
                 .setMediaSourceFactory(mediaSourceFactory)
                 .setRenderersFactory(perPlayerRenderers)
                 .build()
+
+        playerNormGains[player] = normGain
 
         // The output the user picked, if any: a player built for the next track, a crossfade or a
         // precache starts where the others are playing rather than back on the system's choice.
@@ -2024,6 +2060,12 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun setEqualizerConfig(config: EqualizerConfig) {
         internalEqualizerConfig = config
+    }
+
+    override fun setTrackNormalizationGainDb(gainDb: Float) {
+        val safeGain = if (gainDb.isFinite()) gainDb.coerceIn(-12f, 6f) else 0f
+        val target = (if (isCrossfading) secondaryPlayer ?: currentPlayer else currentPlayer) ?: return
+        playerNormGains[target]?.gainDb = safeGain
     }
 
     /**

@@ -40,6 +40,7 @@ import java.nio.ByteOrder
 class ConvolutionReverbAudioProcessor(
     private val effects: () -> AudioEffects,
 ) : BaseAudioProcessor() {
+    private var encoding = C.ENCODING_INVALID
     private var sampleRate = 0
     private var channelCount = 0
 
@@ -63,25 +64,25 @@ class ConvolutionReverbAudioProcessor(
     /**
      * The dry signal, interleaved, waiting for its wet counterpart.
      *
-     * Holds exactly the frames the convolvers have swallowed but not yet answered for: while the
-     * effect is running that is `totalIn mod PARTITION_SIZE` frames, always fewer than one
-     * partition; while bypassed it is empty. That equality is an invariant, and every path that
-     * would break it has to put the frames somewhere rather than drop them — a preset change
-     * replays this queue into the new convolvers, switching the effect off emits it dry, and only a
-     * seek or a format change discards it, because there the audio either side of the cut is gone
-     * anyway.
+     * Stored as `Float` so both `PCM_FLOAT` (native) and `PCM_16BIT` (lossless 16-bit integer
+     * conversion inside IEEE-754 24-bit mantissa) share one ring queue.
      */
-    private var dry = ShortArray(0)
+    private var dry = FloatArray(0)
     private var dryHead = 0
     private var dryTail = 0
 
     /** Per-channel scratch: deinterleaved input on the way in, wet samples on the way back. */
     private var scratch: Array<FloatArray> = emptyArray()
 
+    private fun bytesPerSample(): Int = if (encoding == C.ENCODING_PCM_FLOAT) FLOAT_BYTES else SHORT_BYTES
+
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT &&
+            inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT
+        ) {
             return AudioProcessor.AudioFormat.NOT_SET
         }
+        encoding = inputAudioFormat.encoding
         sampleRate = inputAudioFormat.sampleRate
         channelCount = inputAudioFormat.channelCount
         // Everything below depends on the rate or the channel count, so none of it survives a
@@ -120,6 +121,7 @@ class ConvolutionReverbAudioProcessor(
         appliedPreset = null
         impulseSampleRate = 0
         clearDry()
+        encoding = C.ENCODING_INVALID
         sampleRate = 0
         channelCount = 0
         mix = 0f
@@ -132,6 +134,8 @@ class ConvolutionReverbAudioProcessor(
 
         syncEffects()
 
+        val sampleBytes = bytesPerSample()
+
         if (bypass) {
             // The backlog is whatever the convolvers had swallowed before the user switched the
             // effect off and never answered for — up to one partition, 85 ms. Those frames are real
@@ -141,10 +145,18 @@ class ConvolutionReverbAudioProcessor(
             // input. In steady-state bypass the backlog is empty and this is the plain bulk copy it
             // looks like.
             val backlog = dryTail - dryHead
-            val output = replaceOutputBuffer(backlog * SHORT_BYTES + remaining)
-            while (dryHead < dryTail) {
-                output.putShort(dry[dryHead])
-                dryHead++
+            val output = replaceOutputBuffer(backlog * sampleBytes + remaining)
+            output.order(ByteOrder.nativeOrder())
+            if (encoding == C.ENCODING_PCM_FLOAT) {
+                while (dryHead < dryTail) {
+                    output.putFloat(dry[dryHead])
+                    dryHead++
+                }
+            } else {
+                while (dryHead < dryTail) {
+                    output.putShort(dry[dryHead].toInt().toShort())
+                    dryHead++
+                }
             }
             clearDry()
             // `replaceOutputBuffer` hands back this processor's own buffer while the input belongs
@@ -155,22 +167,33 @@ class ConvolutionReverbAudioProcessor(
         }
 
         inputBuffer.order(ByteOrder.nativeOrder())
-        val frames = remaining / (channelCount * SHORT_BYTES)
+        val frames = remaining / (channelCount * sampleBytes)
         // A block can complete part-way through this buffer, so the convolvers can hand back up to
         // one whole partition more than was just written. Sizing for that up front means the scratch
         // is never reallocated between the write and the read.
         ensureScratch(frames + PartitionedConvolver.PARTITION_SIZE)
         ensureDryCapacity(frames * channelCount)
 
-        for (frame in 0 until frames) {
-            for (channel in 0 until channelCount) {
-                val sample = inputBuffer.short
-                scratch[channel][frame] = sample.toFloat()
-                dry[dryTail] = sample
-                dryTail++
+        if (encoding == C.ENCODING_PCM_FLOAT) {
+            for (frame in 0 until frames) {
+                for (channel in 0 until channelCount) {
+                    val sample = inputBuffer.float
+                    scratch[channel][frame] = sample
+                    dry[dryTail] = sample
+                    dryTail++
+                }
+            }
+        } else {
+            for (frame in 0 until frames) {
+                for (channel in 0 until channelCount) {
+                    val sample = inputBuffer.short.toFloat()
+                    scratch[channel][frame] = sample
+                    dry[dryTail] = sample
+                    dryTail++
+                }
             }
         }
-        // PCM16 frames are always a whole number of bytes, so this should never fire. It is here
+        // PCM frames are always a whole number of bytes, so this should never fire. It is here
         // because the contract is to consume the whole input: leaving a byte behind makes the
         // pipeline re-offer the same buffer forever, having made no progress. There is nowhere
         // sensible to put a stray byte, since the output is not the same length as the input.
@@ -235,14 +258,25 @@ class ConvolutionReverbAudioProcessor(
      * on each — that is the whole reason it is written down twice instead of left to each backend.
      */
     private fun blendIntoOutput(frames: Int) {
-        val output = replaceOutputBuffer(frames * channelCount * SHORT_BYTES)
+        val output = replaceOutputBuffer(frames * channelCount * bytesPerSample())
+        output.order(ByteOrder.nativeOrder())
         val wetLevel = mix
         val dryLevel = 1f - mix
-        for (frame in 0 until frames) {
-            for (channel in 0 until channelCount) {
-                val blended = dry[dryHead].toFloat() * dryLevel + scratch[channel][frame] * wetLevel
-                dryHead++
-                output.putShort(blended.coerceIn(PCM16_MIN, PCM16_MAX).toInt().toShort())
+        if (encoding == C.ENCODING_PCM_FLOAT) {
+            for (frame in 0 until frames) {
+                for (channel in 0 until channelCount) {
+                    val blended = dry[dryHead] * dryLevel + scratch[channel][frame] * wetLevel
+                    dryHead++
+                    output.putFloat(blended)
+                }
+            }
+        } else {
+            for (frame in 0 until frames) {
+                for (channel in 0 until channelCount) {
+                    val blended = dry[dryHead] * dryLevel + scratch[channel][frame] * wetLevel
+                    dryHead++
+                    output.putShort(blended.coerceIn(PCM16_MIN, PCM16_MAX).toInt().toShort())
+                }
             }
         }
         if (dryHead == dryTail) {
@@ -304,7 +338,7 @@ class ConvolutionReverbAudioProcessor(
             ensureScratch(carried)
             for (channel in 0 until channelCount) {
                 for (frame in 0 until carried) {
-                    scratch[channel][frame] = dry[dryHead + frame * channelCount + channel].toFloat()
+                    scratch[channel][frame] = dry[dryHead + frame * channelCount + channel]
                 }
                 rebuilt[channel].write(scratch[channel], 0, carried)
             }
@@ -360,7 +394,7 @@ class ConvolutionReverbAudioProcessor(
             while (capacity < kept + additional) {
                 capacity *= 2
             }
-            val grown = ShortArray(capacity)
+            val grown = FloatArray(capacity)
             dry.copyInto(grown, destinationOffset = 0, startIndex = dryHead, endIndex = dryTail)
             dry = grown
         } else {
@@ -381,8 +415,10 @@ class ConvolutionReverbAudioProcessor(
         const val RIGHT_CHANNEL = 1
 
         const val SHORT_BYTES = 2
+        const val FLOAT_BYTES = 4
 
         const val PCM16_MIN = -32_768f
         const val PCM16_MAX = 32_767f
     }
 }
+

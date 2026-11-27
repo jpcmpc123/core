@@ -32,19 +32,17 @@ import java.nio.ByteOrder
 class SleepFadeAudioProcessor(
     private val gain: () -> Float,
 ) : BaseAudioProcessor() {
+    private var encoding = C.ENCODING_INVALID
+
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT &&
+            inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT
+        ) {
             return AudioProcessor.AudioFormat.NOT_SET
         }
+        encoding = inputAudioFormat.encoding
         return inputAudioFormat
     }
-
-    /**
-     * Always active: the gain changes at runtime, and a processor dropped from the chain would not
-     * be consulted again until the next flush — by which point the sleep timer has already stopped
-     * playback. The full-gain path below is cheap enough to keep it in place permanently.
-     */
-    override fun isActive(): Boolean = super.isActive()
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remaining = inputBuffer.remaining()
@@ -60,9 +58,20 @@ class SleepFadeAudioProcessor(
         }
 
         inputBuffer.order(ByteOrder.nativeOrder())
-        while (inputBuffer.remaining() >= 2) {
-            val scaled = (inputBuffer.short * currentGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-            output.putShort(scaled.toShort())
+        output.order(ByteOrder.nativeOrder())
+        when (encoding) {
+            C.ENCODING_PCM_FLOAT -> {
+                while (inputBuffer.remaining() >= 4) {
+                    output.putFloat(inputBuffer.float * currentGain)
+                }
+            }
+            C.ENCODING_PCM_16BIT -> {
+                while (inputBuffer.remaining() >= 2) {
+                    val scaled = (inputBuffer.short * currentGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    output.putShort(scaled.toShort())
+                }
+            }
+            else -> output.put(inputBuffer)
         }
         while (inputBuffer.hasRemaining()) {
             output.put(inputBuffer.get())
@@ -73,5 +82,7 @@ class SleepFadeAudioProcessor(
 
     override fun onReset() {
         super.onReset()
+        encoding = C.ENCODING_INVALID
     }
 }
+

@@ -56,6 +56,11 @@ class EchoKernel {
      */
     private var lines: Array<ShortArray> = emptyArray()
 
+    /** Float32 rings used when the pipeline runs in `C.ENCODING_PCM_FLOAT` mode. */
+    private var floatLines: Array<FloatArray> = emptyArray()
+
+    private var useFloatLines = false
+
     /**
      * Length every ring will have once allocated, in samples per channel. Decided by the sample
      * rate alone, which is why it is known from [configure] even though nothing is allocated there.
@@ -91,20 +96,34 @@ class EchoKernel {
     fun configure(
         sampleRate: Int,
         channelCount: Int,
+        useFloat: Boolean = false,
     ) {
         this.sampleRate = sampleRate
         this.channelCount = channelCount
+        this.useFloatLines = useFloat
         ringLength = ((DelayEffect.MAX_TIME_MS.toLong() * DelayEffect.MAX_TAPS * sampleRate) / 1_000L).toInt()
-        if (lines.size != channelCount || lines.firstOrNull()?.size != ringLength) {
+        if (useFloat) {
             lines = emptyArray()
-            writeIndex = 0
-            channelCursor = 0
+            if (floatLines.size != channelCount || floatLines.firstOrNull()?.size != ringLength) {
+                floatLines = emptyArray()
+                writeIndex = 0
+                channelCursor = 0
+            } else {
+                flush()
+            }
         } else {
-            // Same geometry, different stream. ExoPlayer reconfigures the sink for every track, so
-            // rebuilding the rings here would hand the collector megabytes per track for no reason;
-            // they only have to be emptied, because what is in them belongs to the track that just
-            // finished.
-            flush()
+            floatLines = emptyArray()
+            if (lines.size != channelCount || lines.firstOrNull()?.size != ringLength) {
+                lines = emptyArray()
+                writeIndex = 0
+                channelCursor = 0
+            } else {
+                // Same geometry, different stream. ExoPlayer reconfigures the sink for every track, so
+                // rebuilding the rings here would hand the collector megabytes per track for no reason;
+                // they only have to be emptied, because what is in them belongs to the track that just
+                // finished.
+                flush()
+            }
         }
         // Forces a rebuild against the new sample rate on the first buffer.
         appliedEffects = null
@@ -125,8 +144,15 @@ class EchoKernel {
      * reallocation would pull the recorded audio out from under a live echo and click.
      */
     private fun ensureLines(): Boolean {
-        if (lines.size == channelCount && lines.firstOrNull()?.size == ringLength) return true
         if (channelCount <= 0 || ringLength <= 0) return false
+        if (useFloatLines) {
+            if (floatLines.size == channelCount && floatLines.firstOrNull()?.size == ringLength) return true
+            floatLines = Array(channelCount) { FloatArray(ringLength) }
+            writeIndex = 0
+            channelCursor = 0
+            return true
+        }
+        if (lines.size == channelCount && lines.firstOrNull()?.size == ringLength) return true
         // The one allocation, on the audio thread, at the moment the switch is flipped. A single
         // buffer's worth of jitter there is the price of not holding the memory all the time.
         lines = Array(channelCount) { ShortArray(ringLength) }
@@ -138,6 +164,7 @@ class EchoKernel {
     /** Drop the recorded audio but keep the rings; the format has not changed. */
     fun flush() {
         lines.forEach { it.fill(0) }
+        floatLines.forEach { it.fill(0f) }
         writeIndex = 0
         channelCursor = 0
     }
@@ -145,6 +172,8 @@ class EchoKernel {
     /** Give the rings back. Called when the player they belong to is released. */
     fun reset() {
         lines = emptyArray()
+        floatLines = emptyArray()
+        useFloatLines = false
         tapOffsets = IntArray(0)
         tapDecays = FloatArray(0)
         appliedEffects = null
@@ -239,4 +268,30 @@ class EchoKernel {
         // Clip then truncate toward zero, which is what `av_clipd` into an `int16_t` does.
         return out.coerceIn(ECHO_PCM16_MIN, ECHO_PCM16_MAX).toInt()
     }
+
+    /**
+     * One interleaved PCM 32-bit float sample in, one out, preserving full floating-point headroom.
+     */
+    fun processInterleavedFloat(input: Float): Float {
+        val line = floatLines[channelCursor]
+        var out = input.toDouble() * inGain
+        var tap = 0
+        while (tap < tapOffsets.size) {
+            var readIndex = writeIndex + ringLength - tapOffsets[tap]
+            if (readIndex >= ringLength) readIndex -= ringLength
+            out += (line[readIndex] * tapDecays[tap]).toDouble()
+            tap++
+        }
+        out *= outGain
+        line[writeIndex] = input
+
+        channelCursor++
+        if (channelCursor == channelCount) {
+            channelCursor = 0
+            writeIndex++
+            if (writeIndex == ringLength) writeIndex = 0
+        }
+        return out.toFloat()
+    }
 }
+

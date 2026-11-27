@@ -32,18 +32,26 @@ class EchoAudioProcessor(
     private val effects: () -> AudioEffects,
 ) : BaseAudioProcessor() {
     private val kernel = EchoKernel()
+    private var encoding = C.ENCODING_INVALID
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT &&
+            inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT
+        ) {
             return AudioProcessor.AudioFormat.NOT_SET
         }
-        kernel.configure(inputAudioFormat.sampleRate, inputAudioFormat.channelCount)
+        encoding = inputAudioFormat.encoding
+        kernel.configure(
+            sampleRate = inputAudioFormat.sampleRate,
+            channelCount = inputAudioFormat.channelCount,
+            useFloat = encoding == C.ENCODING_PCM_FLOAT,
+        )
         return inputAudioFormat
     }
 
     // isActive() is deliberately NOT overridden, for the reason spelled out in
     // EqualizerAudioProcessor: the base class answers it from the format onConfigure just returned,
-    // which is exactly the right question — active for PCM 16-bit, dropped for anything else.
+    // which is exactly the right question — active for PCM 16-bit/float, dropped for anything else.
     // Whether a delay is configured is a separate matter entirely, and is decided per buffer by the
     // bypass branch below, because activity is only reconsidered on configure.
 
@@ -55,6 +63,7 @@ class EchoAudioProcessor(
 
     override fun onReset() {
         kernel.reset()
+        encoding = C.ENCODING_INVALID
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -73,11 +82,22 @@ class EchoAudioProcessor(
         }
 
         inputBuffer.order(ByteOrder.nativeOrder())
+        output.order(ByteOrder.nativeOrder())
         kernel.beginBuffer()
-        while (inputBuffer.remaining() >= 2) {
-            output.putShort(kernel.processInterleaved(inputBuffer.short.toInt()).toShort())
+        when (encoding) {
+            C.ENCODING_PCM_FLOAT -> {
+                while (inputBuffer.remaining() >= 4) {
+                    output.putFloat(kernel.processInterleavedFloat(inputBuffer.float))
+                }
+            }
+            C.ENCODING_PCM_16BIT -> {
+                while (inputBuffer.remaining() >= 2) {
+                    output.putShort(kernel.processInterleaved(inputBuffer.short.toInt()).toShort())
+                }
+            }
+            else -> output.put(inputBuffer)
         }
-        // PCM16 frames are always an even number of bytes, so this should never fire. It is here
+        // PCM frames are always a whole number of bytes, so this should never fire. It is here
         // because the contract is to consume the whole input: leaving a byte behind makes the
         // pipeline re-offer the same buffer forever, having made no progress.
         while (inputBuffer.hasRemaining()) {
@@ -87,3 +107,4 @@ class EchoAudioProcessor(
         output.flip()
     }
 }
+

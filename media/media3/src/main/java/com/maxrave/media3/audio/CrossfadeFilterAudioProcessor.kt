@@ -87,13 +87,17 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
     private var wetMix: Double = 0.0
     private var wetRampStep: Double = 1.0 / MIN_RAMP_SAMPLES
 
+    private var encoding = C.ENCODING_INVALID
     private var sampleRate = 0
     private var channelCount = 0
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT &&
+            inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT
+        ) {
             return AudioProcessor.AudioFormat.NOT_SET
         }
+        encoding = inputAudioFormat.encoding
         sampleRate = inputAudioFormat.sampleRate
         channelCount = inputAudioFormat.channelCount
         val rampSamples = (sampleRate * DRY_WET_RAMP_SECONDS).toInt().coerceAtLeast(MIN_RAMP_SAMPLES)
@@ -145,14 +149,24 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
 
         val output = replaceOutputBuffer(remaining)
         inputBuffer.order(ByteOrder.nativeOrder())
+        output.order(ByteOrder.nativeOrder())
 
-        when (channelCount) {
-            1 -> processMonoBlock(inputBuffer, output, targetWet)
-            2 -> processStereoBlock(inputBuffer, output, targetWet)
-            else -> {
-                // Unsupported channel count: pass through
-                copyBuffer(inputBuffer, output, remaining)
+        when (encoding) {
+            C.ENCODING_PCM_FLOAT -> {
+                when (channelCount) {
+                    1 -> processMonoFloatBlock(inputBuffer, output, targetWet)
+                    2 -> processStereoFloatBlock(inputBuffer, output, targetWet)
+                    else -> copyBuffer(inputBuffer, output, remaining)
+                }
             }
+            C.ENCODING_PCM_16BIT -> {
+                when (channelCount) {
+                    1 -> processMonoBlock(inputBuffer, output, targetWet)
+                    2 -> processStereoBlock(inputBuffer, output, targetWet)
+                    else -> copyBuffer(inputBuffer, output, remaining)
+                }
+            }
+            else -> copyBuffer(inputBuffer, output, remaining)
         }
 
         if (!snapshot.enabled && wetMix <= 0.0) {
@@ -197,6 +211,9 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
             val out = if (mix >= 1.0) wet else dry * (1.0 - mix) + wet * mix
             output.putShort((out.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
         }
+        while (input.hasRemaining()) {
+            output.put(input.get())
+        }
     }
 
     private fun processStereoBlock(input: ByteBuffer, output: ByteBuffer, targetWet: Double) {
@@ -210,6 +227,39 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
             val outR = if (mix >= 1.0) wetR else dryR * (1.0 - mix) + wetR * mix
             output.putShort((outL.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
             output.putShort((outR.coerceIn(-1.0, 1.0) * Short.MAX_VALUE).toInt().toShort())
+        }
+        while (input.hasRemaining()) {
+            output.put(input.get())
+        }
+    }
+
+    private fun processMonoFloatBlock(input: ByteBuffer, output: ByteBuffer, targetWet: Double) {
+        while (input.remaining() >= 4) {
+            val dry = input.float.toDouble()
+            val wet = filter.processSampleMono(dry)
+            val mix = stepWetMix(targetWet)
+            val out = if (mix >= 1.0) wet else dry * (1.0 - mix) + wet * mix
+            output.putFloat(out.toFloat())
+        }
+        while (input.hasRemaining()) {
+            output.put(input.get())
+        }
+    }
+
+    private fun processStereoFloatBlock(input: ByteBuffer, output: ByteBuffer, targetWet: Double) {
+        while (input.remaining() >= 8) {
+            val dryL = input.float.toDouble()
+            val dryR = input.float.toDouble()
+            val wetL = filter.processStereoLeft(dryL)
+            val wetR = filter.processStereoRight(dryR)
+            val mix = stepWetMix(targetWet)
+            val outL = if (mix >= 1.0) wetL else dryL * (1.0 - mix) + wetL * mix
+            val outR = if (mix >= 1.0) wetR else dryR * (1.0 - mix) + wetR * mix
+            output.putFloat(outL.toFloat())
+            output.putFloat(outR.toFloat())
+        }
+        while (input.hasRemaining()) {
+            output.put(input.get())
         }
     }
 
@@ -226,6 +276,7 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
         appliedCutoffHz = -1f
         appliedSampleRate = 0
         wetMix = 0.0
+        encoding = C.ENCODING_INVALID
         sampleRate = 0
         channelCount = 0
         filter.reset()
