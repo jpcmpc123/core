@@ -93,6 +93,7 @@ data class AlbumItem(
     val isSingle: Boolean = false,
     override val thumbnail: String,
     override val explicit: Boolean = false,
+    val subtitle: String? = null,
 ) : YTItem() {
     override val shareLink: String
         get() = "https://simpmusic.org/app/playlist?list=$playlistId"

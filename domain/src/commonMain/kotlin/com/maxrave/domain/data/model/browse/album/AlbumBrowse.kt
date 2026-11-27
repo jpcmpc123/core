@@ -17,4 +17,5 @@ data class AlbumBrowse(
     val type: String,
     val year: String?,
     val otherVersion: List<ResultAlbum> = emptyList(),
+    val similarAlbums: List<ResultAlbum> = emptyList(),
 )

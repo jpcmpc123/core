@@ -471,6 +471,51 @@ class YouTube {
                 } else {
                     emptyList()
                 }
+            val secondarySection =
+                response.contents
+                    .twoColumnBrowseResultsRenderer
+                    .secondaryContents
+                    ?.sectionListRenderer
+            val collectedCarousels =
+                secondarySection
+                    ?.contents
+                    ?.mapNotNull { it.musicCarouselShelfRenderer }
+                    ?.toMutableList()
+                    ?: mutableListOf()
+            val secondaryContinuation =
+                secondarySection?.continuations?.getContinuation()
+                    ?: secondarySection
+                        ?.contents
+                        ?.lastOrNull()
+                        ?.continuationItemRenderer
+                        ?.continuationEndpoint
+                        ?.continuationCommand
+                        ?.token
+            if (secondaryContinuation != null && collectedCarousels.size < 2) {
+                runCatching {
+                    val contResponse =
+                        ytMusic
+                            .browse(
+                                client = WEB_REMIX,
+                                continuation = secondaryContinuation,
+                            ).body<BrowseResponse>()
+                    contResponse.continuationContents
+                        ?.sectionListContinuation
+                        ?.contents
+                        ?.mapNotNull { it.musicCarouselShelfRenderer }
+                        ?.let { collectedCarousels.addAll(it) }
+                    contResponse.onResponseReceivedActions
+                        ?.flatMap { it.appendContinuationItemsAction?.continuationItems.orEmpty() }
+                        ?.mapNotNull { it.musicCarouselShelfRenderer }
+                        ?.let { collectedCarousels.addAll(it) }
+                }
+            }
+            val (otherVersions, similarAlbums) =
+                AlbumPage.classifySecondaryCarousels(
+                    currentBrowseId = browseId,
+                    albumTitle = albumItem.title,
+                    carousels = collectedCarousels,
+                )
             AlbumPage(
                 album = albumItem,
                 songs = parsedSongs,
@@ -514,20 +559,8 @@ class YouTube {
                         ?.thumbnail
                         ?.musicThumbnailRenderer
                         ?.thumbnail,
-                otherVersion =
-                    response.contents
-                        .twoColumnBrowseResultsRenderer
-                        .secondaryContents
-                        ?.sectionListRenderer
-                        ?.contents
-                        ?.lastOrNull()
-                        ?.musicCarouselShelfRenderer
-                        ?.contents
-                        ?.mapNotNull {
-                            AlbumPage.fromMusicTwoRowItemRenderer(
-                                it.musicTwoRowItemRenderer,
-                            )
-                        } ?: emptyList(),
+                otherVersion = otherVersions,
+                similarAlbums = similarAlbums,
             )
         }
 

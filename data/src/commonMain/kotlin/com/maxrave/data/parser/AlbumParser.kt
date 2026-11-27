@@ -57,6 +57,25 @@ internal fun parseAlbumData(data: AlbumPage): AlbumBrowse {
         )
     }
 
+    val fallbackYear = data.album.year?.toString().orEmpty()
+    val toCardResult: (com.maxrave.kotlinytmusicscraper.models.AlbumItem) -> ResultAlbum = { item ->
+        val subtitleText =
+            item.subtitle?.takeIf { it.isNotBlank() }
+                ?: item.year?.toString()
+                ?: item.artists
+                    ?.mapNotNull { a -> a.name.takeIf { it.isNotBlank() } }
+                    ?.joinToString(", ")
+                    ?.takeIf { it.isNotBlank() }
+                ?: fallbackYear
+        ResultAlbum(
+            browseId = item.browseId,
+            isExplicit = item.explicit,
+            thumbnails = listOf(Thumbnail(800, item.thumbnail, 800)),
+            title = item.title,
+            year = subtitleText,
+        )
+    }
+
     return AlbumBrowse(
         artists = artist,
         audioPlaylistId = data.album.playlistId,
@@ -69,15 +88,7 @@ internal fun parseAlbumData(data: AlbumPage): AlbumBrowse {
         tracks = songs,
         type = "Album",
         year = data.album.year.toString(),
-        otherVersion =
-            data.otherVersion.map {
-                ResultAlbum(
-                    browseId = it.browseId,
-                    isExplicit = it.explicit,
-                    thumbnails = listOf(Thumbnail(800, it.thumbnail, 800)),
-                    title = it.title,
-                    year = data.album.year.toString(),
-                )
-            },
+        otherVersion = data.otherVersion.map(toCardResult),
+        similarAlbums = data.similarAlbums.map(toCardResult),
     )
 }
