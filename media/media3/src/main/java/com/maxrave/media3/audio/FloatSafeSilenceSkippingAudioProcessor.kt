@@ -72,7 +72,7 @@ class FloatSafeSilenceSkippingAudioProcessor(
     }
 
     override fun onFlush(streamMetadata: AudioProcessor.StreamMetadata) {
-        if (enabled && delegate.isActive) {
+        if (enabled) {
             delegate.flush(streamMetadata)
         }
     }

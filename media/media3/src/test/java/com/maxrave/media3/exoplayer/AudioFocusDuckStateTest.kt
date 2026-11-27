@@ -75,4 +75,24 @@ class AudioFocusDuckStateTest {
         assertFalse(state.isDucked)
         assertEquals(gen2 + 1L, state.duckGeneration)
     }
+
+    @Test
+    fun crossfadeAdapterDeclaresPlayerNormGainsBeforeInitialPlayer() {
+        val fields = CrossfadeExoPlayerAdapter::class.java.declaredFields.map { it.name }
+        val normIdx = fields.indexOf("playerNormGains")
+        val routerIdx = fields.indexOf("outputRouter")
+        val initPlayerIdx = fields.indexOf("initialPlayerWithFilter")
+        assertTrue("Expected playerNormGains field in CrossfadeExoPlayerAdapter", normIdx >= 0)
+        assertTrue("Expected outputRouter field in CrossfadeExoPlayerAdapter", routerIdx >= 0)
+        assertTrue("Expected initialPlayerWithFilter field in CrossfadeExoPlayerAdapter", initPlayerIdx >= 0)
+        assertTrue(
+            "playerNormGains ($normIdx) must initialize before initialPlayerWithFilter ($initPlayerIdx)",
+            normIdx < initPlayerIdx,
+        )
+        assertTrue(
+            "outputRouter ($routerIdx) must initialize before initialPlayerWithFilter ($initPlayerIdx)",
+            routerIdx < initPlayerIdx,
+        )
+    }
 }
+

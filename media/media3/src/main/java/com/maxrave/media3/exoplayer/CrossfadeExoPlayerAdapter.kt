@@ -234,6 +234,17 @@ internal class CrossfadeExoPlayerAdapter(
     @Volatile
     private var internalEqualizerConfig: EqualizerConfig = EqualizerConfig.FLAT
 
+    private class TrackNormalizationGain(
+        @Volatile var gainDb: Float = 0f,
+    )
+
+    /**
+     * Per-player linear ReplayGain holder; WeakHashMap auto-cleans released players with zero
+     * audio-thread locking. Must be declared above [initialPlayerWithFilter] because property
+     * initializers execute top-to-bottom in `<init>` before `createExoPlayerInstance()`.
+     */
+    private val playerNormGains = Collections.synchronizedMap(WeakHashMap<ExoPlayer, TrackNormalizationGain>())
+
     /**
      * The delay and reverb settings in force. Read exactly like [internalEqualizerConfig]: every
      * player's [EchoAudioProcessor] and [ConvolutionReverbAudioProcessor] sample it on every
@@ -845,13 +856,6 @@ internal class CrossfadeExoPlayerAdapter(
         val player: ExoPlayer,
         val filter: CrossfadeFilterAudioProcessor,
     )
-
-    private class TrackNormalizationGain(
-        @Volatile var gainDb: Float = 0f,
-    )
-
-    /** Per-player linear ReplayGain holder; WeakHashMap auto-cleans released players with zero audio-thread locking. */
-    private val playerNormGains = Collections.synchronizedMap(WeakHashMap<ExoPlayer, TrackNormalizationGain>())
 
     /**
      * Create a new ExoPlayer instance with a per-player [CrossfadeFilterAudioProcessor] and
