@@ -44,6 +44,8 @@ actual class Extractor {
 
     actual fun isStreamUrlReachable(url: String): Boolean = true
 
+    actual fun probeStreamUrl(url: String): StreamProbeResult = StreamProbeResult.Reachable
+
     actual fun mergeAudioVideoDownload(filePath: String): DownloadProgress = DownloadProgress.failed("Not supported on iOS")
 
     actual fun saveAudioWithThumbnail(

@@ -22,9 +22,9 @@ internal fun List<Pair<Int, String>>.hasRequiredItags(): Boolean {
 private fun buildHealthCheckClient(proxy: Proxy?): OkHttpClient =
     extractorHttpClient(proxy)
         .newBuilder()
-        .connectTimeout(2500, TimeUnit.MILLISECONDS)
-        .readTimeout(2500, TimeUnit.MILLISECONDS)
-        .callTimeout(3000, TimeUnit.MILLISECONDS)
+        .connectTimeout(3500, TimeUnit.MILLISECONDS)
+        .readTimeout(3500, TimeUnit.MILLISECONDS)
+        .callTimeout(4500, TimeUnit.MILLISECONDS)
         .build()
 
 @Volatile
@@ -35,42 +35,59 @@ internal fun updateStreamHealthCheckProxy(proxy: Proxy?) {
 }
 
 /**
- * Pick one random URL whose itag belongs to [ITAG.AUDIO] or [ITAG.VIDEO] and HEAD it. Returns true
- * only when the response code is in the 200..299 range. We only health-check those URLs because
- * they are the ones the player will actually use; lower-quality extras can stay unverified.
+ * Pick one random URL whose itag belongs to [ITAG.AUDIO] or [ITAG.VIDEO] and HEAD it. Returns
+ * [StreamProbeResult] differentiating genuine HTTP rejections from transient 4G timeouts.
  */
 internal fun List<Pair<Int, String>>.headCheckTarget(): Pair<Int, String>? =
     ITAG.AUDIO_PLAYABLE.firstNotNullOfOrNull { target -> firstOrNull { it.first == target } }
         ?: firstOrNull { it.first in ITAG.VIDEO }
 
-internal fun List<Pair<Int, String>>.headCheckRandomStream(trackRegistry: Boolean = true): Boolean {
-    val candidate = headCheckTarget() ?: return false
-    if (trackRegistry && ExtractorCallRegistry.isCurrentCancelled()) return false
+internal fun List<Pair<Int, String>>.probeRandomStream(trackRegistry: Boolean = true): StreamProbeResult {
+    val candidate = headCheckTarget() ?: return StreamProbeResult.Rejected(0)
+    if (trackRegistry && ExtractorCallRegistry.isCurrentCancelled()) return StreamProbeResult.Cancelled
     val token = if (trackRegistry) ExtractorCallRegistry.activeToken() else null
-    return runCatching {
-        val request =
-            okhttp3.Request
-                .Builder()
-                .head()
-                .url(candidate.second)
-                .build()
-        val call = streamHealthCheckClient.newCall(request)
-        if (token != null && !ExtractorCallRegistry.registerCall(token, call)) return false
-        try {
-            call.execute().use { response ->
-                response.code in 200..299
+    val request =
+        okhttp3.Request
+            .Builder()
+            .head()
+            .url(candidate.second)
+            .build()
+    val call = streamHealthCheckClient.newCall(request)
+    if (token != null && !ExtractorCallRegistry.registerCall(token, call)) {
+        return StreamProbeResult.Cancelled
+    }
+    return try {
+        call.execute().use { response ->
+            if (response.code in 200..299) {
+                StreamProbeResult.Reachable
+            } else {
+                StreamProbeResult.Rejected(response.code)
             }
-        } finally {
-            if (token != null) ExtractorCallRegistry.unregisterCall(token, call)
         }
-    }.getOrDefault(false)
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        if (trackRegistry && ExtractorCallRegistry.isCurrentCancelled()) {
+            StreamProbeResult.Cancelled
+        } else {
+            StreamProbeResult.TransportError(
+                reason = e::class.simpleName ?: "IOException",
+                isOffline = DirectAudioFastPathState.isOfflineNetworkError(e),
+            )
+        }
+    } finally {
+        if (token != null) ExtractorCallRegistry.unregisterCall(token, call)
+    }
 }
+
+internal fun List<Pair<Int, String>>.headCheckRandomStream(trackRegistry: Boolean = true): Boolean =
+    probeRandomStream(trackRegistry) is StreamProbeResult.Reachable
 
 /** Whether the list carries at least one audio stream URL, even with no video stream at all. */
 internal fun List<Pair<Int, String>>.hasAudioItag(): Boolean = any { it.first in ITAG.AUDIO_PLAYABLE }
 
-internal fun isStreamUrlReachable(url: String): Boolean =
-    runCatching {
+internal fun probeStreamUrl(url: String): StreamProbeResult =
+    try {
         val request =
             okhttp3.Request
                 .Builder()
@@ -78,9 +95,22 @@ internal fun isStreamUrlReachable(url: String): Boolean =
                 .url(url)
                 .build()
         streamHealthCheckClient.newCall(request).execute().use { response ->
-            response.code in 200..299
+            if (response.code in 200..299) {
+                StreamProbeResult.Reachable
+            } else {
+                StreamProbeResult.Rejected(response.code)
+            }
         }
-    }.getOrDefault(false)
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        StreamProbeResult.TransportError(
+            reason = e::class.simpleName ?: "IOException",
+            isOffline = DirectAudioFastPathState.isOfflineNetworkError(e),
+        )
+    }
+
+internal fun isStreamUrlReachable(url: String): Boolean = probeStreamUrl(url) is StreamProbeResult.Reachable
 
 class BraveNewPipeDownloaderImpl(
     proxy: Proxy?,

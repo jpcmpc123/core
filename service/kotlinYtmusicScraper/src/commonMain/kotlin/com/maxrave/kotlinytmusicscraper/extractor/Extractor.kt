@@ -65,4 +65,7 @@ expect class Extractor() {
 
     /** Lightweight HEAD probe used when direct InnerTube URLs need verification. */
     fun isStreamUrlReachable(url: String): Boolean
+
+    /** Typed HEAD probe differentiating HTTP rejections from transient network timeouts. */
+    fun probeStreamUrl(url: String): StreamProbeResult
 }

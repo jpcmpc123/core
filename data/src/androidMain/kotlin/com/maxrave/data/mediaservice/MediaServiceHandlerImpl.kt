@@ -8,6 +8,7 @@ import android.content.Intent
 import android.media.audiofx.AudioEffect
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.SystemClock
 import com.maxrave.common.ASC
 import com.maxrave.common.CUSTOM_ORDER
@@ -228,10 +229,14 @@ internal class MediaServiceHandlerImpl(
     @Volatile
     private var pendingInsertSongJob: Pair<String, Job>? = null
 
+    @Volatile
+    private var pendingNetworkRestoredEmit: Boolean = false
+
     private val networkCallback =
         object : ConnectivityManager.NetworkCallback() {
             override fun onLost(network: Network) {
                 networkWasLost = true
+                pendingNetworkRestoredEmit = false
                 // player getters belong on Main — dispatch rather than reading on ConnectivityThread.
                 coroutineScope.launch {
                     if (player.playWhenReady &&
@@ -249,12 +254,22 @@ internal class MediaServiceHandlerImpl(
                 lastConnectedNetwork = network
                 if (!networkWasLost && !switchedNetwork) return
                 networkWasLost = false
+                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val isValidated =
+                    cm?.getNetworkCapabilities(network)
+                        ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+                if (!isValidated) {
+                    pendingNetworkRestoredEmit = true
+                }
                 coroutineScope.launch {
                     val shouldResume = resumeWhenNetworkReturns
                     resumeWhenNetworkReturns = false
                     val mediaIdAtReconnect = player.currentMediaItem?.mediaId
                     streamRepository.invalidateAllFormats()
-                    _networkRestoredEvents.tryEmit(Unit)
+                    if (isValidated) {
+                        pendingNetworkRestoredEmit = false
+                        _networkRestoredEvents.tryEmit(Unit)
+                    }
                     if (!shouldResume || terminalError) return@launch
                     if (!resumePlaybackAfterReconnect()) {
                         delay(2_000)
@@ -265,6 +280,18 @@ internal class MediaServiceHandlerImpl(
                             resumePlaybackAfterReconnect()
                         }
                     }
+                }
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                if (pendingNetworkRestoredEmit &&
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                ) {
+                    pendingNetworkRestoredEmit = false
+                    _networkRestoredEvents.tryEmit(Unit)
                 }
             }
         }
@@ -3128,6 +3155,8 @@ internal class MediaServiceHandlerImpl(
                             "id=$timingVideoId playing=${elapsed}ms",
                         )
                         playTimingVideoId = null
+                    } else if (!player.playWhenReady) {
+                        playTimingVideoId = null
                     }
                 }
                 if (durMs > 0L) {
@@ -3200,6 +3229,9 @@ internal class MediaServiceHandlerImpl(
                 updateDiscordRpc(it)
             }
         } else {
+            if (playTimingReadyLogged && !player.playWhenReady) {
+                playTimingVideoId = null
+            }
             stopProgressUpdate()
             mayBeSaveRecentSong()
             savePlaybackStateAsync()

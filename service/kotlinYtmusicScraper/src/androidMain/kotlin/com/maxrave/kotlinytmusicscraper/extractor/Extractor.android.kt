@@ -179,6 +179,8 @@ actual class Extractor {
 
     actual fun isStreamUrlReachable(url: String): Boolean = com.maxrave.kotlinytmusicscraper.extractor.isStreamUrlReachable(url)
 
+    actual fun probeStreamUrl(url: String): StreamProbeResult = com.maxrave.kotlinytmusicscraper.extractor.probeStreamUrl(url)
+
     actual fun clearHeadTrust() {
         synchronized(trustLock) {
             localTierTrustedUntilMs = 0L
@@ -485,32 +487,45 @@ actual class Extractor {
                 unverifiedTier = tier
             } else {
                 val headStartedMs = SystemClock.elapsedRealtime()
-                val headOk = pipeResult.headCheckRandomStream()
+                val probeResult = pipeResult.probeRandomStream()
                 val headMs = SystemClock.elapsedRealtime() - headStartedMs
-                if (isCancelled()) {
+                if (isCancelled() || probeResult is StreamProbeResult.Cancelled) {
                     attempts.add("$tier:cancelled/${extractMs}ms")
                     return null
                 }
-                if (!headOk) {
-                    clearTierTrust(tier)
-                    attempts.add("$tier:headFail=${headMs}ms/${extractMs}ms")
-                    Logger.d(
-                        TAG,
-                        "PipePipe[$tier] ${if (complete) "stream" else "audio-only"} URL HEAD check failed (non 2xx) for $videoId",
-                    )
-                    // A rejected URL is the one symptom of a stale player table / dead client:
-                    // invalidate local decoder or put that tier into temporary skip cooldown.
-                    if (tier == LOCAL_TIER) {
-                        markLocalTierBroken()
-                        faradayDecoder.invalidateAsync()
-                    } else if (tier == REMOTE_TIER) {
-                        markRemoteTierBroken()
+                when (probeResult) {
+                    StreamProbeResult.Reachable -> {
+                        markTierTrusted(tier)
+                        headDetail = "head=${headMs}ms"
+                        unverifiedTier = null
                     }
-                    return null
+                    is StreamProbeResult.Rejected -> {
+                        clearTierTrust(tier)
+                        attempts.add("$tier:headHttp${probeResult.httpCode}=${headMs}ms/${extractMs}ms")
+                        Logger.d(
+                            TAG,
+                            "PipePipe[$tier] ${if (complete) "stream" else "audio-only"} URL rejected (HTTP ${probeResult.httpCode}) for $videoId",
+                        )
+                        // A rejected URL is the one symptom of a stale player table / dead client:
+                        // invalidate local decoder or put that tier into temporary skip cooldown.
+                        if (tier == LOCAL_TIER) {
+                            markLocalTierBroken()
+                            faradayDecoder.invalidateAsync()
+                        } else if (tier == REMOTE_TIER) {
+                            markRemoteTierBroken()
+                        }
+                        return null
+                    }
+                    is StreamProbeResult.TransportError -> {
+                        headDetail = "head=timeout_pass(${headMs}ms)"
+                        unverifiedTier = tier
+                        Logger.d(
+                            TAG,
+                            "PipePipe[$tier] HEAD probe errored (${probeResult.reason}) for $videoId; allowing unverified stream",
+                        )
+                    }
+                    StreamProbeResult.Cancelled -> return null
                 }
-                markTierTrusted(tier)
-                headDetail = "head=${headMs}ms"
-                unverifiedTier = null
             }
             val label = if (tier == LOCAL_TIER) faradayDecoder.lastOutcomeLabel else REMOTE_TIER
             if (!complete) {
@@ -532,10 +547,12 @@ actual class Extractor {
             }
             attempts.add("$tier:err(${e::class.simpleName})/${extractMs}ms")
             Logger.w(TAG, "PipePipe[$tier] extractor failed for $videoId: ${e.message}")
-            if (tier == LOCAL_TIER) {
-                markLocalTierBroken()
-            } else if (tier == REMOTE_TIER) {
-                markRemoteTierBroken()
+            if (!DirectAudioFastPathState.isTransientNetworkError(e)) {
+                if (tier == LOCAL_TIER) {
+                    markLocalTierBroken()
+                } else if (tier == REMOTE_TIER) {
+                    markRemoteTierBroken()
+                }
             }
             return null
         }
@@ -572,21 +589,34 @@ actual class Extractor {
                 unverifiedTier = BRAVE_TIER
             } else {
                 val headStartedMs = SystemClock.elapsedRealtime()
-                val headOk = braveResult.headCheckRandomStream()
+                val probeResult = braveResult.probeRandomStream()
                 val headMs = SystemClock.elapsedRealtime() - headStartedMs
-                if (isCancelled()) {
+                if (isCancelled() || probeResult is StreamProbeResult.Cancelled) {
                     attempts.add("$BRAVE_TIER:cancelled/${extractMs}ms")
                     return@runCatching null
                 }
-                if (!headOk) {
-                    clearTierTrust(BRAVE_TIER)
-                    attempts.add("$BRAVE_TIER:headFail=${headMs}ms/${extractMs}ms")
-                    Logger.d(TAG, "BravePipe stream URL HEAD check failed (non 2xx) for $videoId")
-                    return@runCatching null
+                when (probeResult) {
+                    StreamProbeResult.Reachable -> {
+                        markTierTrusted(BRAVE_TIER)
+                        headDetail = "head=${headMs}ms"
+                        unverifiedTier = null
+                    }
+                    is StreamProbeResult.Rejected -> {
+                        clearTierTrust(BRAVE_TIER)
+                        attempts.add("$BRAVE_TIER:headHttp${probeResult.httpCode}=${headMs}ms/${extractMs}ms")
+                        Logger.d(TAG, "BravePipe stream URL rejected (HTTP ${probeResult.httpCode}) for $videoId")
+                        return@runCatching null
+                    }
+                    is StreamProbeResult.TransportError -> {
+                        headDetail = "head=timeout_pass(${headMs}ms)"
+                        unverifiedTier = BRAVE_TIER
+                        Logger.d(
+                            TAG,
+                            "BravePipe HEAD probe errored (${probeResult.reason}) for $videoId; allowing unverified stream",
+                        )
+                    }
+                    StreamProbeResult.Cancelled -> return@runCatching null
                 }
-                markTierTrusted(BRAVE_TIER)
-                headDetail = "head=${headMs}ms"
-                unverifiedTier = null
             }
             attempts.add("$BRAVE_TIER:ok/${extractMs}ms/$headDetail")
             Logger.d(TAG, "extract source=BravePipe itags=${braveResult.map { pair -> pair.first }} for $videoId")

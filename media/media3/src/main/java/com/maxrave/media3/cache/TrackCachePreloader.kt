@@ -95,6 +95,7 @@ internal class TrackCachePreloader(
     private suspend fun cacheWithWatchdog(mediaId: String) {
         var attempt = 0
         var zeroProgressPasses = 0
+        var consecutiveResolveFailures = 0
         while (attempt < MAX_ATTEMPTS) {
             attempt++
             val outcome =
@@ -104,6 +105,16 @@ internal class TrackCachePreloader(
                     throw e
                 } catch (e: Exception) {
                     Logger.w(TAG, "Full-track cache pass $attempt for $mediaId failed: ${e.message}")
+                    if (isResolveOrNetworkFailure(e) && isMetered()) {
+                        consecutiveResolveFailures++
+                        if (consecutiveResolveFailures >= MAX_METERED_NETWORK_FAILURES) {
+                            Logger.d(
+                                TAG,
+                                "Full-track cache stopping on $mediaId after $consecutiveResolveFailures metered resolve/network failures",
+                            )
+                            return
+                        }
+                    }
                     PassOutcome.RETRY
                 }
             when (outcome) {
@@ -115,6 +126,7 @@ internal class TrackCachePreloader(
                 // burning 8x redundant downloads over mobile data.
                 PassOutcome.GIVE_UP -> return
                 PassOutcome.NO_PROGRESS -> {
+                    consecutiveResolveFailures = 0
                     zeroProgressPasses++
                     if (zeroProgressPasses >= MAX_NO_PROGRESS_PASSES) {
                         Logger.d(TAG, "Full-track cache stopping on $mediaId after $zeroProgressPasses zero-progress passes")
@@ -128,6 +140,31 @@ internal class TrackCachePreloader(
             }
         }
         Logger.w(TAG, "Full-track cache gave up on $mediaId after $MAX_ATTEMPTS attempts")
+    }
+
+    private fun isResolveOrNetworkFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        var depth = 0
+        while (current != null && depth < 8) {
+            val className = current::class.simpleName.orEmpty()
+            if (className == "SocketTimeoutException" ||
+                className == "UnknownHostException" ||
+                className == "ConnectException" ||
+                className == "SocketException"
+            ) {
+                return true
+            }
+            val msg = current.message.orEmpty()
+            if (msg.contains("Failed to resolve stream URL", ignoreCase = true) ||
+                msg.contains("Stream resolve cancelled", ignoreCase = true) ||
+                msg.contains("timed out", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
+            depth++
+        }
+        return false
     }
 
     /**
@@ -223,6 +260,7 @@ internal class TrackCachePreloader(
         const val RETRY_BACKOFF_CAP = 6
         const val MAX_ATTEMPTS = 8
         const val MAX_NO_PROGRESS_PASSES = 2
+        const val MAX_METERED_NETWORK_FAILURES = 2
         const val SKIP_PROBE_BYTES = 256L * 1024L
 
         /** Same sanity cap WaveformReader applies to a track's audio. */

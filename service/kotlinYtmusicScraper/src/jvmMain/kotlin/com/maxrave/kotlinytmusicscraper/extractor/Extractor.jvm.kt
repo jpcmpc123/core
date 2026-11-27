@@ -42,6 +42,8 @@ actual class Extractor {
 
     actual fun isStreamUrlReachable(url: String): Boolean = com.maxrave.kotlinytmusicscraper.extractor.isStreamUrlReachable(url)
 
+    actual fun probeStreamUrl(url: String): StreamProbeResult = com.maxrave.kotlinytmusicscraper.extractor.probeStreamUrl(url)
+
     actual fun logIn(cookie: String?) {
         ServiceList.YouTube.tokens = cookie ?: ""
     }

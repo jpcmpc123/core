@@ -339,6 +339,9 @@ class Ytmusic {
 
     fun isStreamUrlReachable(url: String): Boolean = extractor.isStreamUrlReachable(url)
 
+    fun probeStreamUrl(url: String): com.maxrave.kotlinytmusicscraper.extractor.StreamProbeResult =
+        extractor.probeStreamUrl(url)
+
     fun getLiveHlsUrl(videoId: String): String? = extractor.liveHlsUrl(videoId)
 
     fun mergeAudioVideoDownload(filePath: String): DownloadProgress = extractor.mergeAudioVideoDownload(filePath)

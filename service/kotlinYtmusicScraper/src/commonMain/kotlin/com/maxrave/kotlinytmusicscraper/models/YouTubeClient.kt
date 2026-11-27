@@ -16,6 +16,7 @@ data class YouTubeClient(
     val timeZone: String? = null,
     val utcOffsetMinutes: Int? = null,
     val xClientName: Int? = null,
+    val isYouTubeMusicClient: Boolean = false,
 ) {
     fun toContext(
         locale: YouTubeLocale,
@@ -58,6 +59,7 @@ data class YouTubeClient(
                 osName = "Android",
                 osVersion = "11",
                 xClientName = 21,
+                isYouTubeMusicClient = true,
             )
 
         /**
@@ -135,6 +137,7 @@ data class YouTubeClient(
                 api_key = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30",
                 userAgent = USER_AGENT_WEB,
                 referer = REFERER_YOUTUBE_MUSIC,
+                isYouTubeMusicClient = true,
             )
 
         val WEB_EMBEDDED =
@@ -187,5 +190,26 @@ data class YouTubeClient(
                 utcOffsetMinutes = 0,
                 xClientName = 2,
             )
+    }
+}
+
+/**
+ * YouTube Music clients (`WEB_REMIX`, `ANDROID_MUSIC`) report `loudnessDb` relative to `-7 LUFS`,
+ * whereas standard YouTube clients (`ANDROID`, `IOS`, `TVHTML5`, `VISIONOS`, etc.) report it
+ * relative to `-14 LUFS` — an exact `+7.0 dB` offset. Standardizes any non-Music client's
+ * `loudnessDb` onto the YouTube Music `-7 LUFS` reference so fallback clients never introduce a
+ * 7 dB jump in ReplayGain normalization.
+ */
+internal const val YOUTUBE_TO_YTMUSIC_LOUDNESS_OFFSET_DB = -7.0
+
+fun normalizeLoudnessDbToYtMusicScale(
+    client: YouTubeClient,
+    rawLoudnessDb: Double?,
+): Double? {
+    if (rawLoudnessDb == null || !rawLoudnessDb.isFinite()) return rawLoudnessDb
+    return if (client.isYouTubeMusicClient) {
+        rawLoudnessDb
+    } else {
+        rawLoudnessDb + YOUTUBE_TO_YTMUSIC_LOUDNESS_OFFSET_DB
     }
 }

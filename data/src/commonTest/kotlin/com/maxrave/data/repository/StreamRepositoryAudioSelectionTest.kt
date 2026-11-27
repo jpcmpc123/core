@@ -161,5 +161,15 @@ class StreamRepositoryAudioSelectionTest {
         val invalidTrack = computeVolumeNormalization(null)
         assertEquals(0f, invalidTrack.gainDb)
     }
+
+    @Test
+    fun tidal429CooldownUsesExponentialBackoffCappedAtOneHour() {
+        assertEquals(120, computeTidal429CooldownSeconds(0))
+        assertEquals(120, computeTidal429CooldownSeconds(1))
+        assertEquals(600, computeTidal429CooldownSeconds(2))
+        assertEquals(1800, computeTidal429CooldownSeconds(3))
+        assertEquals(3600, computeTidal429CooldownSeconds(4))
+        assertEquals(3600, computeTidal429CooldownSeconds(12))
+    }
 }
 

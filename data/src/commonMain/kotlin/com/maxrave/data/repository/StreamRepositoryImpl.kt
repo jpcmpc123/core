@@ -65,6 +65,7 @@ internal class StreamRepositoryImpl(
     // resolves several tracks in a burst, and each used to fire its own request.
     private val tidalMutex = Mutex()
     private var tidalCooldownEnd: TimeMark? = null
+    private var tidalConsecutive429s: Int = 0
 
     private val lastUnrecoverableErrors = MutableStateFlow<Map<String, String>>(emptyMap())
 
@@ -211,7 +212,7 @@ internal class StreamRepositoryImpl(
                         playbackTrackingVideostatsPlaybackUrl = playbackUrl,
                         playbackTrackingAtrUrl = atrUrl,
                         playbackTrackingVideostatsWatchtimeUrl = watchtimeUrl,
-                        loudnessDb = existing.loudnessDb ?: loudnessDb,
+                        loudnessDb = loudnessDb ?: existing.loudnessDb,
                     )
                 formatCache.update { it + (formatKey to (currentPair.first to updated)) }
             }
@@ -1084,6 +1085,7 @@ internal class StreamRepositoryImpl(
                 youTube
                     .searchTidalMetadata(q, durationSecond)
                     .onSuccess { metadata ->
+                        tidalConsecutive429s = 0
                         Logger.d("Stream", "Tidal metadata: $metadata")
                         formatDbMutex.withLock {
                             localDataSource.updateNewFormatTidalMetadata(
@@ -1110,12 +1112,22 @@ internal class StreamRepositoryImpl(
                         }
                     }.onFailure {
                         if (it is CancellationException) throw it
-                        if (it.message?.contains("429") == true) {
-                            tidalCooldownEnd = TimeSource.Monotonic.markNow() + TIDAL_COOLDOWN_SECONDS.seconds
-                            Logger.w("Stream", "Tidal rate-limited (429): pausing metadata lookups for ${TIDAL_COOLDOWN_SECONDS}s")
+                        val msg = it.message.orEmpty()
+                        if (msg.contains("429")) {
+                            tidalConsecutive429s++
+                            val cooldownSec = computeTidal429CooldownSeconds(tidalConsecutive429s)
+                            tidalCooldownEnd = TimeSource.Monotonic.markNow() + cooldownSec.seconds
+                            Logger.w(
+                                "Stream",
+                                "Tidal rate-limited (429): pausing metadata lookups for ${cooldownSec}s (streak=$tidalConsecutive429s)",
+                            )
+                        } else if (msg.contains("Unable to resolve host", ignoreCase = true) ||
+                            msg.contains("No address associated with hostname", ignoreCase = true)
+                        ) {
+                            Logger.d("Stream", "Tidal metadata skipped for $videoId while offline ($msg)")
                         } else {
                             // Expected for songs Tidal does not know: no stacktrace.
-                            Logger.w("Stream", "Tidal metadata unavailable for $videoId: ${it.message}")
+                            Logger.w("Stream", "Tidal metadata unavailable for $videoId: $msg")
                         }
                     }
             }
@@ -1126,6 +1138,14 @@ internal class StreamRepositoryImpl(
         const val TIDAL_COOLDOWN_SECONDS = 120
     }
 }
+
+internal fun computeTidal429CooldownSeconds(consecutive429s: Int): Int =
+    when {
+        consecutive429s <= 1 -> 120
+        consecutive429s == 2 -> 600
+        consecutive429s == 3 -> 1800
+        else -> 3600
+    }
 
 internal fun selectBestAudioFormat(
     formats: List<PlayerResponse.StreamingData.Format>,

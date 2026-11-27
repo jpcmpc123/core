@@ -341,7 +341,8 @@ class DirectAudioFastPathTest {
         assertEquals("Test Track", standalone.videoDetails?.title)
         assertEquals("Artist - Topic", standalone.videoDetails?.author)
         assertEquals("214", standalone.videoDetails?.lengthSeconds)
-        assertEquals(-7.42, standalone.playerConfig?.audioConfig?.loudnessDb)
+        // VISIONOS (-14 LUFS) is standardized to YouTube Music's -7 LUFS scale (-7.42 - 7.0 = -14.42).
+        assertEquals(-14.42, standalone.playerConfig?.audioConfig?.loudnessDb!!, 1e-6)
         assertNull(standalone.playbackTracking)
         assertEquals(1, standalone.streamingData?.adaptiveFormats?.size)
         assertEquals(ITAG.AUDIO_OPUS_MEDIUM, standalone.streamingData?.adaptiveFormats?.first()?.itag)
@@ -428,19 +429,28 @@ class DirectAudioFastPathTest {
         val state = DirectAudioFastPathState()
         val t0 = 50_000L
 
-        // First isolated 4G timeout leaves VISIONOS available.
+        // Isolated 4G timeouts leave VISIONOS available until 3 consecutive failures.
         assertFalse(state.recordTransportFailure(t0))
+        assertTrue(state.isAvailable(t0 + 1_000L))
+        assertFalse(state.recordTransportFailure(t0 + 500L))
         assertTrue(state.isAvailable(t0 + 1_000L))
 
         // Successful serve resets consecutive counter.
         state.recordServed("HzYrZoALCCA")
         assertFalse(state.recordTransportFailure(t0 + 2_000L))
-        assertTrue(state.isAvailable(t0 + 3_000L))
+        assertFalse(state.recordTransportFailure(t0 + 3_000L))
+        assertTrue(state.isAvailable(t0 + 3_500L))
 
-        // Second consecutive transport failure enters 15-minute cooldown.
+        // Third consecutive transport failure enters short 3-minute transport cooldown (not 15m).
         assertTrue(state.recordTransportFailure(t0 + 4_000L))
         assertFalse(state.isAvailable(t0 + 5_000L))
-        assertTrue(state.isAvailable(t0 + 4_000L + DirectAudioFastPathState.DEFAULT_COOLDOWN_MS))
+        assertFalse(state.isAvailable(t0 + 4_000L + DirectAudioFastPathState.DEFAULT_TRANSPORT_COOLDOWN_MS - 1L))
+        assertTrue(state.isAvailable(t0 + 4_000L + DirectAudioFastPathState.DEFAULT_TRANSPORT_COOLDOWN_MS))
+
+        // Real rejection still triggers full 15-minute cooldown immediately.
+        state.markFailedOrRejected(t0 + 300_000L)
+        assertFalse(state.isAvailable(t0 + 300_000L + DirectAudioFastPathState.DEFAULT_COOLDOWN_MS - 1L))
+        assertTrue(state.isAvailable(t0 + 300_000L + DirectAudioFastPathState.DEFAULT_COOLDOWN_MS))
     }
 
     @Test
@@ -461,6 +471,16 @@ class DirectAudioFastPathTest {
             ),
         )
         assertFalse(DirectAudioFastPathState.isOfflineNetworkError(null))
+    }
+
+    @Test
+    fun transientNetworkErrorsMatchTimeoutsAndSocketsButNotHttp403() {
+        assertTrue(DirectAudioFastPathState.isTransientNetworkError(IllegalStateException("Player request timed out after 10000 ms")))
+        assertTrue(DirectAudioFastPathState.isTransientNetworkError(RuntimeException("failed to connect to www.youtube.com after 10000ms")))
+        assertTrue(DirectAudioFastPathState.isTransientNetworkError(IllegalStateException("Unable to resolve host \"music.youtube.com\"")))
+        assertFalse(DirectAudioFastPathState.isTransientNetworkError(IllegalStateException("HTTP 403 Forbidden")))
+        assertFalse(DirectAudioFastPathState.isTransientNetworkError(IllegalStateException("UNPLAYABLE: This video is not available")))
+        assertFalse(DirectAudioFastPathState.isTransientNetworkError(null))
     }
 
     @Test

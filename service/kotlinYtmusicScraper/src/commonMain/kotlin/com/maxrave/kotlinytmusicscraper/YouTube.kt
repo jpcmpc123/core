@@ -10,8 +10,10 @@ import com.maxrave.kotlinytmusicscraper.extractor.DirectAudioFastPathState
 import com.maxrave.kotlinytmusicscraper.extractor.ExtractSource
 import com.maxrave.kotlinytmusicscraper.extractor.ExtractTiming
 import com.maxrave.kotlinytmusicscraper.extractor.ParsedDirectPlayerResponse
+import com.maxrave.kotlinytmusicscraper.extractor.StreamProbeResult
 import com.maxrave.kotlinytmusicscraper.extractor.contentLengthOf
 import com.maxrave.kotlinytmusicscraper.extractor.orderByAudioTrack
+import com.maxrave.kotlinytmusicscraper.models.normalizeLoudnessDbToYtMusicScale
 import kotlin.math.abs
 import com.maxrave.kotlinytmusicscraper.models.AccountInfo
 import com.maxrave.kotlinytmusicscraper.models.AlbumItem
@@ -172,11 +174,14 @@ private const val AUDIO_VARIANT_RESOLVE_TIMEOUT_MS = 5_000L
 /** Sub-budget for the `next` counterpart step so a slow `next` never starves `FILTER_SONG` search. */
 private const val AUDIO_VARIANT_NEXT_TIMEOUT_MS = 2_200L
 
-/** Fast cap on the anonymous VISIONOS direct audio POST before yielding to BravePipe. */
-private const val VISIONOS_FAST_PATH_TIMEOUT_MS = 3_000L
+/** Cap on the anonymous VISIONOS direct audio POST before yielding to BravePipe. */
+private const val VISIONOS_FAST_PATH_TIMEOUT_MS = 4_500L
 
 /** Delay before starting BravePipe while VISIONOS races in parallel (or 0ms on early failure). */
 private const val VISIONOS_BRAVE_HEDGE_DELAY_MS = 700L
+
+/** Total wall-clock budget for serial direct client fallback requests under poor 4G connectivity. */
+private const val DIRECT_FALLBACK_BUDGET_MS = 18_000L
 
 /** Reuse anonymous VISIONOS visitorData (fetched without session cookies) for up to 30 minutes. */
 private const val VISIONOS_VISITOR_DATA_TTL_MS = 30 * 60 * 1000L
@@ -2003,7 +2008,18 @@ class YouTube {
                             ?.toKmpUri()
                             ?.getQueryParameter("fexp")
                     val playbackTracking = it.playbackTracking
+                    val normalizedAudioConfig =
+                        it.playerConfig?.audioConfig?.let { audioConfig ->
+                            audioConfig.copy(
+                                loudnessDb = normalizeLoudnessDbToYtMusicScale(client, audioConfig.loudnessDb),
+                                perceptualLoudnessDb = normalizeLoudnessDbToYtMusicScale(client, audioConfig.perceptualLoudnessDb),
+                            )
+                        }
                     it.copy(
+                        playerConfig =
+                            normalizedAudioConfig?.let { audioConfig ->
+                                it.playerConfig?.copy(audioConfig = audioConfig)
+                            } ?: it.playerConfig,
                         playbackTracking =
                             playbackTracking?.copy(
                                 atrUrl =
@@ -2261,14 +2277,38 @@ class YouTube {
         val headLabel =
             if (directAudioFastPath.isTrusted(nowMs)) {
                 "head=skip"
-            } else if (ytMusic.isStreamUrlReachable(probeUrl)) {
-                directAudioFastPath.markTrusted(Clock.System.now().toEpochMilliseconds())
-                "head=ok"
             } else {
-                Logger.w(TAG, "VISIONOS direct URL failed HEAD check for $videoId; cooling down for 15m")
-                invalidateVisionOsVisitorData()
-                directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
-                return DirectAudioOutcome.Failure("head_fail", Clock.System.now().toEpochMilliseconds() - startMs)
+                when (val probe = ytMusic.probeStreamUrl(probeUrl)) {
+                    StreamProbeResult.Reachable -> {
+                        directAudioFastPath.markTrusted(Clock.System.now().toEpochMilliseconds())
+                        "head=ok"
+                    }
+                    is StreamProbeResult.Rejected -> {
+                        Logger.w(
+                            TAG,
+                            "VISIONOS direct URL rejected (HTTP ${probe.httpCode}) for $videoId; cooling down for 15m",
+                        )
+                        invalidateVisionOsVisitorData()
+                        directAudioFastPath.markFailedOrRejected(Clock.System.now().toEpochMilliseconds())
+                        return DirectAudioOutcome.Failure(
+                            "head_http_${probe.httpCode}",
+                            Clock.System.now().toEpochMilliseconds() - startMs,
+                        )
+                    }
+                    is StreamProbeResult.TransportError -> {
+                        Logger.d(
+                            TAG,
+                            "VISIONOS HEAD probe errored (${probe.reason}) for $videoId; allowing unverified stream",
+                        )
+                        "head=timeout_pass(${probe.reason})"
+                    }
+                    StreamProbeResult.Cancelled -> {
+                        return DirectAudioOutcome.Failure(
+                            "cancelled",
+                            Clock.System.now().toEpochMilliseconds() - startMs,
+                        )
+                    }
+                }
             }
         return DirectAudioOutcome.Success(
             response = parsed,
@@ -2615,10 +2655,23 @@ class YouTube {
                             .takeIf { res -> res.playabilityStatus.status == "OK" && firstDirectAudioUrl(res) != null }
                             ?.takeIf { res ->
                                 val sample = firstDirectAudioUrl(res) ?: return@takeIf false
-                                ytMusic.isStreamUrlReachable(sample).also { ok ->
-                                    if (!ok) {
-                                        Logger.w(TAG, "WEB_REMIX direct URL failed HEAD check for $videoId; trying alternate clients")
+                                when (val probe = ytMusic.probeStreamUrl(sample)) {
+                                    StreamProbeResult.Reachable -> true
+                                    is StreamProbeResult.TransportError -> {
+                                        Logger.d(
+                                            TAG,
+                                            "WEB_REMIX direct HEAD probe errored (${probe.reason}) for $videoId; allowing stream",
+                                        )
+                                        true
                                     }
+                                    is StreamProbeResult.Rejected -> {
+                                        Logger.w(
+                                            TAG,
+                                            "WEB_REMIX direct URL rejected (HTTP ${probe.httpCode}) for $videoId; trying alternate clients",
+                                        )
+                                        false
+                                    }
+                                    StreamProbeResult.Cancelled -> false
                                 }
                             }
                     } else {
@@ -2642,8 +2695,16 @@ class YouTube {
                                 add(ANDROID to true)
                             }
                         }
+                    val fallbackStartedMs = Clock.System.now().toEpochMilliseconds()
+                    var consecutiveTransportErrors = 0
                     for ((client, withLogin) in fallbackClients) {
+                        if (Clock.System.now().toEpochMilliseconds() - fallbackStartedMs >= DIRECT_FALLBACK_BUDGET_MS) {
+                            Logger.w(TAG, "Direct fallback budget (${DIRECT_FALLBACK_BUDGET_MS}ms) exhausted for $videoId")
+                            break
+                        }
                         altClientTried = true
+                        var transportFailure = false
+                        var offlineFailure = false
                         val candidate =
                             try {
                                 fetchPlayerResponse(
@@ -2658,15 +2719,44 @@ class YouTube {
                                 throw e
                             } catch (e: Exception) {
                                 Logger.w(TAG, "${client.clientName} direct fallback request failed for $videoId (${e.message})")
+                                offlineFailure = DirectAudioFastPathState.isOfflineNetworkError(e)
+                                transportFailure = DirectAudioFastPathState.isTransientNetworkError(e)
                                 null
                             }
-                        if (candidate != null) {
+                        if (offlineFailure) {
+                            Logger.d(TAG, "Stopping direct fallback loop for $videoId while offline")
+                            break
+                        }
+                        if (candidate == null && transportFailure) {
+                            consecutiveTransportErrors++
+                            if (consecutiveTransportErrors >= 2) {
+                                Logger.w(
+                                    TAG,
+                                    "Stopping direct fallback loop for $videoId after $consecutiveTransportErrors transport timeouts",
+                                )
+                                break
+                            }
+                        } else if (candidate != null) {
+                            consecutiveTransportErrors = 0
                             altRes = candidate
                             if (candidate.playabilityStatus.status == "OK") {
                                 val sample = firstDirectAudioUrl(candidate)
-                                if (sample != null && ytMusic.isStreamUrlReachable(sample)) {
-                                    response = candidate.copy(playbackTracking = tempRes.playbackTracking)
-                                    break
+                                if (sample != null) {
+                                    when (val probe = ytMusic.probeStreamUrl(sample)) {
+                                        StreamProbeResult.Reachable,
+                                        is StreamProbeResult.TransportError,
+                                        -> {
+                                            response = candidate.copy(playbackTracking = tempRes.playbackTracking)
+                                            break
+                                        }
+                                        is StreamProbeResult.Rejected -> {
+                                            Logger.w(
+                                                TAG,
+                                                "${client.clientName} direct URL unusable (HTTP ${probe.httpCode}) for $videoId",
+                                            )
+                                        }
+                                        StreamProbeResult.Cancelled -> break
+                                    }
                                 } else {
                                     Logger.w(TAG, "${client.clientName} direct URL unusable for $videoId")
                                 }

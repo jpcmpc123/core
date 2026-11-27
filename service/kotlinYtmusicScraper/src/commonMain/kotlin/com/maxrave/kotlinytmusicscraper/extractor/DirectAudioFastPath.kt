@@ -33,6 +33,7 @@ import kotlinx.serialization.json.longOrNull
 internal class DirectAudioFastPathState(
     private val trustWindowMs: Long = DEFAULT_TRUST_WINDOW_MS,
     private val cooldownMs: Long = DEFAULT_COOLDOWN_MS,
+    private val transportCooldownMs: Long = DEFAULT_TRANSPORT_COOLDOWN_MS,
     private val maxServedTracks: Int = MAX_SERVED_TRACKS,
 ) {
     private data class Snapshot(
@@ -81,10 +82,20 @@ internal class DirectAudioFastPathState(
         }
     }
 
+    fun markFailedOrRejected(nowMs: Long) {
+        state.update { current ->
+            current.copy(
+                trustedUntilMs = 0L,
+                cooldownUntilMs = nowMs + cooldownMs,
+                consecutiveTransportFailures = 0,
+            )
+        }
+    }
+
     /**
-     * Records a transient transport/network failure (e.g. mobile 4G timeout). Enters global
-     * cooldown only after [consecutiveThreshold] consecutive failures so a single network blip
-     * does not disable `VISIONOS` for 15 minutes.
+     * Records a transient transport/network failure (e.g. mobile 4G timeout). Enters a short
+     * [transportCooldownMs] cooldown only after [consecutiveThreshold] consecutive failures so
+     * momentary mobile data congestion does not disable `VISIONOS` for 15 minutes.
      */
     fun recordTransportFailure(
         nowMs: Long,
@@ -97,7 +108,7 @@ internal class DirectAudioFastPathState(
                 enteredCooldown = true
                 current.copy(
                     trustedUntilMs = 0L,
-                    cooldownUntilMs = nowMs + cooldownMs,
+                    cooldownUntilMs = nowMs + transportCooldownMs,
                     consecutiveTransportFailures = 0,
                 )
             } else {
@@ -105,16 +116,6 @@ internal class DirectAudioFastPathState(
             }
         }
         return enteredCooldown
-    }
-
-    fun markFailedOrRejected(nowMs: Long) {
-        state.update { current ->
-            current.copy(
-                trustedUntilMs = 0L,
-                cooldownUntilMs = nowMs + cooldownMs,
-                consecutiveTransportFailures = 0,
-            )
-        }
     }
 
     /**
@@ -150,7 +151,8 @@ internal class DirectAudioFastPathState(
     companion object {
         const val DEFAULT_TRUST_WINDOW_MS = 5 * 60 * 1000L
         const val DEFAULT_COOLDOWN_MS = 15 * 60 * 1000L
-        const val DEFAULT_TRANSPORT_FAILURE_THRESHOLD = 2
+        const val DEFAULT_TRANSPORT_COOLDOWN_MS = 3 * 60 * 1000L
+        const val DEFAULT_TRANSPORT_FAILURE_THRESHOLD = 3
         const val MAX_SERVED_TRACKS = 32
 
         private val PER_TRACK_REFUSAL_STATUSES =
@@ -190,6 +192,44 @@ internal class DirectAudioFastPathState(
                     msg.contains("No address associated with hostname", ignoreCase = true) ||
                     msg.contains("Network is unreachable", ignoreCase = true) ||
                     msg.contains("ENETUNREACH", ignoreCase = true)
+                ) {
+                    return true
+                }
+                current = current.cause
+                depth++
+            }
+            return false
+        }
+
+        /**
+         * Returns true when [error] (or any cause in its chain) reflects a transient transport/4G
+         * timeout or socket drop rather than an HTTP rejection (`403`/`404`) or broken cipher table.
+         */
+        fun isTransientNetworkError(error: Throwable?): Boolean {
+            if (error == null) return false
+            if (isOfflineNetworkError(error)) return true
+            var current = error
+            var depth = 0
+            while (current != null && depth < 8) {
+                val className = current::class.simpleName.orEmpty()
+                if (className == "SocketTimeoutException" ||
+                    className == "ConnectException" ||
+                    className == "SocketException" ||
+                    className == "InterruptedIOException" ||
+                    className == "SSLException" ||
+                    className == "EOFException" ||
+                    className == "HttpRequestTimeoutException" ||
+                    className == "ConnectTimeoutException"
+                ) {
+                    return true
+                }
+                val msg = current.message.orEmpty()
+                if (msg.contains("timeout", ignoreCase = true) ||
+                    msg.contains("timed out", ignoreCase = true) ||
+                    msg.contains("failed to connect", ignoreCase = true) ||
+                    msg.contains("connection reset", ignoreCase = true) ||
+                    msg.contains("broken pipe", ignoreCase = true) ||
+                    msg.contains("software caused connection abort", ignoreCase = true)
                 ) {
                     return true
                 }
@@ -413,7 +453,10 @@ internal object DirectAudioFastPathParser {
             if (filteredAdaptive.isEmpty()) return null
             val mergedConfig =
                 baseResponse.playerConfig
-                    ?: directResponse.loudnessDb?.let { loudness ->
+                    ?: com.maxrave.kotlinytmusicscraper.models.normalizeLoudnessDbToYtMusicScale(
+                        com.maxrave.kotlinytmusicscraper.models.YouTubeClient.VISIONOS,
+                        directResponse.loudnessDb,
+                    )?.let { loudness ->
                         PlayerResponse.PlayerConfig(
                             audioConfig =
                                 PlayerResponse.PlayerConfig.AudioConfig(
@@ -538,7 +581,10 @@ internal object DirectAudioFastPathParser {
                 ?: return null
 
         val playerConfig =
-            directResponse.loudnessDb?.let { loudness ->
+            com.maxrave.kotlinytmusicscraper.models.normalizeLoudnessDbToYtMusicScale(
+                com.maxrave.kotlinytmusicscraper.models.YouTubeClient.VISIONOS,
+                directResponse.loudnessDb,
+            )?.let { loudness ->
                 PlayerResponse.PlayerConfig(
                     audioConfig =
                         PlayerResponse.PlayerConfig.AudioConfig(

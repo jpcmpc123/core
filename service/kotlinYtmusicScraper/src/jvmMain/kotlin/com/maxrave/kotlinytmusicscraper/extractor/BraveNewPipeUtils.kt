@@ -22,14 +22,14 @@ internal fun List<Pair<Int, String>>.hasRequiredItags(): Boolean {
 private val jvmHealthCheckClient: okhttp3.OkHttpClient by lazy {
     extractorHttpClient(null)
         .newBuilder()
-        .connectTimeout(2500, TimeUnit.MILLISECONDS)
-        .readTimeout(2500, TimeUnit.MILLISECONDS)
-        .callTimeout(3000, TimeUnit.MILLISECONDS)
+        .connectTimeout(3500, TimeUnit.MILLISECONDS)
+        .readTimeout(3500, TimeUnit.MILLISECONDS)
+        .callTimeout(4500, TimeUnit.MILLISECONDS)
         .build()
 }
 
-internal fun isStreamUrlReachable(url: String): Boolean =
-    runCatching {
+internal fun probeStreamUrl(url: String): StreamProbeResult =
+    try {
         val request =
             okhttp3.Request
                 .Builder()
@@ -37,9 +37,22 @@ internal fun isStreamUrlReachable(url: String): Boolean =
                 .url(url)
                 .build()
         jvmHealthCheckClient.newCall(request).execute().use { response ->
-            response.code in 200..299
+            if (response.code in 200..299) {
+                StreamProbeResult.Reachable
+            } else {
+                StreamProbeResult.Rejected(response.code)
+            }
         }
-    }.getOrDefault(false)
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        StreamProbeResult.TransportError(
+            reason = e::class.simpleName ?: "IOException",
+            isOffline = DirectAudioFastPathState.isOfflineNetworkError(e),
+        )
+    }
+
+internal fun isStreamUrlReachable(url: String): Boolean = probeStreamUrl(url) is StreamProbeResult.Reachable
 
 internal fun List<Pair<Int, String>>.hasAudioItag(): Boolean = any { it.first in ITAG.AUDIO_PLAYABLE }
 
