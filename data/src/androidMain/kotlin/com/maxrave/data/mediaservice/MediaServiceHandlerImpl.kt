@@ -875,7 +875,7 @@ internal class MediaServiceHandlerImpl(
                 launch {
                     format.collectLatest { formatTemp ->
                         if (dataStoreManager.sendBackToGoogle.first() == TRUE) {
-                            if (formatTemp != null) {
+                            if (formatTemp != null && formatTemp.expiredTime >= now()) {
                                 println("format in viewModel: $formatTemp")
                                 Logger.d(TAG, "Collect format ${formatTemp.videoId}")
                                 Logger.w(TAG, "Format expire at ${formatTemp.expiredTime}")
@@ -1408,6 +1408,24 @@ internal class MediaServiceHandlerImpl(
                         val pos = player.currentPosition
                         if (pos > lastObservedPlayPositionMs) {
                             lastObservedPlayPositionMs = pos
+                        }
+                        val timingVideoId = playTimingVideoId
+                        val durMs = player.duration
+                        val activeBaseId = player.currentMediaItem?.mediaId?.removePrefix(MERGING_DATA_TYPE.VIDEO)
+                        if (timingVideoId != null &&
+                            activeBaseId == timingVideoId &&
+                            durMs > 0L &&
+                            pos > 0L
+                        ) {
+                            val elapsed = SystemClock.elapsedRealtime() - playTimingStartMs
+                            if (!playTimingReadyLogged) {
+                                playTimingReadyLogged = true
+                                Logger.i("PlayTiming", "id=$timingVideoId ready=${elapsed}ms")
+                            }
+                            if (player.isPlaying) {
+                                Logger.i("PlayTiming", "id=$timingVideoId playing=${elapsed}ms")
+                                playTimingVideoId = null
+                            }
                         }
                         _simpleMediaState.value = SimpleMediaState.Progress(pos)
                     }
@@ -3213,7 +3231,7 @@ internal class MediaServiceHandlerImpl(
                     if (curEntity != null && curEntity.durationSeconds == 0 && durSec > 0) {
                         _nowPlayingState.update { it.copy(songEntity = curEntity.copy(durationSeconds = durSec)) }
                     }
-                    if (durSec > 0) {
+                    if (durSec > 0 && !isLocalDeviceAudioId(activeBaseId)) {
                         coroutineScope.launch { lastfmScrobbler.updateDurationSeconds(durSec) }
                     }
                 }

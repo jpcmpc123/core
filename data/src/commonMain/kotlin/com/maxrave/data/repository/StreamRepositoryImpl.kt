@@ -365,7 +365,12 @@ internal class StreamRepositoryImpl(
                 Logger.d("Stream", "isExpired: ${oldFormat.expiredTime.isBefore(now())}")
                 if (oldFormat.expiredTime.isBefore(now())) {
                     youTube
-                        .player(videoId)
+                        .player(
+                            videoId = videoId,
+                            preferredAudioLanguage = cachedPreferredAudioLanguage,
+                            isVideo = false,
+                            expectedDurationSec = oldFormat.lengthSeconds,
+                        )
                         .onSuccess { triple ->
                             val response = triple.second
                             val isLive = response.videoDetails?.isLive == true
