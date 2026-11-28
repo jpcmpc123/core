@@ -32,12 +32,20 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.ExtractorsFactory
+import androidx.media3.extractor.amr.AmrExtractor
 import androidx.media3.extractor.flac.FlacExtractor
 import androidx.media3.extractor.mkv.MatroskaExtractor
+import androidx.media3.extractor.mp3.Mp3Extractor
 import androidx.media3.extractor.mp4.FragmentedMp4Extractor
 import androidx.media3.extractor.mp4.Mp4Extractor
+import androidx.media3.extractor.ogg.OggExtractor
 import androidx.media3.extractor.text.DefaultSubtitleParserFactory
+import androidx.media3.extractor.ts.Ac3Extractor
+import androidx.media3.extractor.ts.Ac4Extractor
+import androidx.media3.extractor.ts.AdtsExtractor
+import androidx.media3.extractor.wav.WavExtractor
 import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import com.maxrave.common.Config.CANVAS_CACHE
 import com.maxrave.common.Config.DOWNLOAD_CACHE
@@ -472,6 +480,40 @@ private fun provideExtractorFactory(): ExtractorsFactory =
         )
     }
 
+/**
+ * Full-format extractors for local device audio (`MP3`, `FLAC`, `WAV`, `M4A`, `AAC`, `OGG`,
+ * `Opus`, `WebM`, `AMR`, etc.). Kept separate from [provideExtractorFactory] so online YouTube
+ * streams keep their minimal extractor set while offline device files never hit
+ * `ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED` (3003).
+ */
+@UnstableApi
+internal fun provideLocalDeviceExtractorFactory(): ExtractorsFactory =
+    ExtractorsFactory {
+        val subtitleParserFactory = DefaultSubtitleParserFactory()
+        arrayOf(
+            Mp3Extractor(
+                Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING or
+                    Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS,
+            ),
+            Mp4Extractor(subtitleParserFactory),
+            FragmentedMp4Extractor(subtitleParserFactory),
+            FlacExtractor(),
+            OggExtractor(),
+            WavExtractor(),
+            MatroskaExtractor(subtitleParserFactory),
+            AdtsExtractor(
+                AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING or
+                    AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS,
+            ),
+            AmrExtractor(
+                AmrExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING or
+                    AmrExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS,
+            ),
+            Ac3Extractor(),
+            Ac4Extractor(),
+        )
+    }
+
 private inline fun <T> runCancellableStreamResolve(
     coordinator: StreamResolveCoordinator,
     key: String,
@@ -602,9 +644,9 @@ private fun provideMergingMediaSource(
             dataStoreManager,
             streamResolveCoordinator,
         ),
-        DefaultMediaSourceFactory(
-            androidx.media3.datasource.DefaultDataSource.Factory(context),
-            provideExtractorFactory(),
+        ProgressiveMediaSource.Factory(
+            DefaultDataSource.Factory(context),
+            provideLocalDeviceExtractorFactory(),
         ),
         dataStoreManager,
         context,

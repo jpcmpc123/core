@@ -1142,9 +1142,11 @@ internal class CrossfadeExoPlayerAdapter(
                                     return@launch
                                 }
                                 try {
-                                    streamRepository.onStreamRejected(errorVideoId)
-                                    streamRepository.invalidateFormat(errorVideoId)
-                                    streamRepository.invalidateFormat("${com.maxrave.common.MERGING_DATA_TYPE.VIDEO}$errorVideoId")
+                                    if (!com.maxrave.common.isLocalDeviceAudioId(errorVideoId)) {
+                                        streamRepository.onStreamRejected(errorVideoId)
+                                        streamRepository.invalidateFormat(errorVideoId)
+                                        streamRepository.invalidateFormat("${com.maxrave.common.MERGING_DATA_TYPE.VIDEO}$errorVideoId")
+                                    }
                                     precachedPlayers.remove(errorVideoId)?.let { cleanupPrecachedEntryInternal(it) }
                                     val freshIdx =
                                         if (playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId == errorVideoId) {
@@ -2158,7 +2160,8 @@ internal class CrossfadeExoPlayerAdapter(
                 message = error.message,
                 recoverable = !unrecoverable,
             )
-        Logger.e(TAG, "Playback error: ${error.message}")
+        val causeDetail = error.cause?.let { " | cause=${it::class.simpleName}: ${it.message}" }.orEmpty()
+        Logger.e(TAG, "Playback error [${error.errorCodeName}/${error.errorCode}]: ${error.message}$causeDetail")
         // Transition BEFORE notifying listeners so an onPlayerError handler (e.g. pause()) sees ERROR
         // and cannot overwrite internalPlayWhenReady = false for subsequent track skips.
         // notifyError = false avoids emitting a second synthetic 403 alongside the real error.
@@ -2630,7 +2633,7 @@ internal class CrossfadeExoPlayerAdapter(
                                 "as a fully cached bare media id. Retrying to resolve a real URL.",
                         )
                     }
-                    if (isRetryableSourceError && currentVideoId != null) {
+                    if (isRetryableSourceError && currentVideoId != null && !com.maxrave.common.isLocalDeviceAudioId(currentVideoId)) {
                         // Reset retry count if this is a different track
                         if (retryVideoId != currentVideoId) {
                             retryVideoId = currentVideoId
@@ -3657,7 +3660,7 @@ internal class CrossfadeExoPlayerAdapter(
      * Called before AutoMix calculations to ensure metadata is available.
      */
     private suspend fun loadAudioMetaIfNeeded(videoId: String) {
-        if (videoId.isBlank() || audioMetaCache.containsKey(videoId)) return
+        if (videoId.isBlank() || com.maxrave.common.isLocalDeviceAudioId(videoId) || audioMetaCache.containsKey(videoId)) return
         try {
             val format = streamRepository.getNewFormat(videoId).firstOrNull()
             if (format == null) {
@@ -4522,6 +4525,7 @@ internal class CrossfadeExoPlayerAdapter(
             private var attempts = 0
 
             override fun onPlayerError(error: PlaybackException) {
+                if (com.maxrave.common.isLocalDeviceAudioId(videoId)) return
                 if (error.isUnrecoverableStreamFailure() || !error.isRetryableSourceError() || attempts >= maxRetryCount) return
                 if (precachedPlayers[videoId]?.player !== player) return
                 if (!isNetworkConnected()) {
