@@ -61,7 +61,12 @@ internal class TrackCachePreloader(
         activeMediaId = mediaId
         watchdogJob?.cancel()
         watchdogJob = null
-        if (mediaId.isBlank() || LiveStreamRegistry.isLive(mediaId)) return
+        if (mediaId.isBlank() ||
+            LiveStreamRegistry.isLive(mediaId) ||
+            com.maxrave.common.isLocalDeviceAudioId(mediaId)
+        ) {
+            return
+        }
         watchdogJob =
             coroutineScope.launch {
                 // Grace period first: most skips happen in the first seconds of a track, and a
@@ -74,7 +79,11 @@ internal class TrackCachePreloader(
                 cacheWithWatchdog(mediaId)
                 // Only once the current track is fully local: prefetch the next one, so it is
                 // already on the device when its turn comes.
-                if (nextMediaId != null && nextMediaId != mediaId && !LiveStreamRegistry.isLive(nextMediaId)) {
+                if (nextMediaId != null &&
+                    nextMediaId != mediaId &&
+                    !LiveStreamRegistry.isLive(nextMediaId) &&
+                    !com.maxrave.common.isLocalDeviceAudioId(nextMediaId)
+                ) {
                     cacheWithWatchdog(nextMediaId)
                 }
             }

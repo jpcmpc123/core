@@ -12,6 +12,8 @@ import androidx.media3.session.CommandButton
 import androidx.media3.session.SessionCommand
 import com.maxrave.common.MEDIA_CUSTOM_COMMAND
 import com.maxrave.common.MERGING_DATA_TYPE
+import com.maxrave.common.isLocalDeviceAudioId
+import com.maxrave.common.localDeviceAudioContentUriString
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.player.GenericCommandButton
@@ -49,12 +51,13 @@ fun MediaItem?.toSongEntity(): SongEntity? =
 @JvmName("MediaItemtoSongEntity")
 @UnstableApi
 fun SongEntity.toMediaItem(): MediaItem {
-    val isSong = (this.thumbnails?.contains("w544") == true && this.thumbnails?.contains("h544") == true)
+    val isLocalDevice = isLocalDeviceAudioId(this.videoId)
+    val isSong = isLocalDevice || (this.thumbnails?.contains("w544") == true && this.thumbnails?.contains("h544") == true)
     return MediaItem
         .Builder()
         .setMediaId(this.videoId)
-        .setUri(this.videoId)
-        .setCustomCacheKey(this.videoId)
+        .setUri(if (isLocalDevice) localDeviceAudioContentUriString(this.videoId) ?: this.videoId else this.videoId)
+        .setCustomCacheKey(if (isLocalDevice) null else this.videoId)
         .setMediaMetadata(
             MediaMetadata
                 .Builder()
@@ -71,13 +74,30 @@ fun SongEntity.toMediaItem(): MediaItem {
 @JvmName("TracktoMediaItem")
 @UnstableApi
 fun Track.toMediaItem(): MediaItem {
+    val isLocalDevice = isLocalDeviceAudioId(this.videoId)
+    if (isLocalDevice) {
+        return MediaItem
+            .Builder()
+            .setMediaId(this.videoId)
+            .setUri(localDeviceAudioContentUriString(this.videoId) ?: this.videoId)
+            .setCustomCacheKey(null)
+            .setMediaMetadata(
+                MediaMetadata
+                    .Builder()
+                    .setTitle(this.title)
+                    .setArtist(this.artists.toListName().connectArtists())
+                    .setArtworkUri(this.thumbnails?.lastOrNull()?.url?.toUri())
+                    .setAlbumTitle(this.album?.name)
+                    .setDescription(MERGING_DATA_TYPE.SONG)
+                    .build(),
+            ).build()
+    }
     var thumbUrl =
         this.thumbnails?.last()?.url
             ?: "http://i.ytimg.com/vi/${this.videoId}/maxresdefault.jpg"
     if (thumbUrl.contains("w120")) {
         thumbUrl = Regex("([wh])120").replace(thumbUrl, "$1544")
     }
-    val artistName: String = this.artists.toListName().connectArtists()
     val isSong =
         (
             this.thumbnails?.last()?.height != 0 &&

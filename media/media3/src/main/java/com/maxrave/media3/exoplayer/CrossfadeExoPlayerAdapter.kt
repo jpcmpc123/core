@@ -1032,7 +1032,10 @@ internal class CrossfadeExoPlayerAdapter(
                             pausedAtMs > 0L &&
                             System.currentTimeMillis() - pausedAtMs > LONG_PAUSE_RESUME_MS
                         ) {
-                            playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId
+                            playlist
+                                .getOrNull(localCurrentMediaItemIndex)
+                                ?.mediaId
+                                ?.takeUnless { com.maxrave.common.isLocalDeviceAudioId(it) }
                         } else {
                             null
                         }

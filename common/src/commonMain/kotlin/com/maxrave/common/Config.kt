@@ -719,8 +719,22 @@ object MERGING_DATA_TYPE {
     const val VIDEO = "Video"
 }
 
+const val LOCAL_DEVICE_AUDIO_PREFIX = "local_device_audio:"
+const val LOCAL_DEVICE_PLAYLIST_ID = "LOCAL_DEVICE_AUDIO_QUEUE"
+
+fun localDeviceAudioId(mediaStoreId: Long): String = "$LOCAL_DEVICE_AUDIO_PREFIX$mediaStoreId"
+
+fun isLocalDeviceAudioId(id: String?): Boolean = id != null && id.startsWith(LOCAL_DEVICE_AUDIO_PREFIX)
+
+fun localDeviceAudioMediaStoreId(id: String?): Long? =
+    if (isLocalDeviceAudioId(id)) id!!.removePrefix(LOCAL_DEVICE_AUDIO_PREFIX).toLongOrNull() else null
+
+fun localDeviceAudioContentUriString(id: String?): String? =
+    localDeviceAudioMediaStoreId(id)?.let { "content://media/external/audio/media/$it" }
+
 enum class LibraryChipType {
     YOUR_LIBRARY,
+    DEVICE_AUDIO,
     WRAPPED,
     CHART,
     YOUTUBE_MUSIC_PLAYLIST,
@@ -734,6 +748,7 @@ enum class LibraryChipType {
     fun toStringValue(): String =
         when (this) {
             YOUR_LIBRARY -> "your_library"
+            DEVICE_AUDIO -> "device_audio"
             YOUTUBE_MUSIC_PLAYLIST -> "youtube_music_playlist"
             YOUTUBE_MIX_FOR_YOU -> "youtube_mix_for_you"
             LOCAL_PLAYLIST -> "local_playlist"
@@ -748,6 +763,7 @@ enum class LibraryChipType {
         fun fromStringValue(value: String): LibraryChipType? =
             when (value) {
                 "your_library" -> YOUR_LIBRARY
+                "device_audio" -> DEVICE_AUDIO
                 "youtube_music_playlist" -> YOUTUBE_MUSIC_PLAYLIST
                 "youtube_mix_for_you" -> YOUTUBE_MIX_FOR_YOU
                 "local_playlist" -> LOCAL_PLAYLIST

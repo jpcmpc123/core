@@ -602,6 +602,10 @@ private fun provideMergingMediaSource(
             dataStoreManager,
             streamResolveCoordinator,
         ),
+        DefaultMediaSourceFactory(
+            androidx.media3.datasource.DefaultDataSource.Factory(context),
+            provideExtractorFactory(),
+        ),
         dataStoreManager,
         context,
         downloadCache,

@@ -21,6 +21,7 @@ import com.maxrave.common.Config.SHARE
 import com.maxrave.common.Config.SONG_CLICK
 import com.maxrave.common.Config.VIDEO_CLICK
 import com.maxrave.common.DESC
+import com.maxrave.common.LOCAL_DEVICE_PLAYLIST_ID
 import com.maxrave.common.LOCAL_PLAYLIST_ID
 import com.maxrave.common.LOCAL_PLAYLIST_ID_SAVED_QUEUE
 import com.maxrave.common.MERGING_DATA_TYPE
@@ -28,6 +29,7 @@ import com.maxrave.common.SPONSOR_BLOCK_MIN_SEGMENT_SECONDS
 import com.maxrave.common.SPONSOR_BLOCK_SKIP_MARGIN_MS
 import com.maxrave.common.SponsorBlockType
 import com.maxrave.common.TITLE
+import com.maxrave.common.isLocalDeviceAudioId
 import com.maxrave.data.db.Converters
 import com.maxrave.data.lastfm.LastfmScrobbler
 import com.maxrave.domain.data.entities.NewFormatEntity
@@ -1005,7 +1007,28 @@ internal class MediaServiceHandlerImpl(
         }
         _format.value = null
         _skipSegments.value = null
+        getSkipSegmentsJob?.cancel()
+        getFormatJob?.cancel()
         getDataOfNowPlayingTrackStateJob?.cancel()
+        if (isLocalDeviceAudioId(videoId)) {
+            val localThumb =
+                track?.thumbnails?.lastOrNull()?.url
+                    ?: mediaItem.metadata.artworkUri
+            val localSongEntity =
+                (track?.toSongEntity() ?: mediaItem.toSongEntity()).copy(
+                    thumbnails = localThumb,
+                    liked = false,
+                )
+            _controlState.update { it.copy(isLiked = false) }
+            _nowPlayingState.update {
+                it.copy(
+                    mediaItem = mediaItem,
+                    track = track,
+                    songEntity = localSongEntity,
+                )
+            }
+            return
+        }
         getDataOfNowPlayingTrackStateJob =
             coroutineScope.launch {
                 Logger.w(TAG, "getDataOfNowPlayingState: $videoId")
@@ -1649,6 +1672,7 @@ internal class MediaServiceHandlerImpl(
                 if (id.contains("Video")) {
                     id = id.removePrefix("Video")
                 }
+                if (isLocalDeviceAudioId(id)) return@launch
                 songRepository.updateLikeStatus(
                     id,
                     if (!(controlState.first().isLiked)) 1 else 0,
@@ -2467,6 +2491,11 @@ internal class MediaServiceHandlerImpl(
                 val track = list[i]
                 val globalIndex = chunkIdx * 100 + i
                 if (index != null && globalIndex == index) continue
+                if (isLocalDeviceAudioId(track.videoId)) {
+                    addMediaItemNotSet(track.toGenericMediaItem())
+                    catalogMetadata.add(track)
+                    continue
+                }
                 var thumbUrl =
                     track.thumbnails?.lastOrNull()?.url
                         ?: "http://i.ytimg.com/vi/${track.videoId}/maxresdefault.jpg"
@@ -2801,20 +2830,25 @@ internal class MediaServiceHandlerImpl(
         playTimingStartMs = SystemClock.elapsedRealtime()
         playTimingVideoId = track.videoId
         playTimingReadyLogged = false
-        pendingInsertSongJob =
-            track.videoId to
-            coroutineScope.launch(Dispatchers.IO) {
-                songRepository.insertSong(track.toSongEntity()).singleOrNull()?.let {
-                    Logger.d(TAG, "Inserted song: ${track.title}")
+        val isLocalDevice = isLocalDeviceAudioId(track.videoId)
+        if (!isLocalDevice) {
+            pendingInsertSongJob =
+                track.videoId to
+                coroutineScope.launch(Dispatchers.IO) {
+                    songRepository.insertSong(track.toSongEntity()).singleOrNull()?.let {
+                        Logger.d(TAG, "Inserted song: ${track.title}")
+                    }
+                    track.durationSeconds?.let {
+                        songRepository.updateDurationSeconds(it, track.videoId)
+                    }
                 }
-                track.durationSeconds?.let {
-                    songRepository.updateDurationSeconds(it, track.videoId)
-                }
-            }
+        }
         addMediaItem(track.toGenericMediaItem(), playWhenReady = type != RECOVER_TRACK_QUEUE)
         when (type) {
             SONG_CLICK, VIDEO_CLICK, SHARE -> {
-                getRelated(track.videoId)
+                if (!isLocalDevice) {
+                    getRelated(track.videoId)
+                }
             }
 
             PLAYLIST_CLICK, ALBUM_CLICK, RADIO_CLICK -> {
@@ -2835,7 +2869,11 @@ internal class MediaServiceHandlerImpl(
                 // the end, so saving in that window persists a queue missing the current
                 // track (plus a blank media id), which desyncs the next restore.
                 val videoId = nowPlayingState.value.songEntity?.videoId
-                if (videoId != null && queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZED) {
+                if (videoId != null &&
+                    !isLocalDeviceAudioId(videoId) &&
+                    queueData.value.data.playlistId != LOCAL_DEVICE_PLAYLIST_ID &&
+                    queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZED
+                ) {
                     dataStoreManager.saveRecentSong(
                         videoId,
                         player.contentPosition,
@@ -2883,6 +2921,7 @@ internal class MediaServiceHandlerImpl(
     private fun mayBeSaveRecentPosition() {
         coroutineScope.launch {
             val videoId = nowPlayingState.value.songEntity?.videoId ?: return@launch
+            if (isLocalDeviceAudioId(videoId)) return@launch
             dataStoreManager.saveRecentSong(videoId, player.contentPosition)
         }
     }
@@ -2892,6 +2931,15 @@ internal class MediaServiceHandlerImpl(
     }
 
     override fun mayBeNormalizeVolume() {
+        val activeMediaId = player.currentMediaItem?.mediaId
+        if (isLocalDeviceAudioId(activeMediaId)) {
+            volumeNormalizationJob?.cancel()
+            volumeNormalizationJob = null
+            if (!_castState.value.isRemote) {
+                player.setTrackNormalizationGainDb(0f)
+            }
+            return
+        }
         if (!normalizeVolume) {
             volumeNormalizationJob?.cancel()
             volumeNormalizationJob = null
@@ -3280,7 +3328,11 @@ internal class MediaServiceHandlerImpl(
                 (currentState as? SimpleMediaState.Progress)?.progress ?: 0L,
             )
         lastObservedPlayPositionMs = 0L
-        if (trackedProgressMs > 0L && lastPlayed != null && lastPlayed.durationSeconds > 0) {
+        if (trackedProgressMs > 0L &&
+            lastPlayed != null &&
+            lastPlayed.durationSeconds > 0 &&
+            !isLocalDeviceAudioId(lastPlayed.videoId)
+        ) {
             mayBeTrackingListeningLocal(lastPlayed, trackedProgressMs)
         }
         Logger.w(TAG, "Smooth Switching Transition Current Position: ${player.currentPosition}")
@@ -3303,7 +3355,7 @@ internal class MediaServiceHandlerImpl(
                         .initial()
                 }
             }
-        } else if (mediaItem != null) {
+        } else if (mediaItem != null && !isLocalDeviceAudioId(mediaItem.mediaId)) {
             // Repeat-one replays the same mediaId without reloading now-playing data: reset
             // Last.fm scrobble state so the replay scrobbles again, and refresh Discord RPC.
             nowPlayingState.value.songEntity?.let { song ->
@@ -3314,14 +3366,17 @@ internal class MediaServiceHandlerImpl(
                 }
             }
         }
-        queueData.value.data.listTracks.let { list ->
-            if ((list.size > 3 || endlessQueueEnabled || queueData.value.data.continuation != null) &&
-                list.size - player.currentMediaItemIndex < 3 &&
-                list.size - player.currentMediaItemIndex >= 0 &&
-                queueData.value.queueState == QueueData.StateSource.STATE_INITIALIZED
-            ) {
-                Logger.d("Check loadMore", "loadMore")
-                loadMore()
+        val currentQueue = queueData.value
+        if (currentQueue.data.playlistId != LOCAL_DEVICE_PLAYLIST_ID && !isLocalDeviceAudioId(nextBaseId)) {
+            currentQueue.data.listTracks.let { list ->
+                if ((list.size > 3 || endlessQueueEnabled || currentQueue.data.continuation != null) &&
+                    list.size - player.currentMediaItemIndex < 3 &&
+                    list.size - player.currentMediaItemIndex >= 0 &&
+                    currentQueue.queueState == QueueData.StateSource.STATE_INITIALIZED
+                ) {
+                    Logger.d("Check loadMore", "loadMore")
+                    loadMore()
+                }
             }
         }
         updateNextPreviousTrackAvailability()
@@ -3494,6 +3549,7 @@ internal class MediaServiceHandlerImpl(
 
     private fun tryScheduleStreamRecovery(): Boolean {
         val mediaItem = player.currentMediaItem ?: return false
+        if (isLocalDeviceAudioId(mediaItem.mediaId)) return false
         if (streamRecoveryMediaId != mediaItem.mediaId) {
             streamRecoveryMediaId = mediaItem.mediaId
             streamRecoveryAttempts = 0

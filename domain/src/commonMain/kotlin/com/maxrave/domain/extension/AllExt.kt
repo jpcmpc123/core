@@ -1,6 +1,8 @@
 package com.maxrave.domain.extension
 
 import com.maxrave.common.MERGING_DATA_TYPE
+import com.maxrave.common.isLocalDeviceAudioId
+import com.maxrave.common.localDeviceAudioContentUriString
 import com.maxrave.domain.data.entities.SongEntity
 import com.maxrave.domain.data.model.browse.album.Track
 import com.maxrave.domain.data.model.cookie.CookieItem
@@ -69,10 +71,11 @@ fun GenericMediaItem.toSongEntity(): SongEntity =
     )
 
 fun SongEntity.toGenericMediaItem(): GenericMediaItem {
-    val isSong = (this.thumbnails?.contains("w544") == true && this.thumbnails.contains("h544"))
+    val isLocalDevice = isLocalDeviceAudioId(this.videoId)
+    val isSong = isLocalDevice || (this.thumbnails?.contains("w544") == true && this.thumbnails.contains("h544"))
     return GenericMediaItem(
         mediaId = this.videoId,
-        uri = this.videoId,
+        uri = if (isLocalDevice) localDeviceAudioContentUriString(this.videoId) ?: this.videoId else this.videoId,
         metadata =
             GenericMediaMetadata(
                 title = this.title,
@@ -81,18 +84,34 @@ fun SongEntity.toGenericMediaItem(): GenericMediaItem {
                 artworkUri = this.thumbnails,
                 description = if (isSong) MERGING_DATA_TYPE.SONG else MERGING_DATA_TYPE.VIDEO,
             ),
-        customCacheKey = this.videoId,
+        customCacheKey = if (isLocalDevice) null else this.videoId,
     )
 }
 
 fun Track.toGenericMediaItem(): GenericMediaItem {
+    val isLocalDevice = isLocalDeviceAudioId(this.videoId)
+    val artistName: String = this.artists.toListName().connectArtists()
+    if (isLocalDevice) {
+        return GenericMediaItem(
+            mediaId = this.videoId,
+            uri = localDeviceAudioContentUriString(this.videoId) ?: this.videoId,
+            metadata =
+                GenericMediaMetadata(
+                    title = this.title,
+                    artist = artistName,
+                    albumTitle = this.album?.name,
+                    artworkUri = this.thumbnails?.lastOrNull()?.url,
+                    description = MERGING_DATA_TYPE.SONG,
+                ),
+            customCacheKey = null,
+        )
+    }
     var thumbUrl =
         this.thumbnails?.last()?.url
             ?: "http://i.ytimg.com/vi/${this.videoId}/maxresdefault.jpg"
     if (thumbUrl.contains("w120")) {
         thumbUrl = Regex("([wh])120").replace(thumbUrl, "$1544")
     }
-    val artistName: String = this.artists.toListName().connectArtists()
     val isSong =
         (
             this.thumbnails?.last()?.height != 0 &&

@@ -78,7 +78,12 @@ internal class WaveformReader(
         allowNetworkDownload: Boolean = true,
     ): TrackStructure? =
         withContext(Dispatchers.IO) {
-            if (mediaId.isBlank() || LiveStreamRegistry.isLive(mediaId)) return@withContext null
+            if (mediaId.isBlank() ||
+                LiveStreamRegistry.isLive(mediaId) ||
+                com.maxrave.common.isLocalDeviceAudioId(mediaId)
+            ) {
+                return@withContext null
+            }
             val name = mediaId.replace(UNSAFE_FILE_CHARS, "_")
             val stored = File(dir, "$name.mix")
             dropOutdated(stored)
